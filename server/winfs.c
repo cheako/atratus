@@ -29,6 +29,14 @@
 #include "process.h"
 #include <limits.h>
 #include "vm.h"
+#include "minmax.h"
+
+struct winfs_filp
+{
+	struct filp fp;
+	HANDLE handle;
+	int dir_count;
+};
 
 BOOL WINAPI GetFileSizeEx(HANDLE handle, PLARGE_INTEGER Size);
 
@@ -224,14 +232,15 @@ static bool winfs_is_link(HANDLE dir, LPCWSTR name, USHORT name_length, DWORD at
 	return r;
 }
 
-static int winfs_stat(filp *f, struct stat64 *statbuf)
+static int winfs_stat(struct filp *fp, struct stat64 *statbuf)
 {
+	struct winfs_filp *wfp = (void*) fp;
 	BY_HANDLE_FILE_INFORMATION info;
 	NTSTATUS r;
 	bool is_link = false;
 	size_t link_size = 0;
 
-	r = GetFileInformationByHandle(f->handle, &info);
+	r = GetFileInformationByHandle(wfp->handle, &info);
 	if (!r)
 	{
 		dprintf("GetFileInformationByHandle failed (%08lx)\n",
@@ -242,7 +251,7 @@ static int winfs_stat(filp *f, struct stat64 *statbuf)
 	memset(statbuf, 0, sizeof *statbuf);
 	if (info.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM)
 	{
-		char *target = winfs_read_symlink_target(f->handle);
+		char *target = winfs_read_symlink_target(wfp->handle);
 		if (target)
 		{
 			is_link = true;
@@ -282,6 +291,22 @@ static int winfs_stat(filp *f, struct stat64 *statbuf)
 	}
 	statbuf->st_blksize = 0x1000;
 	statbuf->st_blocks = statbuf->st_size / 0x1000;
+	statbuf->st_nlink = info.nNumberOfLinks;
+	statbuf->st_uid = current->uid;
+	statbuf->st_gid = current->gid;
+
+	/*
+	 * NB. some software (e.g. glibc)
+	 *     uses st_ino & st_dev to determine uniqueness.
+	 *
+	 * Would be nice to have 64bit inode numbers so we could do:
+	 * statbuf->st_ino = (info.nFileIndexHigh << 32) | info.nFileIndexLow;
+	 * the following might result in a collision.
+	 *
+	 * TODO: make st_dev unique across all filesystems
+	 */
+	statbuf->st_ino = info.nFileIndexLow;
+	statbuf->st_dev = 1;
 
 	return 0;
 }
@@ -297,8 +322,9 @@ static NTAPI void winfs_dir_read_complete(PVOID ptr, PIO_STATUS_BLOCK iosb, ULON
 	ready_list_add(ctx->p);
 }
 
-static int winfs_getdents(filp *fp, void *de, unsigned int count, fn_add_dirent add_de)
+static int winfs_getdents(struct filp *fp, void *de, unsigned int count, fn_add_dirent add_de)
 {
+	struct winfs_filp *wfp = (void*) fp;
 	int ofs = 0;
 	int r;
 	unsigned char *p = (unsigned char*) de;
@@ -320,14 +346,15 @@ static int winfs_getdents(filp *fp, void *de, unsigned int count, fn_add_dirent 
 	while (1)
 	{
 		struct winfs_read_context ctx;
+		unsigned long inode;
 
 		ctx.p = current;
 
 		memset(buffer, 0, sizeof buffer);
-		ret = NtQueryDirectoryFile(fp->handle, NULL,
+		ret = NtQueryDirectoryFile(wfp->handle, NULL,
 			&winfs_dir_read_complete, &ctx, &iosb,
 			buffer, sizeof buffer,
-			FileDirectoryInformation, 0, NULL /*&mask*/, fp->dir_count == 0);
+			FileDirectoryInformation, 0, NULL /*&mask*/, wfp->dir_count == 0);
 		if (ret == STATUS_PENDING)
 		{
 			current->state = thread_stopped;
@@ -360,7 +387,7 @@ static int winfs_getdents(filp *fp, void *de, unsigned int count, fn_add_dirent 
 					info->FileNameLength/sizeof (WCHAR),
 					name, len + 1, NULL, NULL);
 
-			if (winfs_is_link(fp->handle, info->FileName,
+			if (winfs_is_link(wfp->handle, info->FileName,
 					info->FileNameLength, info->FileAttributes))
 				type = _L(DT_LNK);
 			else if (info->FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
@@ -368,9 +395,18 @@ static int winfs_getdents(filp *fp, void *de, unsigned int count, fn_add_dirent 
 			else
 				type = _L(DT_REG);
 
+			/*
+			 * Ensure the inode is non-zero.
+			 * Zero inodes are considered deleted.
+			 */
+			inode = info->FileIndex;
+			if (inode == 0)
+				inode = wfp->dir_count + 1000;
+
 			de = (struct linux_dirent*)&p[ofs];
 			r = add_de(de, name, len, count - ofs,
-				info->NextEntryOffset ? ++fp->dir_count : INT_MAX, type);
+				info->NextEntryOffset ? ++wfp->dir_count : INT_MAX,
+				type, inode);
 			if (r < 0)
 				break;
 			ofs += r;
@@ -383,8 +419,9 @@ static int winfs_getdents(filp *fp, void *de, unsigned int count, fn_add_dirent 
 	return ofs;
 }
 
-static int winfs_read(filp *f, void *buf, size_t size, loff_t *ofs, int block)
+static int winfs_read(struct filp *fp, void *buf, size_t size, loff_t *ofs, int block)
 {
+	struct winfs_filp *wfp = (void*) fp;
 	int bytesCopied = 0;
 
 	while (size)
@@ -392,49 +429,37 @@ static int winfs_read(filp *f, void *buf, size_t size, loff_t *ofs, int block)
 		OVERLAPPED ov;
 		DWORD sz;
 		DWORD bytesRead = 0;
-		void *ptr = NULL;
-		size_t max_size = 0;
 		int r;
 
 		memset(&ov, 0, sizeof ov);
 		ov.OffsetHigh = (*ofs >> 32);
 		ov.Offset = (*ofs & 0xffffffff);
 
-		r = vm_get_pointer(current, buf, &ptr, &max_size);
-		if (r < 0)
-		{
-			if (bytesCopied)
-				break;
-			return -_L(EFAULT);
-		}
-
-		sz = size;
-		if (sz > max_size)
-			sz = max_size;
+		/*
+		 * Something strange is going on here.
+		 * GetOverlappedResult returns ERROR_INVALID_PARAMETER
+		 * if we try to read over 0x10000 bytes.
+		 * Looks like it might only happen on an SMB share,
+		 * possibly something to do with VirtualBox ...
+		 */
+		sz = MIN(size, 0x10000);
 
 		dprintf("reading %ld bytes at %08lx:%08lx to %p\n",
-			sz, ov.OffsetHigh, ov.Offset, ptr);
+			sz, ov.OffsetHigh, ov.Offset, buf);
 
-		r = ReadFile(f->handle, ptr, sz, &bytesRead, &ov);
-		if (!r)
+		r = ReadFile(wfp->handle, buf, sz, &bytesRead, &ov);
+		if (!r && ((GetLastError() != ERROR_IO_PENDING) ||
+			   !GetOverlappedResult(wfp->handle, &ov, &bytesRead, TRUE)))
 		{
 			DWORD err = GetLastError();
+
 			if (err == ERROR_HANDLE_EOF)
 			{
 				LARGE_INTEGER fileSize;
-				if (!GetFileSizeEx(f->handle, &fileSize))
+				if (!GetFileSizeEx(wfp->handle, &fileSize))
 					return -_L(EIO);
 				size = (fileSize.QuadPart - *ofs);
 				continue;
-			}
-			else if (err == ERROR_IO_PENDING)
-			{
-				if (!GetOverlappedResult(f->handle, &ov, &bytesRead, TRUE))
-				{
-					dprintf("ReadFile failed (%ld) at %d\n",
-						GetLastError(), __LINE__);
-					return -_L(EIO);
-				}
 			}
 			else
 			{
@@ -458,8 +483,9 @@ static int winfs_read(filp *f, void *buf, size_t size, loff_t *ofs, int block)
 	return bytesCopied;
 }
 
-static int winfs_write(filp *f, const void *buf, size_t size, loff_t *ofs, int block)
+static int winfs_write(struct filp *fp, const void *buf, size_t size, loff_t *ofs, int block)
 {
+	struct winfs_filp *wfp = (void*) fp;
 	DWORD bytesCopied = 0;
 
 	while (size)
@@ -488,13 +514,13 @@ static int winfs_write(filp *f, const void *buf, size_t size, loff_t *ofs, int b
 		ov.Offset = (*ofs & 0xffffffff);
 
 		bytesWritten = 0;
-		r = WriteFile(f->handle, ptr, sz, &bytesWritten, &ov);
+		r = WriteFile(wfp->handle, ptr, sz, &bytesWritten, &ov);
 		if (!r)
 		{
 			DWORD err = GetLastError();
 			if (err == ERROR_IO_PENDING)
 			{
-				if (!GetOverlappedResult(f->handle, &ov,
+				if (!GetOverlappedResult(wfp->handle, &ov,
 							&bytesWritten, TRUE))
 				{
 					dprintf("WriteFile failed (%ld) at %d\n",
@@ -524,24 +550,25 @@ static int winfs_write(filp *f, const void *buf, size_t size, loff_t *ofs, int b
 	return bytesCopied;
 }
 
-static void winfs_close(filp *fp)
+static void winfs_close(struct filp *fp)
 {
-	if (fp->handle)
-		CloseHandle(fp->handle);
+	struct winfs_filp *wfp = (void*) fp;
+	CloseHandle(wfp->handle);
 }
 
-static int winfs_truncate(filp *fp, uint64_t offset)
+static int winfs_truncate(struct filp *fp, uint64_t offset)
 {
+	struct winfs_filp *wfp = (void*) fp;
 	LARGE_INTEGER where;
 	BOOL r;
 
 	where.QuadPart = offset;
 
-	r = SetFilePointerEx(fp->handle, where, NULL, FILE_BEGIN);
+	r = SetFilePointerEx(wfp->handle, where, NULL, FILE_BEGIN);
 	if (!r)
 		return -_L(EPERM);
 
-	r = SetEndOfFile(fp->handle);
+	r = SetEndOfFile(wfp->handle);
 	if (!r)
 	{
 		/* TODO: go back if we fail? */
@@ -551,8 +578,9 @@ static int winfs_truncate(filp *fp, uint64_t offset)
 	return 0;
 }
 
-static int winfs_seek(filp *fp, int whence, uint64_t pos, uint64_t *newpos)
+static int winfs_seek(struct filp *fp, int whence, uint64_t pos, uint64_t *newpos)
 {
+	struct winfs_filp *wfp = (void*) fp;
 	LARGE_INTEGER Position;
 	LARGE_INTEGER Result;
 	BOOL r;
@@ -560,19 +588,21 @@ static int winfs_seek(filp *fp, int whence, uint64_t pos, uint64_t *newpos)
 	Position.QuadPart = pos;
 	Result.QuadPart = 0LL;
 
-	r = SetFilePointerEx(fp->handle, Position, &Result, whence);
+	r = SetFilePointerEx(wfp->handle, Position, &Result, whence);
 	if (!r)
 		return -_L(EIO);
 
+	fp->offset = Result.QuadPart;
 	if (newpos)
 		*newpos = Result.QuadPart;
 
 	return 0;
 }
 
-static int winfs_readlink(filp *fp, char **buf)
+static int winfs_readlink(struct filp *fp, char **buf)
 {
-	*buf = winfs_get_symlink_target(fp->handle);
+	struct winfs_filp *wfp = (void*) fp;
+	*buf = winfs_get_symlink_target(wfp->handle);
 	if (!*buf)
 		return -_L(EINVAL);
 	return 0;
@@ -595,13 +625,15 @@ static int winfs_unlink_handle(HANDLE handle)
 	return (r == STATUS_SUCCESS) ? 0 : -_L(EPERM);
 }
 
-static int winfs_unlink(filp *fp)
+static int winfs_unlink(struct filp *fp)
 {
-	return winfs_unlink_handle(fp->handle);
+	struct winfs_filp *wfp = (void*) fp;
+	return winfs_unlink_handle(wfp->handle);
 }
 
-static int winfs_utimes(filp *fp, struct timeval *times)
+static int winfs_utimes(struct filp *fp, struct timeval *times)
 {
+	struct winfs_filp *wfp = (void*) fp;
 	FILETIME create_time, write_time;
 	BOOL r;
 
@@ -618,15 +650,16 @@ static int winfs_utimes(filp *fp, struct timeval *times)
 		write_time = create_time;
 	}
 
-	r = SetFileTime(fp->handle, &create_time, NULL, &write_time);
+	r = SetFileTime(wfp->handle, &create_time, NULL, &write_time);
 	if (!r)
 		return -_L(EPERM);
 
 	return 0;
 }
 
-static int winfs_symlink(filp *dir, const char *name, const char *newpath)
+static int winfs_symlink(struct filp *fp, const char *name, const char *newpath)
 {
+	struct winfs_filp *wfp = (void*) fp;
 	OBJECT_ATTRIBUTES oa;
 	IO_STATUS_BLOCK iosb;
 	UNICODE_STRING us;
@@ -659,7 +692,7 @@ static int winfs_symlink(filp *dir, const char *name, const char *newpath)
 				(WCHAR*)&buffer[12], sizeof buffer - 12);
 
 	oa.Length = sizeof oa;
-	oa.RootDirectory = dir->handle;
+	oa.RootDirectory = wfp->handle;
 	oa.ObjectName = &us;
 	oa.Attributes = OBJ_CASE_INSENSITIVE;
 	oa.SecurityDescriptor = 0;
@@ -692,8 +725,9 @@ static int winfs_symlink(filp *dir, const char *name, const char *newpath)
 	return ret;
 }
 
-static int winfs_getname(filp *fp, char **name)
+static int winfs_getname(struct filp *fp, char **name)
 {
+	struct winfs_filp *wfp = (void*) fp;
 	NTSTATUS r;
 	union {
 		BYTE buffer[0x1000];
@@ -705,7 +739,7 @@ static int winfs_getname(filp *fp, char **name)
 	LPWSTR subdir;
 	int subdirlen;
 
-	r = NtQueryInformationFile(fp->handle, &iosb,
+	r = NtQueryInformationFile(wfp->handle, &iosb,
 				&info, sizeof info,
 				FileNameInformation);
 	if (r != STATUS_SUCCESS)
@@ -715,7 +749,7 @@ static int winfs_getname(filp *fp, char **name)
 	}
 
 	dprintf("handle %p name = %.*S\n",
-		fp->handle,
+		wfp->handle,
 		(int) info.NameInfo.FileNameLength/2,
 		info.NameInfo.FileName);
 
@@ -778,8 +812,9 @@ static int winfs_getname(filp *fp, char **name)
 	return 0;
 }
 
-static int winfs_mkdir(filp *dir, const char *name, int mode)
+static int winfs_mkdir(struct filp *fp, const char *name, int mode)
 {
+	struct winfs_filp *wfp = (void*) fp;
 	OBJECT_ATTRIBUTES oa;
 	IO_STATUS_BLOCK iosb;
 	UNICODE_STRING us;
@@ -788,7 +823,7 @@ static int winfs_mkdir(filp *dir, const char *name, int mode)
 	NTSTATUS r;
 	int len;
 
-	dprintf("winfs_mkdir(%p,%s,%08x)\n", dir, name, mode);
+	dprintf("winfs_mkdir(%p,%s,%08x)\n", wfp, name, mode);
 
 	len = MultiByteToWideChar(CP_UTF8, 0, name, -1,
 				dospath, sizeof dospath/sizeof dospath[0]);
@@ -798,7 +833,7 @@ static int winfs_mkdir(filp *dir, const char *name, int mode)
 	us.Length = (len - 1) * sizeof (WCHAR);
 
 	oa.Length = sizeof oa;
-	oa.RootDirectory = dir->handle;
+	oa.RootDirectory = wfp->handle;
 	oa.ObjectName = &us;
 	oa.Attributes = OBJ_CASE_INSENSITIVE;
 	oa.SecurityDescriptor = 0;
@@ -843,20 +878,21 @@ static int winfs_is_directory_handle(HANDLE handle)
 }
 
 
-static int winfs_rmdir(filp *dir)
+static int winfs_rmdir(struct filp *fp)
 {
+	struct winfs_filp *wfp = (void*) fp;
 	int r;
 
-	r = winfs_is_directory_handle(dir->handle);
+	r = winfs_is_directory_handle(wfp->handle);
 	if (r < 0)
 		return r;
 	if (r != 1)
 		return -_L(ENOTDIR);
 
-	return winfs_unlink_handle(dir->handle);
+	return winfs_unlink_handle(wfp->handle);
 }
 
-static filp *winfs_open(struct fs *fs, const char *file, int flags,
+static struct filp *winfs_open(struct fs *fs, const char *file, int flags,
 			int mode, int follow_links)
 {
 	WCHAR *dospath;
@@ -864,9 +900,10 @@ static filp *winfs_open(struct fs *fs, const char *file, int flags,
 	DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 	DWORD create = 0;
 	HANDLE handle;
-	filp *fp;
+	struct winfs_filp *wfp;
 	int symlink_count = 0;
 	DWORD CreateFlags;
+	char *target = NULL;
 
 	dprintf("open(\"%s\",%08x,%08x)\n", file, flags, mode);
 
@@ -891,13 +928,14 @@ static filp *winfs_open(struct fs *fs, const char *file, int flags,
 	else
 		create = OPEN_EXISTING;
 
-	dospath = unix2dos_path(file);
 	while (1)
 	{
-		char *target;
-
+		dospath = unix2dos_path(file);
 		if (!dospath)
+		{
+			free(target);
 			return L_ERROR_PTR(ENOENT);
+		}
 
 		dprintf("CreateFile(%S,%08lx,%08lx,NULL,%08lx,...)\n",
 			dospath, access, share, create);
@@ -920,6 +958,7 @@ static filp *winfs_open(struct fs *fs, const char *file, int flags,
 				dprintf("failed to open %S (%ld)\n",
 					dospath, GetLastError());
 				free(dospath);
+				free(target);
 				return L_ERROR_PTR(ENOENT);
 			}
 		}
@@ -937,24 +976,42 @@ static filp *winfs_open(struct fs *fs, const char *file, int flags,
 		if (symlink_count >= 256)
 			return L_ERROR_PTR(ELOOP);
 
+		/* target is relative to directory containing symlink */
+		if (target[0] != '/')
+		{
+			char *p, *t = malloc(strlen(target) + strlen(file));
+			strcpy(t, file);
+			p = strrchr(t, '/');
+			if (p)
+				strcpy(p + 1, target);
+			else
+			{
+				strcat(p, "/");
+				strcat(p, target);
+			}
+			free(target);
+			target = t;
+		}
+
 		/* FIXME: only works for absolute paths */
 		dprintf("symlink -> %s\n", target);
-		dospath = unix2dos_path(target);
-		free(target);
-	}
 
-	fp = malloc(sizeof (*fp));
-	if (!fp)
+		file = target;
+	}
+	free(target);
+
+	wfp = malloc(sizeof (*wfp));
+	if (!wfp)
 	{
 		CloseHandle(handle);
 		return L_ERROR_PTR(ENOMEM);
 	}
 
-	init_fp(fp, &winfs_file_ops);
-	fp->handle = handle;
-	fp->dir_count = 0;
+	init_fp(&wfp->fp, &winfs_file_ops);
+	wfp->handle = handle;
+	wfp->dir_count = 0;
 
-	return fp;
+	return &wfp->fp;
 }
 
 /* FIXME: separate ops for a symlink? */

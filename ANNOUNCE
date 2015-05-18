@@ -1,5 +1,11 @@
 Announcement & Release notes
 
+0.8 - April release
+
+ - support glibc 2.15
+ - support read-only memory mappings
+ - use NSIS installer
+
 Thu Mar 14 23:12:44 EST 2013
 0.7 - March release
 

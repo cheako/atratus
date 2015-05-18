@@ -36,7 +36,7 @@ struct pipe_buffer
 
 struct pipe_filp
 {
-	filp fp;
+	struct filp fp;
 	struct pipe_buffer *pb;
 };
 
@@ -60,7 +60,7 @@ static void pipe_wait_change(struct pipe_buffer *pb)
 	wait_entry_remove(&pb->wl, &we);
 }
 
-static int pipe_read(filp *f, void *buf, size_t size, loff_t *off, int block)
+static int pipe_read(struct filp *f, void *buf, size_t size, loff_t *off, int block)
 {
 	struct pipe_filp *pfp = (void*) f;
 	struct pipe_buffer *pb = pfp->pb;
@@ -69,7 +69,6 @@ static int pipe_read(filp *f, void *buf, size_t size, loff_t *off, int block)
 	while (size)
 	{
 		int sz;
-		int r;
 
 		sz = pb->available;
 
@@ -91,13 +90,8 @@ static int pipe_read(filp *f, void *buf, size_t size, loff_t *off, int block)
 		if (sz + pb->head > sizeof pb->buffer)
 			sz = sizeof pb->buffer - pb->head;
 
-		r = current->ops->memcpy_to(buf, &pb->buffer[pb->head], sz);
-		if (r < 0)
-		{
-			if (bytesCopied)
-				break;
-			return -_L(EFAULT);
-		}
+		memcpy(buf, &pb->buffer[pb->head], sz);
+
 		bytesCopied += sz;
 		buf = (char*) buf + sz;
 		size -= sz;
@@ -111,7 +105,7 @@ static int pipe_read(filp *f, void *buf, size_t size, loff_t *off, int block)
 	return bytesCopied;
 }
 
-static int pipe_write(filp *f, const void *buf, size_t size, loff_t *off, int block)
+static int pipe_write(struct filp *f, const void *buf, size_t size, loff_t *off, int block)
 {
 	struct pipe_filp *pfp = (void*) f;
 	struct pipe_buffer *pb = pfp->pb;
@@ -162,7 +156,7 @@ static int pipe_write(filp *f, const void *buf, size_t size, loff_t *off, int bl
 	return bytesCopied;
 }
 
-static void pipe_close(filp *fp)
+static void pipe_close(struct filp *fp)
 {
 	struct pipe_filp *pfp = (void*) fp;
 
@@ -183,7 +177,7 @@ static const struct filp_ops pipe_read_ops = {
 	.fn_close = &pipe_close,
 };
 
-static int create_pipe(filp **fp)
+int pipe_create(struct filp **fp)
 {
 	struct pipe_filp *write_pfp = NULL;
 	struct pipe_filp *read_pfp = NULL;
@@ -220,44 +214,4 @@ error:
 	free(read_pfp);
 	free(write_pfp);
 	return -_L(ENOMEM);
-}
-
-int do_pipe(int *fds)
-{
-	filp *fp[2];
-	int r;
-	int fd0, fd1;
-
-	r = create_pipe(fp);
-	if (r < 0)
-		return r;
-
-	fd0 = alloc_fd();
-	if (fd0 < 0)
-	{
-		filp_close(fp[0]);
-		filp_close(fp[1]);
-		return -_L(EMFILE);
-	}
-
-	current->handles[fd0].fp = fp[0];
-	current->handles[fd0].flags = 0;
-
-	fd1 = alloc_fd();
-	if (fd1 < 0)
-	{
-		do_close(fd0);
-		filp_close(fp[1]);
-		return -_L(EMFILE);
-	}
-
-	current->handles[fd1].fp = fp[1];
-	current->handles[fd1].flags = 0;
-
-	fds[0] = fd0;
-	fds[1] = fd1;
-
-	dprintf("fds[] -> %d, %d\n", fds[0], fds[1]);
-
-	return 0;
 }

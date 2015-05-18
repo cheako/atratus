@@ -28,6 +28,7 @@ TARGETS = \
 	dir \
 	env \
 	fork \
+	futex \
 	getopt \
 	getopt_long \
 	hw \
@@ -36,6 +37,7 @@ TARGETS = \
 	ln \
 	ls \
 	malloc \
+	mmap \
 	pipe \
 	qsort \
 	read \

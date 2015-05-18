@@ -24,12 +24,21 @@
 #define _l_O_WRONLY (0x01)
 #define _l_O_RDWR   (0x02)
 #define _l_O_CREAT  (0x40)
+#define _l_O_TRUNC  (0x200)
 
 #define _l_O_NONBLOCK (0x800)
 
 #define _l_WNOHANG (1)
 
 #define _l_SIGCHLD (17)
+
+#define _l_CLONE_VM (0x100)
+#define _l_CLONE_PARENT_SETTID  (0x100000)
+#define _l_CLONE_CHILD_CLEARTID (0x200000)
+#define _l_CLONE_CHILD_SETTID  (0x1000000)
+
+#define _l_FUTEX_WAIT 0
+#define _l_FUTEX_WAKE 1
 
 #define _l_POLLIN  (1 << 0)
 #define _l_POLLPRI (1 << 1)
@@ -48,6 +57,8 @@
 #define _l_DT_DIR 4
 #define _l_DT_REG 8
 #define _l_DT_LNK 10
+
+#define _l_AT_FDCWD (-100)
 
 #define _l_F_OK 0
 #define _l_X_OK 1
@@ -122,6 +133,9 @@
 
 #define TIOCG     0x5401
 #define TIOCS     0x5402
+#define TCSETSW   0x5403
+#define TCSETAW   0x5407
+#define TCFLUSH   0x540b
 
 #define VERASE 2
 #define VEOF 4
@@ -173,7 +187,12 @@
 #define PARENB (0x100)
 #define PARODD (0x200)
 
-#define NCCS 32
+#define NCCS 19
+
+struct iovec {
+	void *iov_base;
+	size_t iov_len;
+};
 
 struct termios
 {
@@ -183,9 +202,7 @@ struct termios
 	unsigned int c_lflag;
 	unsigned char c_line;
 	unsigned char c_cc[NCCS];
-	unsigned int c_ispeed;
-	unsigned int c_ospeed;
-};
+} PACKED;
 
 struct winsize {
 	unsigned short	ws_row;
@@ -268,6 +285,15 @@ struct linux_dirent64 {
 	unsigned char d_type;
 	char d_name[];
 } PACKED;
+
+typedef unsigned long l_sigset_t;
+
+struct l_sigaction {
+	void *sa_handler;
+	unsigned long sa_flags;
+	void *sa_restorer;
+	l_sigset_t sa_mask;
+};
 
 #define SECSPERDAY 86400
 #define SECS_1601_TO_1970 ((369 * 365 + 89) * (ULONGLONG)SECSPERDAY)

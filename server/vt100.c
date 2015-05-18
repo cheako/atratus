@@ -36,9 +36,9 @@
 
 #define MAX_VT100_PARAMS 8
 
-struct _vt100_filp
+struct vt100_filp
 {
-	tty_filp con;
+	struct tty_filp con;
 	int state;
 	int num[MAX_VT100_PARAMS];
 	int num_count;
@@ -61,9 +61,7 @@ struct _vt100_filp
 	CRITICAL_SECTION cs;
 };
 
-typedef struct _vt100_filp vt100_filp;
-
-static void vt100_get_cursor_pos(vt100_filp *vt, int *x, int *y)
+static void vt100_get_cursor_pos(struct vt100_filp *vt, int *x, int *y)
 {
 	CONSOLE_SCREEN_BUFFER_INFO info;
 
@@ -72,7 +70,7 @@ static void vt100_get_cursor_pos(vt100_filp *vt, int *x, int *y)
 	*y = info.dwCursorPosition.Y - info.srWindow.Top + 1;
 }
 
-static int vt100_set_cursor_pos(vt100_filp *vt, int x, int y)
+static int vt100_set_cursor_pos(struct vt100_filp *vt, int x, int y)
 {
 	COORD coord;
 	CONSOLE_SCREEN_BUFFER_INFO info;
@@ -101,7 +99,7 @@ static int vt100_set_cursor_pos(vt100_filp *vt, int x, int y)
 	return 0;
 }
 
-static DWORD vt100_get_attributes(vt100_filp *vt)
+static DWORD vt100_get_attributes(struct vt100_filp *vt)
 {
 	DWORD dwAttribute = 0;
 
@@ -165,7 +163,7 @@ static DWORD vt100_get_attributes(vt100_filp *vt)
 	return dwAttribute;
 }
 
-static int vt100_set_color(vt100_filp *vt)
+static int vt100_set_color(struct vt100_filp *vt)
 {
 	DWORD dwAttribute;
 	int i;
@@ -197,14 +195,14 @@ static int vt100_set_color(vt100_filp *vt)
 }
 
 /* carriage return.  Move the cursor to the start of the line */
-static void vt100_do_cr(vt100_filp *vt)
+static void vt100_do_cr(struct vt100_filp *vt)
 {
 	int x, y;
 	vt100_get_cursor_pos(vt, &x, &y);
 	vt100_set_cursor_pos(vt, 0, y);
 }
 
-static void vt100_scroll(vt100_filp *vt, int up)
+static void vt100_scroll(struct vt100_filp *vt, int up)
 {
 	CONSOLE_SCREEN_BUFFER_INFO info;
 	SMALL_RECT rect;
@@ -256,7 +254,7 @@ static void vt100_scroll(vt100_filp *vt, int up)
 }
 
 /* line feed. Go down one line, but not to the start */
-static void vt100_do_lf(vt100_filp *vt)
+static void vt100_do_lf(struct vt100_filp *vt)
 {
 	int x, y;
 
@@ -290,7 +288,7 @@ static void vt100_do_lf(vt100_filp *vt)
 	}
 }
 
-static void vt100_move_up(vt100_filp *vt)
+static void vt100_move_up(struct vt100_filp *vt)
 {
 	int x, y;
 	vt100_get_cursor_pos(vt, &x, &y);
@@ -298,7 +296,7 @@ static void vt100_move_up(vt100_filp *vt)
 	vt100_scroll(vt, 0);
 }
 
-static void vt100_move_down(vt100_filp *vt)
+static void vt100_move_down(struct vt100_filp *vt)
 {
 	int x, y;
 	vt100_get_cursor_pos(vt, &x, &y);
@@ -306,7 +304,7 @@ static void vt100_move_down(vt100_filp *vt)
 	vt100_do_lf(vt);
 }
 
-static void vt100_do_backspace(vt100_filp *vt)
+static void vt100_do_backspace(struct vt100_filp *vt)
 {
 	int x, y;
 
@@ -317,7 +315,7 @@ static void vt100_do_backspace(vt100_filp *vt)
 	vt100_set_cursor_pos(vt, x, y);
 }
 
-static void vt100_do_vertical_tab(vt100_filp *vt)
+static void vt100_do_vertical_tab(struct vt100_filp *vt)
 {
 	int x, y;
 
@@ -328,7 +326,7 @@ static void vt100_do_vertical_tab(vt100_filp *vt)
 	vt100_set_cursor_pos(vt, x, y);
 }
 
-static void vt100_do_tab(vt100_filp *vt)
+static void vt100_do_tab(struct vt100_filp *vt)
 {
 	int x, y;
 
@@ -340,7 +338,7 @@ static void vt100_do_tab(vt100_filp *vt)
 	vt100_set_cursor_pos(vt, x, y);
 }
 
-static int vt100_utf8_out(vt100_filp *vt, unsigned char ch)
+static int vt100_utf8_out(struct vt100_filp *vt, unsigned char ch)
 {
 	DWORD write_count = 0;
 	BOOL r;
@@ -420,7 +418,7 @@ static int vt100_utf8_out(vt100_filp *vt, unsigned char ch)
 	return 0;
 }
 
-static int vt100_write_normal(vt100_filp *vt, unsigned char ch)
+static int vt100_write_normal(struct vt100_filp *vt, unsigned char ch)
 {
 	switch (ch)
 	{
@@ -434,7 +432,7 @@ static int vt100_write_normal(vt100_filp *vt, unsigned char ch)
 	return 0;
 }
 
-static void vt100_save_char(vt100_filp *vt)
+static void vt100_save_char(struct vt100_filp *vt)
 {
 	CONSOLE_SCREEN_BUFFER_INFO info;
 	DWORD count;
@@ -454,7 +452,7 @@ static void vt100_save_char(vt100_filp *vt)
 	dprintf("save '%c'\n", (char) vt->saved_char);
 }
 
-static void vt100_restore_char(vt100_filp *vt)
+static void vt100_restore_char(struct vt100_filp *vt)
 {
 	CONSOLE_SCREEN_BUFFER_INFO info;
 	DWORD count;
@@ -476,7 +474,7 @@ static void vt100_restore_char(vt100_filp *vt)
 	dprintf("restore '%c'\n", (char) vt->saved_char);
 }
 
-static void vt100_device_status(vt100_filp *vt, int req)
+static void vt100_device_status(struct vt100_filp *vt, int req)
 {
 	char response[16];
 	CONSOLE_SCREEN_BUFFER_INFO info;
@@ -497,7 +495,7 @@ static void vt100_device_status(vt100_filp *vt, int req)
 	}
 }
 
-static void vt100_erase(vt100_filp *vt, int mode)
+static void vt100_erase(struct vt100_filp *vt, int mode)
 {
 	CONSOLE_SCREEN_BUFFER_INFO info;
 	COORD pos;
@@ -551,7 +549,7 @@ static void vt100_erase(vt100_filp *vt, int mode)
 					pos, &count);
 }
 
-static void vt100_clear(vt100_filp *vt, DWORD length, COORD pos)
+static void vt100_clear(struct vt100_filp *vt, DWORD length, COORD pos)
 {
 	DWORD count = 0;
 	DWORD attribute = vt100_get_attributes(vt);
@@ -559,7 +557,7 @@ static void vt100_clear(vt100_filp *vt, DWORD length, COORD pos)
 	FillConsoleOutputAttribute(vt->handle, attribute, length, pos, &count);
 }
 
-static void vt100_erase_screen(vt100_filp *vt, int n)
+static void vt100_erase_screen(struct vt100_filp *vt, int n)
 {
 	CONSOLE_SCREEN_BUFFER_INFO info;
 	COORD pos, top;
@@ -593,7 +591,7 @@ static void vt100_erase_screen(vt100_filp *vt, int n)
 	}
 }
 
-static void vt100_move_cursor(vt100_filp *vt, int delta_x, int delta_y)
+static void vt100_move_cursor(struct vt100_filp *vt, int delta_x, int delta_y)
 {
 	CONSOLE_SCREEN_BUFFER_INFO info;
 	COORD pos;
@@ -617,7 +615,7 @@ static void vt100_move_cursor(vt100_filp *vt, int delta_x, int delta_y)
 	SetConsoleCursorPosition(vt->handle, pos);
 }
 
-static void vt100_cursor_home(vt100_filp *vt)
+static void vt100_cursor_home(struct vt100_filp *vt)
 {
 	CONSOLE_SCREEN_BUFFER_INFO info;
 	COORD pos;
@@ -632,7 +630,7 @@ static void vt100_cursor_home(vt100_filp *vt)
 	SetConsoleCursorPosition(vt->handle, pos);
 }
 
-static void vt100_screen_alignment(vt100_filp *vt)
+static void vt100_screen_alignment(struct vt100_filp *vt)
 {
 	/*
 	 * We're meant to write Es all over the screen
@@ -646,7 +644,7 @@ static void vt100_screen_alignment(vt100_filp *vt)
  * wait for a double height/double width command
  * (These are probably not possible on a Windows console)
  */
-static int vt100_write_wait_dhdw_mode(vt100_filp *vt, unsigned char ch)
+static int vt100_write_wait_dhdw_mode(struct vt100_filp *vt, unsigned char ch)
 {
 	switch (ch)
 	{
@@ -663,7 +661,7 @@ static int vt100_write_wait_dhdw_mode(vt100_filp *vt, unsigned char ch)
 	return 0;
 }
 
-static void vt_hide_cursor(vt100_filp *vt, int enable)
+static void vt_hide_cursor(struct vt100_filp *vt, int enable)
 {
 	CONSOLE_CURSOR_INFO cci;
 
@@ -676,7 +674,7 @@ static void vt_hide_cursor(vt100_filp *vt, int enable)
  *  ESC [ ? N h  - enable mode N
  *  ESC [ ? N l  - disable mode N
  */
-static int vt100_write_wait_mode_switch_num(vt100_filp *vt, unsigned char ch)
+static int vt100_write_wait_mode_switch_num(struct vt100_filp *vt, unsigned char ch)
 {
 	int enable = 0;
 	if (ch >= '0' && ch <= '9')
@@ -729,27 +727,27 @@ static int vt100_write_wait_mode_switch_num(vt100_filp *vt, unsigned char ch)
 	return 0;
 }
 
-static int vt100_write_wait_char_set_g0(vt100_filp *vt, unsigned char ch)
+static int vt100_write_wait_char_set_g0(struct vt100_filp *vt, unsigned char ch)
 {
 	dprintf("switch to g0 %c - unsupported\n", ch);
 	vt->state = 0;
 	return 0;
 }
 
-static int vt100_write_wait_char_set_g1(vt100_filp *vt, unsigned char ch)
+static int vt100_write_wait_char_set_g1(struct vt100_filp *vt, unsigned char ch)
 {
 	dprintf("switch to g1 %c - unsupported\n", ch);
 	vt->state = 0;
 	return 0;
 }
 
-static void vt100_identify(vt100_filp *vt)
+static void vt100_identify(struct vt100_filp *vt)
 {
 	const char ident[] = "\033[0n"; /* vt100 */
 	tty_input_add_string(&vt->con, ident);
 }
 
-static void vt100_enable_scrolling(vt100_filp *vt, int start, int end)
+static void vt100_enable_scrolling(struct vt100_filp *vt, int start, int end)
 {
 	CONSOLE_SCREEN_BUFFER_INFO info;
 	int max;
@@ -776,7 +774,7 @@ static void vt100_enable_scrolling(vt100_filp *vt, int start, int end)
 	vt->scroll_end = end;
 }
 
-static int vt100_write_wait_number(vt100_filp *vt, unsigned char ch)
+static int vt100_write_wait_number(struct vt100_filp *vt, unsigned char ch)
 {
 	switch (ch)
 	{
@@ -859,7 +857,7 @@ static int vt100_write_wait_number(vt100_filp *vt, unsigned char ch)
 	return 0;
 }
 
-static void vt100_reset(vt100_filp *vt)
+static void vt100_reset(struct vt100_filp *vt)
 {
 	vt->state = 0;
 	vt->num_count = 0;
@@ -876,7 +874,7 @@ static void vt100_reset(vt100_filp *vt)
 	vt100_enable_scrolling(vt, 0, 0);
 }
 
-static int vt100_write_wait_first_char(vt100_filp *vt, unsigned char ch)
+static int vt100_write_wait_first_char(struct vt100_filp *vt, unsigned char ch)
 {
 	int i;
 
@@ -945,11 +943,11 @@ static int vt100_write_wait_first_char(vt100_filp *vt, unsigned char ch)
 	return 0;
 }
 
-static void vt100_do_nul(vt100_filp *vt)
+static void vt100_do_nul(struct vt100_filp *vt)
 {
 }
 
-typedef int (*vt100_state_fn)(vt100_filp *vt, unsigned char ch);
+typedef int (*vt100_state_fn)(struct vt100_filp *vt, unsigned char ch);
 
 static vt100_state_fn vt100_state_list[] = {
 	vt100_write_normal,
@@ -962,24 +960,24 @@ static vt100_state_fn vt100_state_list[] = {
 	vt100_write_wait_char_set_g1,
 };
 
-typedef void (*vt100_control_fn)(vt100_filp *vt);
+typedef void (*vt100_control_fn)(struct vt100_filp *vt);
 
-static void vt100_do_escape(vt100_filp *vt)
+static void vt100_do_escape(struct vt100_filp *vt)
 {
 	vt->state = 1;
 }
 
-static void vt100_do_bel(vt100_filp *vt)
+static void vt100_do_bel(struct vt100_filp *vt)
 {
 	Beep(2000, 200);
 }
 
-static void vt100_do_si(vt100_filp *vt)
+static void vt100_do_si(struct vt100_filp *vt)
 {
 	vt->charset = 0;
 }
 
-static void vt100_do_so(vt100_filp *vt)
+static void vt100_do_so(struct vt100_filp *vt)
 {
 	vt->charset = 1;
 }
@@ -1035,9 +1033,9 @@ static vt100_control_fn vt100_control_list[0x20] =
 	NULL,
 };
 
-static int vt100_write(tty_filp *con, unsigned char ch)
+static int vt100_write(struct tty_filp *con, unsigned char ch)
 {
-	vt100_filp *vt = (void*) con;
+	struct vt100_filp *vt = (void*) con;
 	int r = 0;
 
 	if (ch < 0x20)
@@ -1059,7 +1057,7 @@ static int vt100_write(tty_filp *con, unsigned char ch)
 	return r;
 }
 
-static void vt100_send_cursor_code(vt100_filp *vt, char ch)
+static void vt100_send_cursor_code(struct vt100_filp *vt, char ch)
 {
 	char cursor[4];
 	int n = 0;
@@ -1083,7 +1081,7 @@ static void vt100_send_cursor_code(vt100_filp *vt, char ch)
 static DWORD WINAPI vt100_input_thread(LPVOID param)
 {
 	HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
-	vt100_filp *vt = param;
+	struct vt100_filp *vt = param;
 	unsigned char ch = 0;
 	DWORD count = 0;
 	BOOL r;
@@ -1140,10 +1138,10 @@ static DWORD WINAPI vt100_input_thread(LPVOID param)
 	return 0;
 }
 
-static void vt100_get_winsize(tty_filp *con, struct winsize *ws)
+static void vt100_get_winsize(struct tty_filp *con, struct winsize *ws)
 {
 	CONSOLE_SCREEN_BUFFER_INFO info;
-	vt100_filp *vt= (void*) con;
+	struct vt100_filp *vt= (void*) con;
 
 	GetConsoleScreenBufferInfo(vt->handle, &info);
 
@@ -1155,15 +1153,15 @@ static void vt100_get_winsize(tty_filp *con, struct winsize *ws)
 	dprintf("winsize -> %d,%d\n", ws->ws_col, ws->ws_row);
 }
 
-static void vt100_lock(tty_filp *con)
+static void vt100_lock(struct tty_filp *con)
 {
-	vt100_filp *vt= (void*) con;
+	struct vt100_filp *vt = (void*) con;
 	EnterCriticalSection(&vt->cs);
 }
 
-static void vt100_unlock(tty_filp *con)
+static void vt100_unlock(struct tty_filp *con)
 {
-	vt100_filp *vt= (void*) con;
+	struct vt100_filp *vt = (void*) con;
 	LeaveCriticalSection(&vt->cs);
 }
 
@@ -1174,10 +1172,10 @@ struct con_ops vt100_ops = {
 	.fn_get_winsize = vt100_get_winsize,
 };
 
-static filp* alloc_vt100_console(HANDLE handle)
+static struct filp* alloc_vt100_console(HANDLE handle, int pgid)
 {
-	vt100_filp *vt;
-	tty_filp *con;
+	struct vt100_filp *vt;
+	struct tty_filp *con;
 	DWORD id;
 
 	vt = malloc(sizeof *vt);
@@ -1188,7 +1186,7 @@ static filp* alloc_vt100_console(HANDLE handle)
 
 	con->ops = &vt100_ops;
 
-	tty_init(con);
+	tty_init(con, pgid);
 
 	vt->handle = handle;
 	vt100_reset(vt);
@@ -1201,11 +1199,11 @@ static filp* alloc_vt100_console(HANDLE handle)
 	return &con->fp;
 }
 
-static filp *condev;
+static struct filp *condev;
 
-filp* get_vt100_console(HANDLE console)
+struct filp* get_vt100_console(HANDLE console, int pgid)
 {
 	if (!condev)
-		condev = alloc_vt100_console(console);
+		condev = alloc_vt100_console(console, pgid);
 	return condev;
 }

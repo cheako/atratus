@@ -24,6 +24,7 @@ CFLAGS += -I../include
 CFLAGS += -Wp,-MD,.$@.d -Wp,-MT,$@
 
 MINGWCC = i586-mingw32msvc-gcc
+WINDRES = i586-mingw32msvc-windres
 NATIVEEXEFLAGS = -lntdll -nostartfiles -nodefaultlibs -Wl,--subsystem=native -e __entry
 
 all: atratus.exe cygsymlink.exe linux.exe
@@ -36,6 +37,7 @@ ATRATUS_SRCS = \
 	debug.c \
 	dev.c \
 	elf.c \
+	emulate.c \
 	inet.c \
 	null.c \
 	pipe.c \
@@ -43,7 +45,8 @@ ATRATUS_SRCS = \
 	tty.c \
 	vm.c \
 	vt100.c \
-	winfs.c
+	winfs.c \
+	zero.c
 
 STUB_SRCS = \
 	linux.c
@@ -59,7 +62,10 @@ OBJECTS = $(ATRATUS_OBJECTS) $(STUB_OBJECTS)
 
 -include $(OBJECTS:%=$(dir %).$(notdir %).d)
 
-atratus.exe: $(ATRATUS_OBJECTS)
+%.res: %.rc
+	$(WINDRES) -i $< -o $@ -O coff
+
+atratus.exe: $(ATRATUS_OBJECTS) atratus.res
 	$(MINGWCC) -o $@ $^ -lntdll -lkernel32 -lpsapi -lws2_32
 
 # a stub called linux so the task manager shows something sensible
@@ -70,4 +76,4 @@ cygsymlink.exe: $(CYGSYMLINK_OBJECTS)
 	$(MINGWCC) -static -o $@ $^ -lntdll -lkernel32
 
 clean:
-	rm -f atratus.exe cygsymlink.exe linux.exe *.pe.o .*.pe.o.d
+	rm -f atratus.exe cygsymlink.exe linux.exe *.pe.o .*.pe.o.d *.res

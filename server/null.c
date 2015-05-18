@@ -29,7 +29,7 @@
 #include "process.h"
 #include "null.h"
 
-static int null_read(filp *f, void *buf, size_t size, loff_t *off, int block)
+static int null_read(struct filp *f, void *buf, size_t size, loff_t *off, int block)
 {
 	return 0;
 }
@@ -38,9 +38,9 @@ static const struct filp_ops null_ops = {
 	.fn_read = &null_read,
 };
 
-filp* null_fp_get(void)
+struct filp* null_fp_get(void)
 {
-	filp *fp;
+	struct filp *fp;
 
 	fp = malloc(sizeof (*fp));
 	if (!fp)

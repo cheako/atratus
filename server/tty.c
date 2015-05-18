@@ -32,10 +32,10 @@
 #include "linux-defines.h"
 #include "debug.h"
 
-static void tty_poll_add(filp *f, struct wait_entry *we);
-static void tty_poll_del(filp *f, struct wait_entry *we);
+static void tty_poll_add(struct filp *f, struct wait_entry *we);
+static void tty_poll_del(struct filp *f, struct wait_entry *we);
 
-static int tty_is_canonical(tty_filp *tty)
+static int tty_is_canonical(struct tty_filp *tty)
 {
 	return tty->tios.c_lflag & ICANON;
 }
@@ -44,7 +44,7 @@ static int tty_is_canonical(tty_filp *tty)
  * Process input characters into an input string
  * return number of characters ready to read
  */
-static int tty_process_input(tty_filp *tty)
+static int tty_process_input(struct tty_filp *tty)
 {
 	int i, pos, end;
 
@@ -97,9 +97,9 @@ static int tty_process_input(tty_filp *tty)
 	return end + 1;
 }
 
-static int tty_read(filp *f, void *buf, size_t size, loff_t *ofs, int block)
+static int tty_read(struct filp *f, void *buf, size_t size, loff_t *ofs, int block)
 {
-	tty_filp *tty = (tty_filp*) f;
+	struct tty_filp *tty = (struct tty_filp*) f;
 	int ret = 0;
 	struct wait_entry we;
 	int done = 0;
@@ -120,14 +120,7 @@ static int tty_read(filp *f, void *buf, size_t size, loff_t *ofs, int block)
 			if (len > size)
 				len = size;
 
-			int r;
-			r = current->ops->memcpy_to(buf, tty->ready_data, len);
-			if (r < 0)
-			{
-				if (ret > 0)
-					break;
-				return -_L(EFAULT);
-			}
+			memcpy(buf, tty->ready_data, len);
 			buf = (char*)buf + len;
 			ret += len;
 
@@ -160,7 +153,7 @@ static int tty_read(filp *f, void *buf, size_t size, loff_t *ofs, int block)
 	return ret;
 }
 
-void tty_input_add_char(tty_filp *tty, char ch)
+void tty_input_add_char(struct tty_filp *tty, char ch)
 {
 	struct wait_entry *we;
 
@@ -177,7 +170,7 @@ void tty_input_add_char(tty_filp *tty, char ch)
 	tty->ops->fn_unlock(tty);
 }
 
-void tty_input_add_string(tty_filp *tty, const char *string)
+void tty_input_add_string(struct tty_filp *tty, const char *string)
 {
 	struct wait_entry *we;
 	int len = strlen(string);
@@ -196,7 +189,7 @@ void tty_input_add_string(tty_filp *tty, const char *string)
 }
 
 /* write to the terminal, observing termios settings */
-static int tty_write_output(tty_filp *tty, unsigned char ch)
+static int tty_write_output(struct tty_filp *tty, unsigned char ch)
 {
 	switch (ch)
 	{
@@ -246,9 +239,9 @@ static void tty_debug_dump_buffer(const unsigned char *buffer, size_t sz)
 	dprintf("tty out -> '%.*s'\n", n, out);
 }
 
-static int tty_write(filp *f, const void *buf, size_t size, loff_t *off, int block)
+static int tty_write(struct filp *f, const void *buf, size_t size, loff_t *off, int block)
 {
-	tty_filp *tty = (tty_filp*) f;
+	struct tty_filp *tty = (struct tty_filp*) f;
 	DWORD written = 0;
 	unsigned char *p = NULL;
 	unsigned char buffer[0x1000];
@@ -290,14 +283,14 @@ static int tty_write(filp *f, const void *buf, size_t size, loff_t *off, int blo
 	return written;
 }
 
-static int tty_set_termios(tty_filp *tty, void *p)
+static int tty_set_termios(struct tty_filp *tty, void *p)
 {
 	int r;
 	/*
 	 * There's two or three different termios structures.
 	 * TODO: use the kernel structure, not the libc one
 	 */
-	STATIC_ASSERT(sizeof tty->tios == 60);
+	STATIC_ASSERT(sizeof tty->tios == 36);
 
 	r = current->ops->memcpy_from(&tty->tios, p, sizeof tty->tios);
 	if (r < 0)
@@ -313,13 +306,14 @@ static int tty_set_termios(tty_filp *tty, void *p)
 	return 0;
 }
 
-static int tty_get_termios(tty_filp *tty, void *p)
+static int tty_get_termios(struct tty_filp *tty, void *p)
 {
 	dprintf("get termios(%p)\n", p);
+	STATIC_ASSERT(sizeof tty->tios == 36);
 	return current->ops->memcpy_to(p, &tty->tios, sizeof tty->tios);
 }
 
-static int tty_get_winsize(tty_filp *tty, void *ptr)
+static int tty_get_winsize(struct tty_filp *tty, void *ptr)
 {
 	struct winsize ws;
 
@@ -327,27 +321,46 @@ static int tty_get_winsize(tty_filp *tty, void *ptr)
 	return current->ops->memcpy_to(ptr, &ws, sizeof ws);
 }
 
-static int tty_ioctl(filp *f, int cmd, unsigned long arg)
+static int tty_tcflush(struct tty_filp *tty, int what)
 {
-	tty_filp *tty = (tty_filp*) f;
-	int *pgrp;
+	return 0;
+}
+
+static int tty_get_process_group(struct tty_filp *tty, void *ptr)
+{
+	int pgid = tty->pgid;
+	dprintf("TIOCGPGRP -> %d\n", pgid);
+	return current->ops->memcpy_to(ptr, &pgid, sizeof pgid);
+}
+
+static int tty_ioctl(struct filp *f, int cmd, unsigned long arg)
+{
+	struct tty_filp *tty = (struct tty_filp*) f;
 	int r = 0;
 
 	switch (cmd)
 	{
 	case TIOCGPGRP:
-		pgrp = (int*)arg;
-		*pgrp = f->pgid;
-		break;
+		return tty_get_process_group(tty, (void*)arg);
 	case TIOCSPGRP:
-		f->pgid = arg;
+		tty->pgid = arg;
 		break;
+	/*
+	 * TODO: termios handling is wrong
+	 *       Set calls do subtly different things.
+	 */
 	case TIOCS:
+		return tty_set_termios(tty, (void*)arg);
+	case TCSETSW:
+		return tty_set_termios(tty, (void*)arg);
+	case TCSETAW:
 		return tty_set_termios(tty, (void*)arg);
 	case TIOCG:
 		return tty_get_termios(tty, (void*)arg);
 	case TIOCGWINSZ:
 		return tty_get_winsize(tty, (void*)arg);
+	case TCFLUSH:
+		return tty_tcflush(tty, arg);
 	default:
 		dprintf("unknown tty ioctl(%08x, %08lx)\n", cmd, arg);
 		r = -_L(EINVAL);
@@ -356,10 +369,11 @@ static int tty_ioctl(filp *f, int cmd, unsigned long arg)
 	return r;
 }
 
-static int tty_poll(filp *f)
+static int tty_poll(struct filp *f)
 {
 	int events = 0;
-	tty_filp *tty = (tty_filp*) f;
+	struct tty_filp *tty = (struct tty_filp*) f;
+
 	tty->ops->fn_lock(tty);
 	if (0 != tty_process_input(tty))
 		events |= _l_POLLIN;
@@ -368,18 +382,18 @@ static int tty_poll(filp *f)
 	return events;
 }
 
-static void tty_poll_add(filp *f, struct wait_entry *we)
+static void tty_poll_add(struct filp *f, struct wait_entry *we)
 {
-	tty_filp *tty = (tty_filp*) f;
+	struct tty_filp *tty = (struct tty_filp*) f;
 
 	tty->ops->fn_lock(tty);
 	wait_entry_append(&tty->wl, we);
 	tty->ops->fn_unlock(tty);
 }
 
-static void tty_poll_del(filp *f, struct wait_entry *we)
+static void tty_poll_del(struct filp *f, struct wait_entry *we)
 {
-	tty_filp *tty = (tty_filp*) f;
+	struct tty_filp *tty = (struct tty_filp*) f;
 
 	tty->ops->fn_lock(tty);
 	wait_entry_remove(&tty->wl, we);
@@ -395,7 +409,7 @@ static const struct filp_ops tty_file_ops = {
 	.fn_poll_del = &tty_poll_del,
 };
 
-void tty_init(tty_filp *tty)
+void tty_init(struct tty_filp *tty, int pgid)
 {
 	init_fp(&tty->fp, &tty_file_ops);
 
@@ -405,4 +419,5 @@ void tty_init(tty_filp *tty)
 	tty->tios.c_oflag = ONLCR | OPOST;
 	tty->eof = 0;
 	tty->ready_count = 0;
+	tty->pgid = pgid;
 }

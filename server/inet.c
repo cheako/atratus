@@ -79,7 +79,8 @@ enum socket_state
 
 struct socket_filp
 {
-	filp fp;
+	struct filp fp;
+	HANDLE handle;
 	OVERLAPPED overlapped;
 	struct process *thread;
 	struct socket_filp *next;
@@ -124,7 +125,7 @@ static int WSAToErrno(const char *func)
 
 static int inet_error_from_overlapped(struct socket_filp *sfp)
 {
-	SOCKET s = (SOCKET) sfp->fp.handle;
+	SOCKET s = (SOCKET) sfp->handle;
 	DWORD bytesTransferred = 0;
 	DWORD err, flags = 0;
 	BOOL r;
@@ -167,30 +168,23 @@ static int inet_socket_wait_complete(struct socket_filp *sfp)
 	return inet_error_from_overlapped(sfp);
 }
 
-static int inet_read(filp *fp, void *buf, size_t size, loff_t *off, int block)
+static int inet_read(struct filp *fp, void *buf, size_t size, loff_t *off, int block)
 {
 	struct socket_filp *sfp = (struct socket_filp*) fp;
-	uint8_t buffer[0x1000];
 	DWORD bytesRead;
 	int bytesCopied = 0;
 
 	while (size)
 	{
-		SOCKET s = (SOCKET) sfp->fp.handle;
+		SOCKET s = (SOCKET) sfp->handle;
 		WSABUF wsabuf;
-		DWORD sz;
-		int r;
 		DWORD flags;
-
-		if (size > sizeof buffer)
-			sz = sizeof buffer;
-		else
-			sz = size;
+		int r;
 
 		sfp->async_events &= ~FD_READ;
 
-		wsabuf.buf = (void*) buffer;
-		wsabuf.len = sz;
+		wsabuf.buf = (void*) buf;
+		wsabuf.len = size;
 		bytesRead = 0;
 		flags = 0;
 		r = WSARecv(s, &wsabuf, 1, &bytesRead, &flags, &sfp->overlapped, NULL);
@@ -201,7 +195,7 @@ static int inet_read(filp *fp, void *buf, size_t size, loff_t *off, int block)
 			if (WSAGetLastError() != ERROR_IO_PENDING)
 			{
 				dprintf("WriteFile %p failed %ld\n",
-					sfp->fp.handle, GetLastError());
+					sfp->handle, GetLastError());
 				return WSAToErrno("inet_read");
 			}
 
@@ -215,25 +209,15 @@ static int inet_read(filp *fp, void *buf, size_t size, loff_t *off, int block)
 			bytesRead = r;
 		}
 
-		r = current->ops->memcpy_to(buf, buffer, bytesRead);
-		if (r < 0)
-		{
-			if (bytesCopied)
-				break;
-			return r;
-		}
 		bytesCopied += bytesRead;
 		buf = (char*) buf + bytesRead;
 		size -= bytesRead;
-
-		if (bytesRead != sizeof buffer)
-			break;
 	}
 
 	return bytesCopied;
 }
 
-static int inet_write(filp *fp, const void *buf, size_t size, loff_t *off, int block)
+static int inet_write(struct filp *fp, const void *buf, size_t size, loff_t *off, int block)
 {
 	struct socket_filp *sfp = (struct socket_filp*) fp;
 	uint8_t buffer[0x1000];
@@ -257,7 +241,7 @@ static int inet_write(filp *fp, const void *buf, size_t size, loff_t *off, int b
 			return -_L(EFAULT);
 
 		bytesWritten = 0;
-		ret = WriteFile(sfp->fp.handle, buffer, bytesRead,
+		ret = WriteFile(sfp->handle, buffer, bytesRead,
 				&bytesWritten, &sfp->overlapped);
 		if (!ret)
 		{
@@ -266,7 +250,7 @@ static int inet_write(filp *fp, const void *buf, size_t size, loff_t *off, int b
 			if (GetLastError() != ERROR_IO_PENDING)
 			{
 				dprintf("WriteFile %p failed %ld\n",
-					sfp->fp.handle, GetLastError());
+					sfp->handle, GetLastError());
 				return -_L(EIO);
 			}
 
@@ -289,10 +273,10 @@ static int inet_write(filp *fp, const void *buf, size_t size, loff_t *off, int b
 	return bytesCopied;
 }
 
-static void inet_close(filp *fp)
+static void inet_close(struct filp *fp)
 {
 	struct socket_filp *sfp = (struct socket_filp*) fp;
-	SOCKET s = (SOCKET) sfp->fp.handle;
+	SOCKET s = (SOCKET) sfp->handle;
 	struct socket_filp **p;
 	int found = 0;
 
@@ -317,7 +301,7 @@ static void inet_close(filp *fp)
 
 static int inet_set_reuseaddr(struct socket_filp *sfp, const void *optval, size_t optlen)
 {
-	SOCKET s = (SOCKET) sfp->fp.handle;
+	SOCKET s = (SOCKET) sfp->handle;
 	int val = 0;
 	int r;
 
@@ -338,7 +322,7 @@ static int inet_set_reuseaddr(struct socket_filp *sfp, const void *optval, size_
 
 static int inet_set_keepalive(struct socket_filp *sfp, const void *optval, size_t optlen)
 {
-	SOCKET s = (SOCKET) sfp->fp.handle;
+	SOCKET s = (SOCKET) sfp->handle;
 	int val = 0;
 	int r;
 
@@ -387,7 +371,7 @@ static int inet_connect(struct socket_filp *sfp,
 {
 	struct sockaddr_in sin;
 	int r;
-	SOCKET s = (SOCKET) sfp->fp.handle;
+	SOCKET s = (SOCKET) sfp->handle;
 
 	dprintf("connect(%p,%p,%d) block=%d\n", sfp, addr, addrlen, block);
 
@@ -485,7 +469,7 @@ static int inet_bind(struct socket_filp *sfp, void *addr, size_t addrlen)
 {
 	struct sockaddr_in sin;
 	int r;
-	SOCKET s = (SOCKET) sfp->fp.handle;
+	SOCKET s = (SOCKET) sfp->handle;
 
 	dprintf("bind(%p,%p,%d)\n", sfp, addr, addrlen);
 
@@ -522,7 +506,7 @@ static int inet_bind(struct socket_filp *sfp, void *addr, size_t addrlen)
 
 static int inet_listen(struct socket_filp *sfp, int backlog)
 {
-	SOCKET s = (SOCKET) sfp->fp.handle;
+	SOCKET s = (SOCKET) sfp->handle;
 	int r;
 
 	r = listen(s, backlog);
@@ -542,7 +526,7 @@ static int inet_copy_accept_addr(struct socket_filp *sfp,
 	struct sockaddr_in *in_local, *in_remote;
 	size_t len = sizeof (struct sockaddr_in);
 	INT local_len, remote_len;
-	SOCKET s = (SOCKET) sfp->fp.handle;
+	SOCKET s = (SOCKET) sfp->handle;
 	unsigned short port;
 	unsigned int sa;
 	int r;
@@ -589,7 +573,7 @@ static int inet_accept(struct socket_filp *sfp,
 			struct sockaddr *addr, size_t *addrlen,
 			int block)
 {
-	SOCKET s = (SOCKET) sfp->fp.handle;
+	SOCKET s = (SOCKET) sfp->handle;
 	struct socket_filp *new_sfp;
 	DWORD recv_len = 0;
 	BOOL ret;
@@ -688,7 +672,7 @@ accepted:
 
 static int inet_shutdown(struct socket_filp *sfp, int how)
 {
-	SOCKET s = (SOCKET) sfp->fp.handle;
+	SOCKET s = (SOCKET) sfp->handle;
 	int r;
 
 	dprintf("shutdown(%d,%d)\n", s, how);
@@ -707,7 +691,7 @@ static int inet_shutdown(struct socket_filp *sfp, int how)
 static int inet_getpeername(struct socket_filp *sfp,
 			struct sockaddr *addr, size_t *addrlen)
 {
-	SOCKET s = (SOCKET) sfp->fp.handle;
+	SOCKET s = (SOCKET) sfp->handle;
 	struct sockaddr_in sin;
 	int len = sizeof sin;
 	size_t maxlen = 0;
@@ -740,7 +724,7 @@ static int inet_getpeername(struct socket_filp *sfp,
 static int inet_getsockname(struct socket_filp *sfp,
 			struct sockaddr *addr, size_t *addrlen)
 {
-	SOCKET s = (SOCKET) sfp->fp.handle;
+	SOCKET s = (SOCKET) sfp->handle;
 	struct sockaddr_in sin;
 	int len = sizeof sin;
 	size_t maxlen = 0;
@@ -770,7 +754,7 @@ static int inet_getsockname(struct socket_filp *sfp,
 	return 0;
 }
 
-static int inet_sockcall(int call, filp *fp, unsigned long *args, int block)
+static int inet_sockcall(int call, struct filp *fp, unsigned long *args, int block)
 {
 	struct socket_filp *sfp = (struct socket_filp*) fp;
 
@@ -809,21 +793,21 @@ static int inet_sockcall(int call, filp *fp, unsigned long *args, int block)
 	return -_L(ENOSYS);
 }
 
-static void inet_poll_add(filp *f, struct wait_entry *we)
+static void inet_poll_add(struct filp *f, struct wait_entry *we)
 {
 	struct socket_filp *sfp = (struct socket_filp*) f;
 
 	wait_entry_append(&sfp->wl, we);
 }
 
-static void inet_poll_del(filp *f, struct wait_entry *we)
+static void inet_poll_del(struct filp *f, struct wait_entry *we)
 {
 	struct socket_filp *sfp = (struct socket_filp *) f;
 
 	wait_entry_remove(&sfp->wl, we);
 }
 
-static int inet_poll(filp *f)
+static int inet_poll(struct filp *f)
 {
 	struct socket_filp *sfp = (struct socket_filp*) f;
 	int events = 0;
@@ -911,7 +895,7 @@ static struct socket_filp *inet_alloc_socket(SOCKET s)
 	sfp->state = ss_created;
 
 	init_fp(&sfp->fp, &inet_ops);
-	sfp->fp.handle = (HANDLE) s;
+	sfp->handle = (HANDLE) s;
 
 	sfp->next = inet_first_socket;
 	inet_first_socket = sfp;
@@ -924,7 +908,7 @@ static struct socket_filp *inet_alloc_socket(SOCKET s)
 
 static int inet_alloc_fd(struct socket_filp *sfp)
 {
-	SOCKET s = (SOCKET) sfp->fp.handle;
+	SOCKET s = (SOCKET) sfp->handle;
 	int fd;
 
 	fd = alloc_fd();
@@ -953,7 +937,7 @@ void inet4_process_events(void)
 		if (sfp->thread &&
 			HasOverlappedIoCompleted(&sfp->overlapped))
 		{
-			SOCKET s = (SOCKET) sfp->fp.handle;
+			SOCKET s = (SOCKET) sfp->handle;
 			dprintf("socket %d ready\n", s);
 			ready_list_add(sfp->thread);
 		}
@@ -1021,7 +1005,7 @@ static void inet_on_async_select(WPARAM wParam, LPARAM lParam)
 
 	for (sfp = inet_first_socket; sfp; sfp = sfp->next)
 	{
-		SOCKET s = (SOCKET) sfp->fp.handle;
+		SOCKET s = (SOCKET) sfp->handle;
 		if (s == wParam)
 		{
 			struct wait_entry *we;

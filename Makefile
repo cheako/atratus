@@ -19,7 +19,6 @@
 #
 
 all:
-	cd lib && make
 	cd server && make
 	cd tests/static && make
 	cd tests/dynamic && make
@@ -27,7 +26,6 @@ all:
 	cd tests/X11 && make
 
 clean:
-	cd lib && make $@
 	cd server && make $@
 	cd tests/static && make $@
 	cd tests/dynamic && make $@

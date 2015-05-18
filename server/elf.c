@@ -47,14 +47,9 @@
 
 #define DEFAULT_STACKSIZE 0x100000
 
-/* TODO: remove these */
-int sys_pread64(int fd, void *addr, size_t length, loff_t ofs);
-int do_open(const char *file, int flags, int mode);
-int kread(int fd, void *buf, size_t size, loff_t off);
-
 struct elf_module
 {
-	int fd;
+	struct filp *fp;
 	void *base;
 	uint32_t min_vaddr;
 	uint32_t max_vaddr;
@@ -98,7 +93,7 @@ int elf_alloc_vdso(struct process *proc, void **vdso)
 	uint8_t code[] = {0xcd, 0x80, 0xc3};
 
 	addr = vm_process_map(proc, 0, sz, _l_PROT_READ | _l_PROT_WRITE | _l_PROT_EXEC,
-		 _l_MAP_PRIVATE|_l_MAP_ANONYMOUS, -1, 0);
+		 _l_MAP_PRIVATE|_l_MAP_ANONYMOUS, NULL, 0);
 	if (addr == _l_MAP_FAILED)
 		return -_L(ENOMEM);
 
@@ -263,6 +258,13 @@ int elf_stack_setup(struct process *context,
 	}
 
 	context->regs.Esp = (ULONG) addr;
+	context->regs.Eax = 0;
+	context->regs.Ebx = 0;
+	context->regs.Ecx = 0;
+	context->regs.Edx = 0;
+	context->regs.Esi = 0;
+	context->regs.Edi = 0;
+	context->regs.Ebp = 0;
 
 	return 0;
 }
@@ -285,7 +287,7 @@ void elf_object_free(struct elf_module *m)
 {
 	if (!m)
 		return;
-	do_close(m->fd);
+	filp_close(m->fp);
 	free(m);
 }
 
@@ -299,7 +301,7 @@ static unsigned int round_up_to_page(unsigned int addr)
 	return (addr + pagemask) & ~pagemask;
 }
 
-int elf_mmap_flags_get(int flags)
+static int elf_mmap_flags_get(int flags)
 {
 	int mapflags = 0;
 
@@ -312,12 +314,17 @@ int elf_mmap_flags_get(int flags)
 	return mapflags;
 }
 
-void elf_map_flags_print(int flags)
+static void elf_map_flags_print(int flags)
 {
 	dprintf("map -> %s %s %s\n",
 		flags & _l_PROT_READ ? "PROT_READ" : "",
 		flags & _l_PROT_WRITE ? "PROT_WRITE" : "",
 		flags & _l_PROT_EXEC ? "PROT_EXEC" : "");
+}
+
+static int elf_read(struct filp *fp, void *buf, size_t len, loff_t ofs)
+{
+	return fp->ops->fn_read(fp, buf, len, &ofs, 1);
 }
 
 int elf_object_map(struct process *proc, struct elf_module *m)
@@ -341,7 +348,7 @@ int elf_object_map(struct process *proc, struct elf_module *m)
 
 	/* reserve memory for image */
 	m->base = vm_process_map(proc, (void*)m->min_vaddr, m->max_vaddr - m->min_vaddr,
-			_l_PROT_NONE, _l_MAP_ANONYMOUS|_l_MAP_PRIVATE, -1, 0);
+			_l_PROT_NONE, _l_MAP_ANONYMOUS|_l_MAP_PRIVATE, NULL, 0);
 	if (m->base == _l_MAP_FAILED)
 	{
 		dprintf("mmap failed\n");
@@ -357,6 +364,8 @@ int elf_object_map(struct process *proc, struct elf_module *m)
 		unsigned int vaddr_offset = (m->to_load[i].p_vaddr & pagemask);
 		unsigned int memsz = round_up_to_page(vaddr_offset + m->to_load[i].p_memsz);
 		unsigned int max_addr;
+		void *ptr;
+		size_t max_sz = 0;
 
 		elf_map_flags_print(mapflags);
 
@@ -374,7 +383,7 @@ int elf_object_map(struct process *proc, struct elf_module *m)
 		 */
 		p = vm_process_map(proc, p, memsz,
 			_l_PROT_READ | _l_PROT_WRITE | _l_PROT_EXEC,
-			_l_MAP_FIXED|_l_MAP_PRIVATE|_l_MAP_ANONYMOUS, -1, 0);
+			_l_MAP_FIXED|_l_MAP_PRIVATE|_l_MAP_ANONYMOUS, NULL, 0);
 		if (p == _l_MAP_FAILED)
 		{
 			fprintf(stderr, "mmap failed (%d)\n", -(int)p);
@@ -384,7 +393,17 @@ int elf_object_map(struct process *proc, struct elf_module *m)
 		p = (void*)(m->base - m->min_vaddr + m->to_load[i].p_vaddr);
 		dprintf("pread %08x bytes from %08x to %p\n",
 			m->to_load[i].p_filesz, m->to_load[i].p_offset, p);
-		r = sys_pread64(m->fd, p, m->to_load[i].p_filesz, m->to_load[i].p_offset);
+
+		r = vm_get_pointer(proc, p, &ptr, &max_sz);
+		if (r < 0)
+			goto error;
+		if (max_sz < m->to_load[i].p_filesz)
+		{
+			r = -_L(EPERM);
+			goto error;
+		}
+
+		r = elf_read(m->fp, ptr, m->to_load[i].p_filesz, m->to_load[i].p_offset);
 		if (r != m->to_load[i].p_filesz)
 		{
 			fprintf(stderr, "read failed (%08x != %08x)\n",
@@ -423,14 +442,22 @@ struct elf_module *elf_module_load(const char *path)
 	m->min_vaddr = 0xfffff000;
 	m->max_vaddr = 0;
 
-	m->fd = do_open(path, _l_O_RDONLY, 0);
-	if (m->fd < 0)
+	m->fp = filp_open(path, _l_O_RDONLY, 0, 1);
+	r = L_PTR_ERROR(m->fp);
+	if (r < 0)
 	{
 		dprintf("open() failed\n");
+		m->fp = NULL;
 		goto error;
 	}
 
-	r = kread(m->fd, &m->ehdr, sizeof m->ehdr, 0);
+	if (!m->fp->ops->fn_read)
+	{
+		r = -_L(EPERM);
+		goto error;
+	}
+
+	r = elf_read(m->fp, &m->ehdr, sizeof m->ehdr, 0);
 	if (r < 0)
 	{
 		dprintf("read() failed\n");
@@ -460,14 +487,14 @@ struct elf_module *elf_module_load(const char *path)
 	dprintf("opened ELF file, entry=%08x\n", m->ehdr.e_entry);
 
 	dprintf("Program headers (%d)\n", m->ehdr.e_phnum);
-	dprintf("     %-15s %-8s %-8s %-8s %-8s %-8s %-8s\n",
+	dprintf("%-4s %-8s %-8s %-8s %-8s %-8s %-8s\n",
 		"type", "offset", "vaddr", "filesz",
 		"memsz", "flags", "align");
 
 	for (i = 0; i < m->ehdr.e_phnum; i++)
 	{
 		Elf32_Phdr phdr;
-		r = kread(m->fd, &phdr, sizeof phdr,
+		r = elf_read(m->fp, &phdr, sizeof phdr,
 			 m->ehdr.e_phoff + i * sizeof phdr);
 		if (r < 0)
 			break;
@@ -509,7 +536,7 @@ struct elf_module *elf_module_load(const char *path)
 				dprintf("interpreter name too big\n");
 				goto error;
 			}
-			r = kread(m->fd, &m->interpreter, sz, phdr.p_offset);
+			r = elf_read(m->fp, &m->interpreter, sz, phdr.p_offset);
 			if (r != sz)
 			{
 				dprintf("interpreter name read failed\n");
@@ -522,7 +549,7 @@ struct elf_module *elf_module_load(const char *path)
 	return m;
 
 error:
-	do_close(m->fd);
+	filp_close(m->fp);
 	free(m);
 	return NULL;
 }

@@ -22,6 +22,7 @@
 #ifndef __ATRATUS_PIPE_H__
 #define __ATRATUS_PIPE_H__
 
-extern int do_pipe(int *fds);
+struct filp;
+extern int pipe_create(struct filp **fp);
 
 #endif /* __ATRATUS_PIPE_H__ */

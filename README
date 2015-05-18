@@ -28,14 +28,14 @@ LIMITATIONS?
   It may not work correctly on Windows 8, and does not work on
   Windows 2000 or any 64bit Windows in its current state.
 
-* This version is a proof of concept to show that fork() and exec(),
-  which have been a stubling block of previous Linux-binary-on-Windows
-  projects can work.
-
-* programs statically linked with glibc will (currently) not work
+* Performance of TLS emulation needs to be worked on.
 
 
-DIRTY TECHNICAL DETAILS?
+TECHNICAL DETAILS?
+
+* The "kernel" and "userland" are separate Windows processes. The
+  userland process's memory is allocated from a shared section owned
+  by the kernel.
 
 * fork() is implemented using NtCreateProcess() which is an NT system
   call not exposed to Win32 userland
@@ -44,14 +44,10 @@ DIRTY TECHNICAL DETAILS?
   although they could be caught by an exception handler "in process"
   to improve efficiency.
 
-* TLS is not yet fully handled, but will work using a combination of
-  instruction emulation and by reusing Windows' TLS selector
-  (i.e. setting %gs = %fs)
-
-* the "kernel" is using co-operative multi-tasking (i.e. yield())
+* The "kernel" is using co-operative multi-tasking (i.e. yield())
   to keep things simple and reliable for the moment.
 
-* memory is allocated in the kernel in a shared section, and that
+* Memory is allocated in the kernel in a shared section, and that
   section is also mapped into the client process's address space.
   Windows allocates in chunks of 64k, but Linux allocates in chunks
   of 4k, however this Windows allows page protection to be changed
@@ -69,12 +65,12 @@ This software should build on Ubuntu 12.04 LTS (x86)
 
 DEBUGGING
 
-* the -D flag creates a debug log that logs the system calls handled
+* The -D flag creates a debug log that logs the system calls handled
   by the server process. e.g
 
    C:\Documents and Settings\Mike\Desktop\atratus-v0.6-alpha>bin\atratus.exe -D ls.log bin/ls -la
 
-* when any signal is caught, debugging information is dumped.
+* When any signal is caught, debugging information is dumped.
   The contents are:
 
    - the instruction that caused the fault
@@ -84,7 +80,7 @@ DEBUGGING
    - the allocated address ranges
    - a simple backtrace (walking ESP and EBP), assuming -fframe-pointers
 
-    An example is show below
+  An example is show below:
 
     not a syscall: 0f b6
     EAX:5fffff2c EBX:00fff956 ECX:00fff956 EDX:000006a6

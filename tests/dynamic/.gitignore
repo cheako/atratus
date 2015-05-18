@@ -4,6 +4,7 @@ ctype
 dir
 env
 fork
+futex
 getopt
 getopt_long
 hw
@@ -12,6 +13,7 @@ jmpbuf
 ln
 ls
 malloc
+mmap
 pipe
 qsort
 read

@@ -29,11 +29,12 @@
 #include "process.h"
 #include "tty.h"
 #include "null.h"
+#include "zero.h"
 
-static filp* dev_open(struct fs *fs, const char *file, int flags,
+static struct filp* dev_open(struct fs *fs, const char *file, int flags,
 			int mode, int follow_links)
 {
-	filp *fp = NULL;
+	struct filp *fp = NULL;
 
 	dprintf("opening %s\n", file);
 
@@ -44,6 +45,9 @@ static filp* dev_open(struct fs *fs, const char *file, int flags,
 		fp = current->tty;
 
 	if (!strcmp(file, "null"))
+		fp = null_fp_get();
+
+	if (!strcmp(file, "zero"))
 		fp = null_fp_get();
 
 	if (!fp)

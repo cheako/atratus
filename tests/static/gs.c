@@ -69,6 +69,11 @@ void exit(int code)
 	}
 }
 
+static unsigned int testfn(void)
+{
+	return 0xbead0107;
+}
+
 /* copy the value of %fs to %gs if %gs isn't set already */
 static inline int setup_gs(void *where)
 {
@@ -181,6 +186,64 @@ void _start(void)
 	:"=a"(out) :: "memory");
 	if (0xbead0104 != out)
 		exit(6);
+
+	__asm__ __volatile__ (
+		"\tmovl %%ecx, %%gs:(0)\n"
+		"\tmovl %%gs:(0), %%edx\n"
+	:"=d"(out)
+	:"c"(0xbead0105)
+	:"memory");
+	if (out != 0xbead0105)
+		exit(7);
+
+	__asm__ __volatile__ (
+		"\txor %%gs:(0),%%edx\n"
+	:"=d"(out)
+	:"d"(0xbead0000)
+	:"memory");
+	if (out != 0x0105)
+		exit(7);
+
+	__asm__ __volatile__ (
+		"\tpush %%ebp\n"
+		"\tmovl %%ecx, %%gs:(0)\n"
+		"\tmov $0, %%ebp\n"
+		"\tmov %%gs: 0(%%ebp), %%eax\n"
+		"\tpop %%ebp\n"
+	:"=a"(out)
+	:"c"(0xbead0106)
+	:"memory");
+	if (out != 0xbead0106)
+		exit(8);
+
+	__asm__ __volatile__ (
+		"\tmov %1, %%gs:(0)\n"
+		"\tcall *%%gs:(0)\n"
+	:"=a"(out)
+	:"r"(&testfn)
+	:"memory");
+	if (out != 0xbead0107)
+		exit(9);
+
+	__asm__ __volatile__ (
+		"\tmovl $4, %%eax\n"
+		"\tmovl $0x6d, %%gs:(%%eax)\n"
+		"\tcmpl $0x6d, %%gs:(%%eax)\n"
+		"\tjz 1f\n"
+		"\tincl %%eax\n"
+		"1:\n"
+	:"=a"(out) :: "memory");
+	if (4 != out)
+		exit(10);
+
+	__asm__ __volatile__ (
+		"\tmovl $0xffffffff,%%gs:(%%edx)\n"
+		"\tmovl %%gs:(0), %%eax\n"
+	:"=a"(out)
+	:"d"(0)
+	:"memory");
+	if (0xffffffff != out)
+		exit(11);
 
 	write(1, msg, sizeof msg - 1);
 

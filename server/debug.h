@@ -28,11 +28,17 @@
 		(void) _sa; \
 	} while(0)
 
+#include <windows.h>
+
 void die(const char *fmt, ...) __attribute__((format(printf,1,2), noreturn));
 int dprintf(const char *fmt, ...) __attribute__((format(printf,1,2)));
 void debug_set_file(const char *filename);
 void debug_set_verbose(int val);
 void debug_init(void);
 void debug_line_dump(void *p, unsigned int len);
+void debug_mem_dump(void *p, size_t len);
+void debug_dump_regs(CONTEXT *regs);
+struct process;
+void debug_backtrace(struct process *context);
 
 #endif /* __ATRATUS_DEBUG_H__ */

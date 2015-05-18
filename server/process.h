@@ -23,6 +23,7 @@
 #define __ATRATUS_PROCESS_H__
 
 #include "ntapi.h"
+#include <stdint.h>
 
 #define MAX_FDS 100
 #define MAX_VTLS_ENTRIES 10
@@ -56,7 +57,7 @@ typedef enum {
 
 struct fdinfo
 {
-	filp *fp;
+	struct filp *fp;
 	int flags;
 };
 
@@ -118,6 +119,7 @@ struct process
 	int                             gid;
 	int                             euid;
 	int                             egid;
+	int                             pgid;
 	int				brk;
 	unsigned int			vtls_selector;
 	unsigned int			vtls_entries;
@@ -135,7 +137,7 @@ struct process
 	int				exit_code;
 	PVOID				fiber;
 	char				*cwd;
-	filp				*tty;
+	struct filp			*tty;
 	struct vm_mapping_list		mapping_list;
 };
 
@@ -214,6 +216,8 @@ struct timeout
 	void (*fn)(struct timeout *t);
 };
 
+struct timespec;
+
 extern void timeout_add(struct timeout *t);
 extern void tv_from_ms(struct timeval *t, int ms);
 extern void timeout_add_ms(struct timeout *t, int ms);
@@ -238,5 +242,6 @@ extern void process_free(struct process *process);
 extern void ready_list_add(struct process *p);
 
 extern int process_close_fd(struct process *p, int fd);
+int process_getpid(struct process *p);
 
 #endif /* __ATRATUS_PROCESS_H__ */

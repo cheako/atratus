@@ -29,10 +29,15 @@ int vm_memcpy_from_process(struct process *p, void *local_addr,
 			const void *client_addr, size_t size);
 int vm_memcpy_to_process(struct process *p, void *client_addr,
 			const void *local_addr, size_t size);
-void* vm_process_map(struct process *proc, void *addr, ULONG len,
-		 int prot, int flags, int fd, off_t offset);
+void* vm_process_map(struct process *proc, void *addr, size_t len,
+		 int prot, int flags, struct filp *fp, off_t offset);
+int vm_process_map_protect(struct process *proc, void *addr,
+			size_t len, int prot);
+int vm_process_unmap(struct process *proc, void *addr, size_t len);
 int vm_get_pointer(struct process *p, const void *client_addr,
 		void **addr, size_t *max_size);
+int vm_string_read(struct process *proc, const char *addr, char **out);
+void vm_dump_address_space(struct process *p);
 
 static inline unsigned long round_down(unsigned long val, unsigned long rounding)
 {

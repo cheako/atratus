@@ -24,18 +24,19 @@
 
 #include "linux-defines.h"
 
-struct _tty_filp;
+struct tty_filp;
 
 struct con_ops {
-	void (*fn_lock)(struct _tty_filp *con);
-	void (*fn_unlock)(struct _tty_filp *con);
-	int (*fn_write)(struct _tty_filp *con, unsigned char ch);
-	void (*fn_get_winsize)(struct _tty_filp *con, struct winsize *ws);
+	void (*fn_lock)(struct tty_filp *con);
+	void (*fn_unlock)(struct tty_filp *con);
+	int (*fn_write)(struct tty_filp *con, unsigned char ch);
+	void (*fn_get_winsize)(struct tty_filp *con, struct winsize *ws);
 };
 
-struct _tty_filp {
-	filp fp;
+struct tty_filp {
+	struct filp fp;
 	struct con_ops *ops;
+	int pgid;
 	int eof;
 	unsigned char ready_data[20];
 	int ready_count;
@@ -43,10 +44,8 @@ struct _tty_filp {
 	struct wait_list wl;
 };
 
-typedef struct _tty_filp tty_filp;
-
-void tty_input_add_string(tty_filp *con, const char *string);
-void tty_input_add_char(tty_filp *con, char ch);
-void tty_init(tty_filp* con);
+void tty_input_add_string(struct tty_filp *con, const char *string);
+void tty_input_add_char(struct tty_filp *con, char ch);
+void tty_init(struct tty_filp* con, int pgid);
 
 #endif /* __TTY_H__ */

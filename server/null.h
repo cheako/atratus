@@ -22,6 +22,6 @@
 #ifndef __ATRATUS_SERVER_NULL_H__
 #define __ATRATUS_SERVER_NULL_H__
 
-filp *null_fp_get(void);
+struct filp *null_fp_get(void);
 
 #endif /* __ATRATUS_SERVER_NULL_H__ */
