@@ -40,7 +40,10 @@ struct tty_filp {
 	unsigned char ready_data[20];
 	int ready_count;
 	struct termios tios;
-	struct wait_list wl;
+	LIST_ANCHOR(struct wait_entry) wl;
+	struct workitem interrupt_item;
+	int suspend;
+	int interrupt;
 };
 
 void tty_input_add_string(struct tty_filp *con, const char *string);

@@ -7,6 +7,7 @@
 #define _l_EPERM 1
 #define _l_ENOENT 2
 #define _l_ESRCH 3
+#define _l_EINTR 4
 #define _l_EIO 5
 #define _l_EBADF 9
 #define _l_ECHILD 10

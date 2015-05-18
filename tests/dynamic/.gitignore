@@ -17,13 +17,15 @@ mmap
 pipe
 qsort
 read
+signal
 socket
 stat
-string
 stdlib
 stdio
+string
 time
 tls
 ttysize
 uname
 vtplay
+waitpid

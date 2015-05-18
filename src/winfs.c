@@ -357,9 +357,9 @@ static int winfs_getdents(struct filp *fp, void *de, unsigned int count, fn_add_
 			FileDirectoryInformation, 0, NULL /*&mask*/, wfp->dir_count == 0);
 		if (ret == STATUS_PENDING)
 		{
-			current->state = thread_stopped;
-			yield();
-			current->state = thread_running;
+			schedule();
+			if (current->state == thread_terminated)
+				break;
 
 			ret = iosb.Status;
 			dprintf("NtQueryDirectoryFile -> %08lx\n", ret);
@@ -1081,7 +1081,7 @@ static const struct filp_ops winfs_file_ops = {
 
 static struct fs winfs =
 {
-	.root = "/",
+	.root = "",
 	.open = &winfs_open,
 };
 

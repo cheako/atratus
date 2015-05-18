@@ -142,7 +142,7 @@ void vm_mappings_copy(struct process *to, struct process *from)
 	ULONG old_prot;
 	int i;
 
-	for (m = from->mapping_list.first; m; m = m->next)
+	LIST_FOR_EACH(&from->mapping_list, m, item)
 	{
 		char *pto, *pfrom;
 		int page_count = (m->size + 0xfff)/0x1000;
@@ -160,8 +160,8 @@ void vm_mappings_copy(struct process *to, struct process *from)
 			die("vm: bad offset @%d!\n", __LINE__);
 		if (vm_offset > vm_maxsize)
 			die("vm: out of memory at %d\n", __LINE__);
-
-		mapping_append(&to->mapping_list, mapping);
+		LIST_ELEMENT_INIT(mapping, item);
+		LIST_APPEND(&to->mapping_list, mapping, item);
 
 		/*
 		 * Copy the mapping.
@@ -216,7 +216,7 @@ static struct vm_mapping *vm_mapping_find(struct process *p, const void *addr)
 	struct vm_mapping *m;
 	void *start, *end;
 
-	for (m = p->mapping_list.first; m; m = m->next)
+	LIST_FOR_EACH(&p->mapping_list, m, item)
 	{
 		start = m->address;
 		end = (char*) m->address + m->size;
@@ -238,7 +238,7 @@ static size_t vm_get_hole_size(struct process *p, const void *addr)
 		return 0;
 	max = 0x80000000 - (size_t) addr;
 
-	for (m = p->mapping_list.first; m; m = m->next)
+	LIST_FOR_EACH(&p->mapping_list, m, item)
 	{
 		if (m->address <= addr)
 			continue;
@@ -292,12 +292,11 @@ void vm_mappings_free(struct process *p)
 {
 	struct vm_mapping *m;
 
-	while ((m = p->mapping_list.first))
+	while ((m = LIST_HEAD(&p->mapping_list)))
 	{
-		p->mapping_list.first = m->next;
+		LIST_REMOVE(&p->mapping_list, m, item);
 		free(m);
 	}
-	p->mapping_list.last = NULL;
 }
 
 int vm_get_pointer(struct process *p, const void *client_addr,
@@ -454,7 +453,8 @@ static PVOID vm_allocate_pages(struct process *proc, void *addr, size_t len, int
 	dprintf("New mapping %08x bytes at %p, offset=%08llx\n",
 		mapping->size, mapping->address, mapping->offset);
 
-	mapping_append(&proc->mapping_list, mapping);
+	LIST_ELEMENT_INIT(mapping, item);
+	LIST_APPEND(&proc->mapping_list, mapping, item);
 
 	vm_offset += Size;
 	if (vm_offset & 0xffff)

@@ -30,6 +30,7 @@
 #include "tty.h"
 #include "null.h"
 #include "zero.h"
+#include "random.h"
 
 static struct filp* dev_open(struct fs *fs, const char *file, int flags,
 			int mode, int follow_links)
@@ -42,13 +43,19 @@ static struct filp* dev_open(struct fs *fs, const char *file, int flags,
 		file++;
 
 	if (!strcmp(file, "tty"))
+	{
 		fp = current->tty;
+		fp->refcount++;
+	}
 
 	if (!strcmp(file, "null"))
 		fp = null_fp_get();
 
 	if (!strcmp(file, "zero"))
 		fp = null_fp_get();
+
+	if (!strcmp(file, "urandom"))
+		fp = random_fp_get();
 
 	if (!fp)
 		return L_ERROR_PTR(ENOENT);
@@ -58,7 +65,7 @@ static struct filp* dev_open(struct fs *fs, const char *file, int flags,
 
 static struct fs devfs =
 {
-	.root = "/dev/",
+	.root = "/dev",
 	.open = &dev_open,
 };
 

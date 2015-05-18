@@ -24,12 +24,16 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <sys/select.h>
 #include "ok.h"
 
 int test_create_pipe(void)
 {
 	int fds[2] = {-1, -1};
 	char buffer[10];
+	fd_set fdset;
+	struct timeval tv;
+	int r;
 
 	OK(0 == pipe(fds));
 
@@ -50,6 +54,25 @@ int test_create_pipe(void)
 	OK(!memcmp(buffer, "he", 2));
 	OK(3 == read(fds[0], buffer, 3));
 	OK(!memcmp(buffer, "llo", 3));
+
+	/* check fd is not pollable with no data in the pipe */
+	FD_ZERO(&fdset);
+	FD_SET(fds[0], &fdset);
+	tv.tv_sec = 0;
+	tv.tv_usec = 0;
+	r = select(fds[0]+1, &fdset, NULL, NULL, &tv);
+	OK(r == 0);
+	OK(!FD_ISSET(fds[0], &fdset));
+
+	/* check fd is pollable with data in the pipe */
+	OK(1 == write(fds[1], "x", 1));
+	FD_ZERO(&fdset);
+	FD_SET(fds[0], &fdset);
+	tv.tv_sec = 0;
+	tv.tv_usec = 0;
+	r = select(fds[0]+1, &fdset, NULL, NULL, &tv);
+	OK(r == 1);
+	OK(FD_ISSET(fds[0], &fdset));
 
 	OK(0 == close(fds[0]));
 	OK(0 == close(fds[1]));

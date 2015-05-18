@@ -22,6 +22,6 @@
 #ifndef __ATRATUS_VT100_H__
 #define __ATRATUS_VT100_H__
 
-struct filp* get_vt100_console(HANDLE console, struct process *leader);
+struct filp* get_vt100_console(HANDLE in, HANDLE out, struct process *leader);
 
 #endif /* __ATRATUS_VT100_H__ */

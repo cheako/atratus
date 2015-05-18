@@ -41,6 +41,7 @@ TARGETS = \
 	pipe \
 	qsort \
 	read \
+	signal \
 	socket \
 	stat \
 	stdio \
@@ -50,7 +51,8 @@ TARGETS = \
 	tls \
 	ttysize \
 	uname \
-	vtplay
+	vtplay \
+	waitpid
 
 all: $(TARGETS)
 

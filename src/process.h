@@ -26,6 +26,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "linux-defines.h"
+
+#include "list.h"
+
 #define MAX_FDS 100
 #define MAX_VTLS_ENTRIES 10
 
@@ -49,8 +53,10 @@ struct user_desc {
 
 typedef enum {
 	thread_running,
+	thread_ready,
 	thread_stopped,
 	thread_terminated,
+	thread_interrupted,
 } thread_state;
 
 struct fdinfo
@@ -61,7 +67,7 @@ struct fdinfo
 
 struct vm_mapping
 {
-	struct vm_mapping	*next, *prev;
+	LIST_ELEMENT(struct vm_mapping, item);
 	void			*address;
 	size_t			size;
 	uint64_t		offset;
@@ -70,42 +76,14 @@ struct vm_mapping
 
 struct vm_mapping_list
 {
-	struct vm_mapping	*first, *last;
+	struct vm_mapping	*head, *tail;
 };
 
-static void inline mapping_list_init(struct vm_mapping_list *list)
+struct sigqueue
 {
-	list->first = NULL;
-	list->last = NULL;
-}
-
-static void inline mapping_append(struct vm_mapping_list *list,
-				 struct vm_mapping *entry)
-{
-	if (!list->first)
-		list->first = entry;
-	else
-		list->last->next = entry;
-
-	entry->next = NULL;
-	entry->prev = list->last;
-
-	list->last = entry;
-}
-
-static inline void mapping_remove(struct vm_mapping_list *list,
-				struct vm_mapping *entry)
-{
-	if (entry->prev)
-		entry->prev->next = entry->next;
-	else
-		list->first = entry->next;
-
-	if (entry->next)
-		entry->next->prev = entry->prev;
-	else
-		list->last = entry->prev;
-}
+	LIST_ELEMENT(struct sigqueue, item);
+	int signal;
+};
 
 struct process
 {
@@ -123,11 +101,12 @@ struct process
 	unsigned int			vtls_entries;
 	struct user_desc		vtls[MAX_VTLS_ENTRIES];
 	struct fdinfo			handles[MAX_FDS];
-	struct process                  *next_process;
+	LIST_ELEMENT(struct process, item);
 	struct process                  *parent;
-	struct process                  *child;
-	struct process                  *sibling;
-	struct process			*next_ready;
+	LIST_ANCHOR(struct process)	children;
+	LIST_ELEMENT(struct process, sibling);
+	LIST_ELEMENT(struct process, ready_item);
+	LIST_ELEMENT(struct process, remote_break_item);
 	CLIENT_ID			id;
 	USER_STACK			stack_info;
 	thread_state                    state;
@@ -138,81 +117,25 @@ struct process
 	char				*cwd;
 	struct filp			*cwdfp;
 	struct filp			*tty;
-	struct vm_mapping_list		mapping_list;
+	LIST_ANCHOR(struct vm_mapping)	mapping_list;
+	struct l_sigaction		sa[256];
+	LIST_ANCHOR(struct sigqueue)	signal_list;
 	int				ttyeof;
 };
 
 extern struct process *current;
 extern void yield(void);
-
-struct wait_entry;
-
-struct wait_list
-{
-	struct wait_entry *head;
-	struct wait_entry *tail;
-};
+extern void schedule(void);
 
 struct wait_entry
 {
-	struct wait_entry *next;
-	struct wait_entry *prev;
+	LIST_ELEMENT(struct wait_entry, item);
 	struct process *p;
 };
 
-static inline void wait_head_init(struct wait_list *wl)
-{
-	wl->head = NULL;
-	wl->tail = NULL;
-}
-
-static inline void wait_entry_init(struct wait_entry *we)
-{
-	we->next = NULL;
-	we->prev = NULL;
-}
-
-static inline void wait_entry_append(struct wait_list *list,
-				struct wait_entry *entry)
-{
-	if (list->tail)
-		list->tail->next = entry;
-	else
-		list->head = entry;
-	entry->prev = list->tail;
-	list->tail = entry;
-	entry->next = NULL;
-}
-
-static inline void wait_entry_remove(struct wait_list *list,
-				struct wait_entry *entry)
-{
-	if (list->tail == entry)
-		list->tail = entry->prev;
-	else
-		entry->next->prev = entry->prev;
-
-	if (list->head == entry)
-		list->head = entry->next;
-	else
-		entry->prev->next = entry->next;
-
-	entry->p = NULL;
-	entry->prev = NULL;
-	entry->next = NULL;
-}
-
-static inline int wait_entry_in_list(struct wait_list *list,
-		 struct wait_entry *entry)
-{
-	if (list->head == entry || list->tail == entry)
-		return 1;
-	return (entry->prev || entry->next);
-}
-
 struct timeout
 {
-	struct timeout *next;
+	LIST_ELEMENT(struct timeout, item);
 	struct timeval tv;
 	void (*fn)(struct timeout *t);
 };
@@ -227,6 +150,14 @@ extern void timeout_add_timespec(struct timeout *t, struct timespec *ts);
 extern void timeout_remove(struct timeout *t);
 extern void timeout_now(struct timeval *tv);
 
+struct workitem
+{
+	LIST_ELEMENT(struct workitem, item);
+	void(*fn)(struct workitem*);
+};
+
+extern void work_add(struct workitem *item);
+
 struct signal_waiter
 {
 	struct wait_entry we;
@@ -236,11 +167,14 @@ struct signal_waiter
 extern void signal_waiter_add(struct signal_waiter *sw, int signal);
 extern void signal_waiter_remove(struct signal_waiter *sw);
 
+extern void process_signal_group(struct process *p, int signal);
 extern void process_signal(struct process *p, int signal);
 extern void process_free(struct process *process);
+extern int process_pending_signal_check(struct process *p);
 
 /* add a fiber to wake in the main loop */
 extern void ready_list_add(struct process *p);
+extern void ready_list_remove(struct process *p);
 
 extern int process_close_fd(struct process *p, int fd);
 int process_getpid(struct process *p);

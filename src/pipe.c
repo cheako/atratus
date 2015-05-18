@@ -30,7 +30,7 @@ struct pipe_buffer
 {
 	int head, available;
 	int closed;
-	struct wait_list wl;
+	LIST_ANCHOR(struct wait_entry) wl;
 	char buffer[0x1000];
 };
 
@@ -44,7 +44,7 @@ static void pipe_notify_waiters(struct pipe_buffer *pb)
 {
 	struct wait_entry *we;
 
-	for (we = pb->wl.head; we; we = we->next)
+	LIST_FOR_EACH(&pb->wl, we, item)
 		ready_list_add(we->p);
 }
 
@@ -53,11 +53,9 @@ static void pipe_wait_change(struct pipe_buffer *pb)
 	struct wait_entry we;
 
 	we.p = current;
-	wait_entry_append(&pb->wl, &we);
-	current->state = thread_stopped;
-	yield();
-	current->state = thread_running;
-	wait_entry_remove(&pb->wl, &we);
+	LIST_APPEND(&pb->wl, &we, item);
+	schedule();
+	LIST_REMOVE(&pb->wl, &we, item);
 }
 
 static int pipe_read(struct filp *f, void *buf, size_t size, loff_t *off, int block)
@@ -74,11 +72,21 @@ static int pipe_read(struct filp *f, void *buf, size_t size, loff_t *off, int bl
 
 		if (sz == 0)
 		{
+			int r;
+
 			if (pb->closed)
 				break;
 
 			if (!block)
 				break;
+
+			r = process_pending_signal_check(current);
+			if (r < 0)
+			{
+				if (!bytesCopied)
+					bytesCopied = r;
+				break;
+			}
 
 			pipe_wait_change(pb);
 			continue;
@@ -111,7 +119,7 @@ static int pipe_write(struct filp *f, const void *buf, size_t size, loff_t *off,
 	struct pipe_buffer *pb = pfp->pb;
 	int bytesCopied = 0;
 
-	while (size)
+	while (size && current->state != thread_terminated)
 	{
 		int sz;
 		int r;
@@ -167,14 +175,53 @@ static void pipe_close(struct filp *fp)
 		free(pfp->pb);
 }
 
+static int pipe_write_poll(struct filp *fp)
+{
+	struct pipe_filp *pfp = (void*) fp;
+	struct pipe_buffer *pb = pfp->pb;
+	int space = sizeof pb->buffer - pb->available;
+
+	return space ? _L(POLLOUT) : 0;
+}
+
+static int pipe_read_poll(struct filp *fp)
+{
+	struct pipe_filp *pfp = (void*) fp;
+	struct pipe_buffer *pb = pfp->pb;
+
+	return pb->available ? _L(POLLIN) : 0;
+}
+
+static void pipe_poll_add(struct filp *fp, struct wait_entry *we)
+{
+	struct pipe_filp *pfp = (void*) fp;
+	struct pipe_buffer *pb = pfp->pb;
+
+	LIST_APPEND(&pb->wl, we, item);
+}
+
+static void pipe_poll_del(struct filp *fp, struct wait_entry *we)
+{
+	struct pipe_filp *pfp = (void*) fp;
+	struct pipe_buffer *pb = pfp->pb;
+
+	LIST_REMOVE(&pb->wl, we, item);
+}
+
 static const struct filp_ops pipe_write_ops = {
 	.fn_write = &pipe_write,
 	.fn_close = &pipe_close,
+	.fn_poll = &pipe_write_poll,
+	.fn_poll_add = &pipe_poll_add,
+	.fn_poll_del = &pipe_poll_del,
 };
 
 static const struct filp_ops pipe_read_ops = {
 	.fn_read = &pipe_read,
 	.fn_close = &pipe_close,
+	.fn_poll = &pipe_read_poll,
+	.fn_poll_add = &pipe_poll_add,
+	.fn_poll_del = &pipe_poll_del,
 };
 
 int pipe_create(struct filp **fp)

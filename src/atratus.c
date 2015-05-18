@@ -66,9 +66,11 @@ struct _l_new_utsname {
 };
 
 struct process *current = NULL;
-struct process *first_process;
+LIST_ANCHOR(struct process) process_list;
+LIST_ANCHOR(struct process) remote_break_list;
 static LPVOID wait_fiber;
 static HANDLE loop_event;
+static HANDLE debugObject;
 
 static WCHAR stub_exe_name[MAX_PATH];
 
@@ -94,13 +96,13 @@ struct process *context_from_client_id(CLIENT_ID *id)
 {
 	struct process *process;
 
-	process = first_process;
+	process = LIST_HEAD(&process_list);
 	while (process)
 	{
 		if (process->id.UniqueThread == id->UniqueThread &&
 		    process->id.UniqueProcess == id->UniqueProcess)
 			return process;
-		process = process->next_process;
+		process = LIST_NEXT(process, item);
 	}
 	return NULL;
 }
@@ -122,6 +124,7 @@ DECLARE(NtUnmapViewOfSection)
 DECLARE(KiUserApcDispatcher)
 DECLARE(LdrInitializeThunk)
 DECLARE(NtSetLdtEntries)
+DECLARE(NtRemoveProcessDebug);
 #undef DECLARE
 
 static BOOL dynamic_resolve(void)
@@ -149,6 +152,7 @@ static BOOL dynamic_resolve(void)
 		RESOLVE(KiUserApcDispatcher)
 		RESOLVE(LdrInitializeThunk)
 		RESOLVE(NtSetLdtEntries)
+		RESOLVE(NtRemoveProcessDebug)
 #undef RESOLVE
 	}
 	else
@@ -164,8 +168,11 @@ void* sys_mmap(void *addr, size_t len, int prot,
 		int flags, int fd, off_t offset);
 static int do_close(int fd);
 void dump_string_list(char **list);
-void unlink_process(struct process *process);
 void __stdcall SyscallHandler(PVOID param);
+void process_deliver_signal(struct process *p);
+void signal_queue_free(struct process *p);
+void sys_sigreturn(void);
+void sys_rt_sigreturn(void);
 
 static void dump_user_mem(struct process *context,
 			void *p, unsigned int len)
@@ -362,7 +369,7 @@ static NTSTATUS patch_ldr_thunk(struct process *context)
 struct process *process_find(int pid)
 {
 	struct process *p;
-	for (p = first_process; p; p = p->next_process)
+	LIST_FOR_EACH(&process_list, p, item)
 		if (process_getpid(p) == pid)
 			return p;
 	return NULL;
@@ -378,12 +385,16 @@ struct process *alloc_process(void)
 	context->ops = &nt_process_ops;
 	context->process = INVALID_HANDLE_VALUE;
 	context->thread = INVALID_HANDLE_VALUE;
-	context->state = thread_running;
+	context->state = thread_ready;
 	context->umask = 0777;
 
 	/* insert at head of list */
-	context->next_process = first_process;
-	first_process = context;
+	LIST_ELEMENT_INIT(context, item);
+	LIST_PREPEND(&process_list, context, item);
+
+	LIST_ELEMENT_INIT(context, ready_item);
+	LIST_ANCHOR_INIT(&context->signal_list);
+	LIST_ELEMENT_INIT(context, remote_break_item);
 
 	return context;
 }
@@ -646,14 +657,6 @@ void dump_handles(void)
 	dprintf("thread  = %p\n", current->id.UniqueThread);
 }
 
-HANDLE hBreakEvent;
-
-BOOL WINAPI break_handler(DWORD ctrl)
-{
-	SetEvent(hBreakEvent);
-	return TRUE;
-}
-
 const char *debug_state_to_string(DBG_STATE state)
 {
 	switch (state)
@@ -811,7 +814,6 @@ static void process_vtls_copy(struct process *to, struct process *from)
 static int do_fork(struct process **newproc)
 {
 	HANDLE parent = NULL;
-	HANDLE debugObject;
 	struct process *context;
 	OBJECT_ATTRIBUTES oa;
 	NTSTATUS r;
@@ -927,12 +929,17 @@ static int do_fork(struct process **newproc)
 	context->parent = current;
 
 	/* chain siblings if they exist */
-	context->sibling = current->child;
-	current->child = context;
+	LIST_ELEMENT_INIT(context, sibling);
+	LIST_APPEND(&current->children, context, sibling);
+
 	context->umask = current->umask;
 	context->tty = current->tty;
 	context->tty->refcount++;
 	context->leader = current->leader;
+	context->uid = current->uid;
+	context->gid = current->gid;
+	context->euid = current->euid;
+	context->egid = current->egid;
 
 	process_vtls_copy(context, current);
 
@@ -1025,22 +1032,48 @@ int sys_clone(int flags, void *stack, void *ptidptr, int tls, void *ctidptr)
 	return tid;
 }
 
+static void zombie_reaper(struct workitem *item)
+{
+	struct process *p;
+
+	while (1)
+	{
+		LIST_FOR_EACH(&process_list, p, item)
+			if (p->state == thread_terminated)
+				break;
+
+		if (!p)
+			break;
+
+		/* this removes the process from the list */
+		LIST_REMOVE(&process_list, p, item);
+		process_free(p);
+	}
+}
+
+struct workitem zombie_reap_work =
+{
+	INVALID_ELEMENT, INVALID_ELEMENT, &zombie_reaper
+};
+
+void process_shutdown(struct process *p, int exit_code)
+{
+	/* TODO: close handles, other cleanup */
+	if (p->state == thread_terminated)
+	{
+		dprintf("%p: Already shutdown\n", p);
+		return;
+	}
+	p->exit_code = exit_code;
+	p->state = thread_terminated;
+	p->suspended = false;
+	ready_list_add(p);
+}
+
 int sys_exit(int exit_code)
 {
-	dprintf("exit code %d\n", exit_code);
-	NtTerminateProcess(current->process, exit_code);
-	CloseHandle(current->process);
-	/* TODO: close handles, other cleanup */
-	current->exit_code = exit_code;
-	current->state = thread_terminated;
-
-	close_fd_set(current);
-
-	process_signal(current->parent, _L(SIGCHLD));
-
-	if (!current->parent)
-		unlink_process(current);
-
+	dprintf("exit(%d)\n", exit_code);
+	process_shutdown(current, exit_code);
 	return 0;
 }
 
@@ -1193,6 +1226,7 @@ int sys_writev(int fd, const struct iovec *ptr, int iovcnt)
 
 void winfs_init(void);
 void devfs_init(void);
+void procfs_init(void);
 
 struct fs *fs_first;
 
@@ -1235,7 +1269,8 @@ struct filp *filp_open(const char *file, int flags, int mode, int follow_links)
 	for (fs = fs_first; fs; fs = fs->next)
 	{
 		len = strlen(fs->root);
-		if (!strncmp(fs->root, path, len))
+		if (!strncmp(fs->root, path, len) &&
+		    (path[len] == 0 || path[len] == '/'))
 			break;
 	}
 
@@ -1873,14 +1908,7 @@ int sys_kill(int pid, int sig)
 		return -_L(ESRCH);
 
 	process_signal(p, sig);
-	if (p == current)
-	{
-		printf("signal %d\n", sig);
-		debug_dump_regs(&current->regs);
-		dump_stack(current);
-		debug_backtrace(current);
-		exit(1);
-	}
+
 	return 0;
 }
 
@@ -2167,6 +2195,9 @@ static int do_stat64(const char *file, struct stat64 *statbuf, BOOL follow_links
 	if (r < 0)
 		return r;
 
+	if (!fp->ops->fn_stat)
+		return -_L(EPERM);
+
 	r = fp->ops->fn_stat(fp, statbuf);
 
 	filp_close(fp);
@@ -2197,6 +2228,36 @@ static int sys_access(const char *ptr, int mode)
 	}
 
 	free(path);
+
+	return r;
+}
+
+static int do_rename(const char *oldptr, const char *newptr)
+{
+	return -_L(EPERM);
+}
+
+static int sys_rename(const char *oldptr, const char *newptr)
+{
+	char *oldpath = NULL, *newpath = NULL;
+	int r;
+
+	r = vm_string_read(current, oldptr, &oldpath);
+	if (r < 0)
+		goto out;
+
+	r = vm_string_read(current, newptr, &newpath);
+	if (r < 0)
+		goto out2;
+
+	dprintf("rename(\"%s\",\"%s\")\n", oldpath, newpath);
+
+	r = do_rename(oldptr, newptr);
+
+	free(newpath);
+out2:
+	free(oldpath);
+out:
 
 	return r;
 }
@@ -2673,8 +2734,8 @@ static struct process *find_zombie(struct process *parent)
 {
 	struct process *p;
 
-	for (p = parent->child; p; p = p->sibling)
-		if (p->state == thread_terminated)
+	LIST_FOR_EACH(&parent->children, p, sibling)
+		if (p->state == thread_terminated || p->suspended)
 			return p;
 
 	return NULL;
@@ -2689,8 +2750,6 @@ int sys_waitpid(int pid, int *stat_addr, int options)
 	dprintf("waitpid(%d,%p,%08x)\n", pid, stat_addr, options);
 
 	do {
-		struct signal_waiter sw;
-
 		p = find_zombie(current);
 		if (p)
 			break;
@@ -2701,25 +2760,31 @@ int sys_waitpid(int pid, int *stat_addr, int options)
 			break;
 		}
 
-		sw.we.p = current;
+		if (process_pending_signal_check(current))
+		{
+			r = -_L(EINTR);
+			break;
+		}
 
-		signal_waiter_add(&sw, _L(SIGCHLD));
-		current->state = thread_stopped;
-		yield();
-		current->state = thread_running;
-		signal_waiter_remove(&sw);
+		schedule();
+		if (current->state == thread_terminated)
+			return 0;
 	} while (1);
 
 	if (p)
 	{
 		/* TODO: handle WIFSIGNALED(), etc */
-		int status = (p->exit_code & 0xff) << 8;
+		int status = 0;
+		status |= (p->exit_code & 0xff) << 8;
+		if (p->suspended)
+			status |= 0x7f;
 		r = current->ops->memcpy_to(stat_addr, &status,
 					 sizeof exit_code);
 		if (r < 0)
 			return r;
 		r = (ULONG)p->id.UniqueProcess;
-		process_free(p);
+		if (p->state == thread_terminated)
+			work_add(&zombie_reap_work);
 	}
 
 	dprintf("waitpid() -> %d\n", r);
@@ -2792,11 +2857,16 @@ int sys_nanosleep(struct timespec *in, struct timeval *out)
 	pt.t.fn = &poll_timeout_waker;
 	pt.p = current;
 
+	r = process_pending_signal_check(current);
+	if (r < 0)
+		return r;
+
 	timeout_add_timespec(&pt.t, &req);
-	current->state = thread_stopped;
-	yield();
-	current->state = thread_running;
+	schedule();
 	timeout_remove(&pt.t);
+
+	if (current->state == thread_terminated)
+		return 0;
 
 	if (out)
 	{
@@ -2804,6 +2874,9 @@ int sys_nanosleep(struct timespec *in, struct timeval *out)
 		req.tv_nsec = 0;
 		current->ops->memcpy_to(out, &req, sizeof req);
 	}
+
+	if (!LIST_EMPTY(&current->signal_list))
+		return -_L(EINTR);
 
 	return 0;
 }
@@ -2881,9 +2954,13 @@ int do_poll(int nfds, struct _l_pollfd *fds, struct timeval *tv)
 		if (ready || pt.timed_out)
 			break;
 
-		current->state = thread_stopped;
-		yield();
-		current->state = thread_running;
+		ready = process_pending_signal_check(current);
+		if (ready)
+			break;
+
+		schedule();
+		if (current->state == thread_terminated)
+			return 0;
 	}
 
 	for (i = 0; i < nfds; i++)
@@ -3026,12 +3103,13 @@ int do_select(int maxfd, void *rfds, void *wfds, void *efds, void *tvptr)
 		memset(&exset, 0, sizeof exset);
 		for (i = 0; i < nfds; i++)
 		{
+			int fd = fds[i].fd;
 			if (fds[i].revents & _L(POLLIN))
-				fdset_set(&rdset, i);
+				fdset_set(&rdset, fd);
 			if (fds[i].revents & _L(POLLOUT))
-				fdset_set(&wrset, i);
+				fdset_set(&wrset, fd);
 			if (fds[i].revents & (_L(POLLERR)|_L(POLLHUP)))
-				fdset_set(&exset, i);
+				fdset_set(&exset, fd);
 		}
 		if (rfds)
 			current->ops->memcpy_to(rfds, &rdset, sizeof rdset);
@@ -3217,10 +3295,51 @@ int sys_newuname(struct _l_new_utsname *ptr)
 int sys_rt_sigaction(int sig, const struct l_sigaction *act,
 		 struct l_sigaction *oact, size_t sigsetsize)
 {
+	struct l_sigaction sa;
+	struct process *p = current;
+	int r;
+
+	memset(&sa, 0, sizeof sa);
+
 	dprintf("rt_sigaction(%d,%p,%p,%d)\n", sig, act, oact, sigsetsize);
 
 	if (sig == _L(SIGKILL) || sig == _L(SIGSTOP))
 		return -_L(EINVAL);
+
+	if (sig >= 0x100 || sig < 0)
+		return -_L(EINVAL);
+
+	if (oact)
+	{
+		r = vm_memcpy_to_process(p, oact, &p->sa[sig], sizeof sa);
+		if (r < 0)
+			return r;
+	}
+
+	if (act)
+	{
+		r = vm_memcpy_from_process(p, &sa, act, sizeof sa);
+		if (r < 0)
+			return r;
+
+		dprintf("handler:  %p\n", sa.sa_handler);
+		dprintf("flags:    %08lx\n", sa.sa_flags);
+		dprintf("restorer: %p\n", sa.sa_restorer);
+
+		/*
+		 * set in glibc-2.15/sysdeps/unix/sysv/linux/i386/sigaction.c
+		 * not returned by kernel
+		 */
+		sa.sa_flags &= ~_L(SA_RESTORER);
+
+		/*
+		 * TODO:
+		 *  - check action flags and sanity
+		 *  - observe sigsetsize
+		 */
+
+		memcpy(&p->sa[sig], &sa, sizeof sa);
+	}
 
 	return 0;
 }
@@ -3301,9 +3420,15 @@ static int do_futex_wait(unsigned int *uaddr, unsigned int val, struct timespec 
 
 	while (*uaddr == val && !pt.timed_out)
 	{
-		current->state = thread_stopped;
-		yield();
-		current->state = thread_running;
+		int r;
+
+		r = process_pending_signal_check(current);
+		if (r < 0)
+			return r;
+
+		schedule();
+		if (current->state == thread_terminated)
+			return 0;
 	}
 
 	if (ts)
@@ -3417,6 +3542,9 @@ int do_syscall(int n, int a1, int a2, int a3, int a4, int a5, int a6)
 		break;
 	case 33:
 		r = sys_access(ptr(a1), a2);
+		break;
+	case 38:
+		r = sys_rename(ptr(a1), ptr(a2));
 		break;
 	case 37:
 		r = sys_kill(a1, a2);
@@ -3596,7 +3724,8 @@ int do_syscall(int n, int a1, int a2, int a3, int a4, int a5, int a6)
 		r = sys_openat(a1, ptr(a2), a3, a4);
 		break;
 	default:
-		die("unknown/invalid system call %d (%08x)\n", n, n);
+		dprintf("unknown/invalid system call %d (%08x)\n", n, n);
+		r = -_L(ENOSYS);
 	}
 
 	if (r < 0)
@@ -3644,25 +3773,61 @@ static NTSTATUS OnDebuggerExitProcess(DEBUGEE_EVENT *event,
 	return STATUS_SUCCESS;
 }
 
+void process_continue(struct process *p)
+{
+	NTSTATUS r;
+
+	process_deliver_signal(p);
+	while (p->suspended && p->state != thread_terminated)
+	{
+		schedule();
+		process_deliver_signal(p);
+	}
+	if (p->state == thread_terminated)
+		return;
+
+	p->regs.ContextFlags = CONTEXT_i386 | CONTEXT_FULL;
+	r = NtSetContextThread(p->thread, &p->regs);
+	if (r != STATUS_SUCCESS)
+	{
+		process_shutdown(p, _L(SIGSEGV));
+		return;
+	}
+
+	if (p->state == thread_ready)
+	{
+		p->state = thread_running;
+		r = pDbgUiContinue(&p->id, DBG_CONTINUE);
+		if (r != STATUS_SUCCESS)
+			process_shutdown(p, _L(SIGSEGV));
+	}
+}
+
 static NTSTATUS OnDebuggerException(DEBUGEE_EVENT *event,
 					struct process *context)
 {
 	EXCEPTION_RECORD *er = &event->Exception.ExceptionRecord;
 
+	if (ELEMENT_IN_LIST(context, remote_break_item))
+	{
+		context->state = thread_interrupted;
+		SwitchToFiber(context->fiber);
+		return STATUS_SUCCESS;
+	}
+
+	context->state = thread_ready;
+
 	if (er->ExceptionCode == STATUS_ACCESS_VIOLATION)
 	{
 		CONTEXT *regs = &context->regs;
 		unsigned char buffer[2];
-		NTSTATUS r;
 
 		if (0 > vm_memcpy_from_process(context, buffer,
 					(void*) context->regs.Eip, sizeof buffer))
 		{
-			r = STATUS_ACCESS_VIOLATION;
-			fprintf(stderr, "%08x:%08x failed to read instruction\n",
-				event->ClientId.UniqueProcess,
-				event->ClientId.UniqueThread);
-			goto fail;
+			dprintf("failed to read instruction at %08lx\n",
+				context->regs.Eip);
+			process_signal(context, _L(SIGSEGV));
 		}
 		if (buffer[0] == 0xcd && buffer[1] == 0x80)
 		{
@@ -3674,33 +3839,19 @@ static NTSTATUS OnDebuggerException(DEBUGEE_EVENT *event,
 		}
 		else if (!emulate_instruction(context, buffer))
 		{
-			fprintf(stderr, "not a syscall: %02x %02x\n",
-				buffer[0], buffer[1]);
-			goto fail;
+			dprintf("invalid instruction at %08lx\n",
+				context->regs.Eip);
+			/* queue a SIGILL */
+			process_signal(context, _L(SIGILL));
 		}
 
-		context->regs.ContextFlags = CONTEXT_i386 | CONTEXT_FULL;
-		r = NtSetContextThread(context->thread, &context->regs);
-		if (r != STATUS_SUCCESS)
-		{
-			fprintf(stderr, "failed to set registers back\n");
-			return STATUS_UNSUCCESSFUL;
-		}
 	}
 	else
 	{
-fail:
-		debug_dump_regs(&context->regs);
-		dump_exception(er);
-		dump_stack(context);
-		vm_dump_address_space(context);
-		debug_backtrace(context);
-		exit(0);
+		process_signal(context, _L(SIGILL));
 	}
 
-	if (context->state == thread_running && !context->suspended)
-		return pDbgUiContinue(&event->ClientId, DBG_CONTINUE);
-
+	process_continue(context);
 	return STATUS_SUCCESS;
 }
 
@@ -3758,6 +3909,34 @@ static EventHandlerFn handlers[] =
 	OnDebuggerUnloadDll,		// DbgUnloadDllStateChange
 };
 
+NTSTATUS DebugCheckRemoteBreaks(void)
+{
+	NTSTATUS r;
+	struct process *p;
+
+	for (p = LIST_HEAD(&remote_break_list); p; )
+	{
+		struct process *next = LIST_NEXT(p, remote_break_item);
+
+		r = read_process_registers(p);
+		if (r == STATUS_SUCCESS)
+		{
+			current = p;
+			dprintf("interrupted!\n");
+			LIST_REMOVE(&remote_break_list, p, remote_break_item);
+			if (p->state == thread_running)
+				p->state = thread_interrupted;
+			else
+				dprintf("not running, state = %d\n", p->state);
+			SwitchToFiber(p->fiber);
+		}
+
+		p = next;
+	}
+
+	return STATUS_SUCCESS;
+}
+
 static NTSTATUS ReadDebugPort(HANDLE debugObject)
 {
 	struct process *context;
@@ -3787,10 +3966,11 @@ static NTSTATUS ReadDebugPort(HANDLE debugObject)
 	context = context_from_client_id(&event.ClientId);
 	if (!context)
 	{
-		printf("received event for unknown process %08x:%08x\n",
-			event.ClientId.UniqueProcess,
-			event.ClientId.UniqueThread);
-		return STATUS_UNSUCCESSFUL;
+		dprintf("received event for unknown process %08x:%08x\n",
+			(UINT)event.ClientId.UniqueProcess,
+			(UINT)event.ClientId.UniqueThread);
+
+		return DebugCheckRemoteBreaks();
 	}
 
 	/*
@@ -3805,50 +3985,78 @@ static NTSTATUS ReadDebugPort(HANDLE debugObject)
 
 void __stdcall SyscallHandler(PVOID param)
 {
-	struct process *context = param;
-	current = context;
-	while (1)
+	struct process *p = param;
+	current = p;
+
+	while (p->state != thread_terminated)
 	{
-		CONTEXT *regs = &context->regs;
+		CONTEXT *regs = &p->regs;
 		ULONG r;
 
-		r = do_syscall(regs->Eax, regs->Ebx,
-				regs->Ecx, regs->Edx,
-				regs->Esi, regs->Edi,
-				regs->Ebp);
-		regs->Eax = r;
-
-		context->regs.ContextFlags = CONTEXT_i386 | CONTEXT_FULL;
-		r = NtSetContextThread(context->thread, &context->regs);
-		if (r != STATUS_SUCCESS)
+		/* stopped by a signal or a syscall? */
+		if (p->state != thread_interrupted)
 		{
-			fprintf(stderr, "failed to set registers back\n");
-			context->state = thread_terminated;
-			/* FIXME: use kill here */
+			if (regs->Eax == 119)
+				sys_sigreturn();
+			else if (regs->Eax == 173)
+				sys_rt_sigreturn();
+			else
+			{
+				r = do_syscall(regs->Eax, regs->Ebx,
+						regs->Ecx, regs->Edx,
+						regs->Esi, regs->Edi,
+						regs->Ebp);
+				regs->Eax = r;
+			}
+
+			if (p->state == thread_terminated)
+				break;
 		}
 		else
-		{
-			if (context->state == thread_running && !context->suspended)
-				pDbgUiContinue(&context->id, DBG_CONTINUE);
-		}
+			p->state = thread_ready;
+
+		process_continue(p);
+		if (p->state == thread_terminated)
+			break;
 
 		yield();
 	}
+
+	dprintf("%p: freeing resources\n", p);
+	/* shutdown here */
+	pNtRemoveProcessDebug(p->process, debugObject);
+	NtTerminateThread(p->thread, 0);
+	CloseHandle(p->thread);
+	NtTerminateProcess(p->process, 0);
+	CloseHandle(p->process);
+	p->suspended = false;
+	close_fd_set(p);
+	vm_mappings_free(p);
+	signal_queue_free(p);
+	ready_list_remove(p);
+
+	if (!p->parent)
+		work_add(&zombie_reap_work);
+	else
+		process_signal(p->parent, _L(SIGCHLD));
+
+	/* exiting from this fiber would cause the main thread to exit */
+	SwitchToFiber(wait_fiber);
 }
 
-NTSTATUS create_first_thread(struct process *context)
+NTSTATUS create_first_thread(struct process *p)
 {
 	NTSTATUS r;
 
-	context->fiber = CreateFiber(0, &SyscallHandler, context);
-	if (!context->fiber)
+	p->fiber = CreateFiber(0, &SyscallHandler, p);
+	if (!p->fiber)
 		return STATUS_UNSUCCESSFUL;
 
 	/* create a thread to run in the process */
-	context->regs.ContextFlags = CONTEXT_FULL;
-	r = NtCreateThread(&context->thread, THREAD_ALL_ACCESS, NULL,
-			 context->process, &context->id,
-			 &context->regs, &context->stack_info, FALSE);
+	p->regs.ContextFlags = CONTEXT_FULL;
+	r = NtCreateThread(&p->thread, THREAD_ALL_ACCESS, NULL,
+			 p->process, &p->id,
+			 &p->regs, &p->stack_info, FALSE);
 	return r;
 }
 
@@ -3929,71 +4137,45 @@ void get_stub_name(void)
 	lstrcpyW(&stub_exe_name[len], stub);
 }
 
-/* remove from active process list */
-void unlink_process(struct process *process)
-{
-	struct process **p;
-	for (p = &first_process; *p; p = &(*p)->next_process)
-	{
-		if (*p == process)
-		{
-			*p = (*p)->next_process;
-			return;
-		}
-	}
-	dprintf("unlink failed\n");
-}
-
 static void process_migrate_children_to_parent(struct process *p)
 {
 	struct process *t;
 
+	if (!p->parent)
+		return;
+
+	if (p->parent == p)
+		return;
+
 	/* migrate all children to parent of exitting process */
-	while ((t = p->child))
+	while ((t = LIST_HEAD(&p->children)))
 	{
 		/* remove from this process */
-		p->child = t->sibling;
+		LIST_REMOVE(&p->children, t, sibling);
 
 		/* add as parent's child */
-		t->sibling = p->parent->child;
-		p->parent->child = t;
+		LIST_APPEND(&p->parent->children, t, sibling);
 	}
 }
 
 static void process_unlink_from_sibling_list(struct process *process)
 {
-	struct process **p;
-
 	if (!process->parent)
 		return;
 
-	for (p = &(process->parent->child); *p; p = &(*p)->sibling)
-	{
-		if (*p == process)
-		{
-			*p = process->child;
-			return;
-		}
-	}
-	die("sibling list unlink failed\n");
+	LIST_REMOVE(&process->parent->children, process, sibling);
 }
 
 void process_free(struct process *process)
 {
-	vm_mappings_free(process);
-
+	dprintf("freeing process %p\n", process);
 	process_migrate_children_to_parent(process);
 	process_unlink_from_sibling_list(process);
-
 	DeleteFiber(process->fiber);
-	NtTerminateProcess(process->process, STATUS_UNSUCCESSFUL);
-	CloseHandle(process->thread);
-	CloseHandle(process->process);
 	free(process->cwd);
 	process->cwd = NULL;
 	filp_close(process->cwdfp);
 	process->cwdfp = NULL;
-	unlink_process(process);
 	free(process);
 }
 
@@ -4008,6 +4190,16 @@ void yield(void)
 	current = p;
 }
 
+void schedule(void)
+{
+	if (current->state == thread_terminated)
+		return;
+	current->state = thread_stopped;
+	yield();
+	if (current->state != thread_terminated)
+		current->state = thread_ready;
+}
+
 /*
  * list of fibers ready to run
  * Singly linked with the last entry pointing to itself
@@ -4015,7 +4207,7 @@ void yield(void)
  * Always woken from the main loop
  */
 static CRITICAL_SECTION ready_list_lock;
-static struct process *first_ready;
+LIST_ANCHOR(struct process)	ready_list;
 
 /* this needs to be done from the main loop's context */
 static void process_ready_list(void)
@@ -4023,20 +4215,26 @@ static void process_ready_list(void)
 	while (1)
 	{
 		EnterCriticalSection(&ready_list_lock);
-		struct process *p = first_ready;
-		if (p)
+		struct process *p = NULL;
+		if (!LIST_EMPTY(&ready_list))
 		{
-			if (p == p->next_ready)
-				first_ready = NULL;
-			else
-				first_ready = p->next_ready;
-			p->next_ready = NULL;
+			p = LIST_HEAD(&ready_list);
+			LIST_REMOVE(&ready_list, p, ready_item);
 		}
 		LeaveCriticalSection(&ready_list_lock);
 		if (!p)
 			break;
-		SwitchToFiber(p->fiber);
+		if (p->state != thread_terminated)
+			SwitchToFiber(p->fiber);
 	}
+}
+
+void ready_list_remove(struct process *p)
+{
+	EnterCriticalSection(&ready_list_lock);
+	if (ELEMENT_IN_LIST(p, ready_item))
+		LIST_REMOVE(&ready_list, p, ready_item);
+	LeaveCriticalSection(&ready_list_lock);
 }
 
 void ready_list_add(struct process *p)
@@ -4047,64 +4245,332 @@ void ready_list_add(struct process *p)
 	EnterCriticalSection(&ready_list_lock);
 
 	/* first_ready is alway non-null if in ready list */
-	if (!p->next_ready)
+	if (!ELEMENT_IN_LIST(p, ready_item))
 	{
-		if (first_ready)
-			p->next_ready = first_ready;
-		else
-			p->next_ready = p;
-		first_ready = p;
+		LIST_APPEND(&ready_list, p, ready_item);
 	}
 
 	LeaveCriticalSection(&ready_list_lock);
 	SetEvent(loop_event);
 }
 
-/* move to process. timeouts are global, but signals are per process */
-struct wait_list signal_waiters;
-
-void signal_waiter_add(struct signal_waiter *sw, int signal)
+void process_queue_signal(struct process *p, int signal)
 {
-	sw->signal = signal;
-	wait_entry_append(&signal_waiters, &sw->we);
+	struct sigqueue *sq;
+
+	dprintf("%s(%p,%d)\n", __FUNCTION__, p, signal);
+	/* TODO: only real time signals should be queued */
+
+	sq = malloc(sizeof (struct sigqueue));
+	sq->signal = signal;
+
+	LIST_ELEMENT_INIT(sq, item);
+
+	LIST_APPEND(&p->signal_list, sq, item);
+
+	if (p->state == thread_stopped)
+		ready_list_add(p);
+	else
+		dprintf("%p not stopped (state %d)\n", p, p->state);
 }
 
-void signal_waiter_remove(struct signal_waiter *sw)
+void signal_queue_free(struct process *p)
 {
-	wait_entry_remove(&signal_waiters, &sw->we);
+	struct sigqueue *sq;
+	while ((sq = LIST_HEAD(&p->signal_list)))
+	{
+		LIST_REMOVE(&p->signal_list, sq, item);
+		free(sq);
+	}
+}
+
+void signal_handle_default(struct process *p, int signal)
+{
+	/* see signal(7) */
+	switch (signal)
+	{
+	case _L(SIGCHLD):
+		break;
+	case _L(SIGTSTP):
+	case _L(SIGTTIN):
+	case _L(SIGTTOU):
+		p->suspended = true;
+		break;
+	default:
+		process_shutdown(p, signal);
+	}
+}
+
+struct ucontext
+{
+	uint16_t gs;
+	uint16_t fs;
+	uint16_t es;
+	uint16_t ds;
+	uint32_t edi;
+	uint32_t esi;
+	uint32_t ebp;
+	uint32_t esp;
+	uint32_t ebx;
+	uint32_t edx;
+	uint32_t ecx;
+	uint32_t eax;
+	uint32_t trapno;
+	uint32_t err;
+	uint32_t eip;
+	uint16_t cs;
+	uint32_t eflags;
+	uint32_t esp_at_signal;
+	uint16_t ss;
+	void *fpustate;
+	uint32_t oldmask;
+	uint32_t cr2;
+};
+
+void signal_ucontext_from_process(struct process *p, struct ucontext *uc)
+{
+#define COPY(LR, WR) uc->LR = p->regs.WR
+	COPY(gs, SegGs);
+	COPY(fs, SegFs);
+	COPY(es, SegEs);
+	COPY(ds, SegDs);
+	COPY(edi, Edi);
+	COPY(esi, Esi);
+	COPY(ebp, Ebp);
+	COPY(esp, Esp);
+	COPY(ebx, Ebx);
+	COPY(edx, Edx);
+	COPY(ecx, Ecx);
+	COPY(eax, Eax);
+	COPY(cs, SegCs);
+	COPY(ss, SegSs);
+	COPY(eip, Eip);
+	COPY(eflags, EFlags);
+#undef COPY
+}
+
+void signal_ucontext_to_process(struct process *p, struct ucontext *uc)
+{
+#define COPY(LR, WR) p->regs.WR = uc->LR
+	COPY(gs, SegGs);
+	COPY(fs, SegFs);
+	COPY(es, SegEs);
+	COPY(ds, SegDs);
+	COPY(edi, Edi);
+	COPY(esi, Esi);
+	COPY(ebp, Ebp);
+	COPY(esp, Esp);
+	COPY(ebx, Ebx);
+	COPY(edx, Edx);
+	COPY(ecx, Ecx);
+	COPY(eax, Eax);
+	COPY(cs, SegCs);
+	COPY(ss, SegSs);
+	COPY(eip, Eip);
+	COPY(eflags, EFlags);
+#undef COPY
+}
+
+struct signal_stack_layout {
+	void *ret;
+	int signo;
+	struct ucontext uc;
+};
+
+void sys_sigreturn(void)
+{
+	struct process *p = current;
+	struct signal_stack_layout frame;
+	void *stack;
+	int r;
+
+	dprintf("%s()\n", __FUNCTION__);
+
+	stack = (void*)(p->regs.Esp - 8);
+
+	r = vm_memcpy_from_process(p, &frame, stack, sizeof frame);
+	if (r < 0)
+	{
+		dprintf("%s: can't read signal stack\n", __FUNCTION__);
+		process_shutdown(p, _L(SIGSEGV));
+	}
+
+	signal_ucontext_to_process(p, &frame.uc);
+}
+
+struct sigaction_stack_layout {
+	void *ret;
+	int signo;
+	struct l_siginfo_t *si_ptr;
+	struct ucontext *uc_ptr;
+	struct l_siginfo_t si;
+	struct ucontext uc;
+};
+
+void sys_rt_sigreturn(void)
+{
+	struct process *p = current;
+	struct sigaction_stack_layout frame;
+	void *stack;
+	int r;
+
+	dprintf("%s(esp=%08lx)\n", __FUNCTION__, p->regs.Esp);
+
+	stack = (void*)(p->regs.Esp - 4);
+
+	r = vm_memcpy_from_process(p, &frame, stack, sizeof frame);
+	if (r < 0)
+	{
+		dprintf("%s: can't read signal stack\n", __FUNCTION__);
+		process_shutdown(current, _L(SIGSEGV));
+	}
+
+	signal_ucontext_to_process(p, &frame.uc);
+}
+
+/*
+ * http://syprog.blogspot.com.au/2011/10/iterfacing-linux-signals.html
+ * http://housel.livejournal.com/1557.html
+ */
+void signal_push_on_stack(struct process *p, struct sigqueue *sq)
+{
+	uint8_t *stack;
+	int r;
+
+	stack = (void*) p->regs.Esp;
+
+	if (p->sa[sq->signal].sa_flags & _L(SA_SIGINFO))
+	{
+		struct sigaction_stack_layout frame = {0};
+		stack -= sizeof frame;
+
+		frame.si_ptr = &(((struct sigaction_stack_layout*) stack)->si);
+		frame.uc_ptr = &(((struct sigaction_stack_layout*) stack)->uc);
+
+		signal_ucontext_from_process(p, &frame.uc);
+
+		frame.ret = p->sa[sq->signal].sa_restorer;
+		frame.signo = sq->signal;
+		frame.si.si_signo = sq->signal;
+		r = vm_memcpy_to_process(p, stack, &frame, sizeof frame);
+		if (r < 0)
+		{
+			process_shutdown(p, _L(SIGSEGV));
+			return;
+		}
+	}
+	else
+	{
+		struct signal_stack_layout frame = {0};
+		stack -= sizeof frame;
+
+		signal_ucontext_from_process(p, &frame.uc);
+
+		frame.ret = p->sa[sq->signal].sa_restorer;
+		frame.signo = sq->signal;
+		r = vm_memcpy_to_process(p, stack, &frame, sizeof frame);
+		if (r < 0)
+		{
+			process_shutdown(p, _L(SIGSEGV));
+			return;
+		}
+	}
+
+	p->regs.Eip = (uintptr_t) p->sa[sq->signal].sa_handler;
+	p->regs.Esp = (uintptr_t) stack;
+	dprintf("Entering signal handler at %p stack at %p\n",
+		p->sa[sq->signal].sa_handler, stack);
+}
+
+void process_deliver_signal(struct process *p)
+{
+	struct sigqueue *sq;
+
+	sq = LIST_HEAD(&p->signal_list);
+	if (!sq)
+		return;
+	LIST_REMOVE(&p->signal_list, sq, item);
+
+	if (p->sa[sq->signal].sa_handler == _L(SIG_DFL))
+	{
+		dprintf("signal %d: default action\n", sq->signal);
+		signal_handle_default(p, sq->signal);
+	}
+	else if (p->sa[sq->signal].sa_handler == _L(SIG_IGN))
+	{
+		dprintf("signal %d: ignored\n", sq->signal);
+	}
+	else
+	{
+		dprintf("signal %d: delivering\n", sq->signal);
+		signal_push_on_stack(p, sq);
+	}
+
+	free(sq);
+}
+
+int process_pending_signal_check(struct process *p)
+{
+	/* TODO: check masks */
+	if (!LIST_EMPTY(&p->signal_list))
+		return -_L(EINTR);
+	return 0;
 }
 
 void process_signal(struct process *p, int signal)
 {
-	struct signal_waiter *sw = (void*) signal_waiters.head;
+	bool was_running;
 
-	/* signals that cannot be queued */
+	if (!p)
+		return;
+
+	if (signal < 0 || signal >= 0x100)
+		die("signal %d out of range\n", signal);
+
+	if (p->state == thread_terminated)
+		return;
+
+	was_running = (p->state == thread_running);
+
+	p->exit_code = signal;
 	switch (signal)
 	{
 	case _L(SIGKILL):
-		p->state = thread_terminated;
-		return;
-
+		process_shutdown(p, signal);
+		break;
 	case _L(SIGSTOP):
 		p->suspended = true;
-		return;
-
+		break;
 	case _L(SIGCONT):
 		p->suspended = false;
-		return;
+		break;
+	default:
+		process_queue_signal(p, signal);
 	}
 
-	while (sw)
+	if (was_running && !ELEMENT_IN_LIST(p, remote_break_item))
 	{
-		struct wait_entry *next = sw->we.next;
-		if (sw->signal == signal)
-			ready_list_add(sw->we.p);
+		NTSTATUS r;
 
-		sw = (struct signal_waiter*) next;
+		/* issue a break */
+		dprintf("remote break!\n");
+		r = pDbgUiIssueRemoteBreakin(p->process);
+		if (r != STATUS_SUCCESS)
+			die("DbgUiIssueRemoteBreakin failed %08lx\n", r);
+		LIST_APPEND(&remote_break_list, p, remote_break_item);
 	}
 }
 
-static struct timeout *timeout_head;
+extern void process_signal_group(struct process *leader, int signal)
+{
+	struct process *p;
+
+	LIST_FOR_EACH(&process_list, p, item)
+		if (p->leader == leader || p == leader)
+			process_signal(p, signal);
+}
+
+LIST_ANCHOR(struct timeout) timeout_list;
 
 void timeout_now(struct timeval *tv)
 {
@@ -4178,54 +4644,73 @@ void timeout_add_ms(struct timeout *t, int ms)
 
 void timeout_add(struct timeout *t)
 {
-	struct timeout **where = &timeout_head;
-
-	while (*where && timeout_before(*where, t))
-		where = &(*where)->next;
-
-	t->next = *where;
-	*where = t;
+	LIST_ELEMENT_INIT(t, item);
+	LIST_INSERT_ORDERED(&timeout_list, t, timeout_before, item);
+	LIST_ASSERT_ORDERED(&timeout_list, timeout_before, item);
 }
 
 void timeout_remove(struct timeout *t)
 {
-	struct timeout **where = &timeout_head;
-
-	while (*where && t != *where)
-		where = &(*where)->next;
-
-	*where = t->next;
+	LIST_REMOVE(&timeout_list, t, item);
 }
 
 DWORD timeout_get_next(void)
 {
 	struct timeval now;
 	int t;
+	struct timeout *to = LIST_HEAD(&timeout_list);
 
-	if (!timeout_head)
+	if (!to)
 		return INFINITE;
 
 	timeout_now(&now);
-	t = (timeout_head->tv.tv_usec - now.tv_usec + 999) / 1000;
-	t += (timeout_head->tv.tv_sec - now.tv_sec) * 1000;
+	t = (to->tv.tv_usec - now.tv_usec + 999) / 1000;
+	t += (to->tv.tv_sec - now.tv_sec) * 1000;
 
 	if (0)
 	{
 		timeout_dprint_timeval(&now, "now");
-		timeout_dprint_timeval(&timeout_head->tv, "next");
+		timeout_dprint_timeval(&to->tv, "next");
 		dprintf("timeout -> %d\n", t);
 	}
 
 	if (t < 0)
 		t = 0;
 
-
 	return t;
 }
 
 void timeout_handle(void)
 {
-	timeout_head->fn(timeout_head);
+	struct timeout *to = LIST_HEAD(&timeout_list);
+	to->fn(to);
+}
+
+LIST_ANCHOR(struct workitem) workitem_list;
+
+void work_add(struct workitem *item)
+{
+	EnterCriticalSection(&ready_list_lock);
+	LIST_APPEND(&workitem_list, item, item);
+	LeaveCriticalSection(&ready_list_lock);
+	SetEvent(loop_event);
+}
+
+void work_process(void)
+{
+	while (true)
+	{
+		struct workitem *item;
+		EnterCriticalSection(&ready_list_lock);
+		item = LIST_HEAD(&workitem_list);
+		if (item)
+			LIST_REMOVE(&workitem_list, item, item)
+		LeaveCriticalSection(&ready_list_lock);
+		if (!item)
+			break;
+
+		item->fn(item);
+	}
 }
 
 static void dump_selectors(void)
@@ -4255,9 +4740,9 @@ int main(int argc, char **argv)
 {
 	HANDLE debugObject = 0;
 	NTSTATUS r;
-	struct process *context = alloc_process();
+	struct process *p = alloc_process();
 	int n = 1;
-	HANDLE console_handle;
+	HANDLE console_in, console_out;
 	HANDLE inet4_handle;
 	DWORD console_mode = 0;
 	BOOL backtrace_on_ctrl_c = 0;
@@ -4282,11 +4767,11 @@ int main(int argc, char **argv)
 
 	vm_init();
 
-	context->cwd = strdup("/");
-	context->uid = 1000;
-	context->gid = 1000;
-	context->euid = 1000;
-	context->egid = 1000;
+	p->cwd = strdup("/");
+	p->uid = 1000;
+	p->gid = 1000;
+	p->euid = 1000;
+	p->egid = 1000;
 
 	InitializeCriticalSection(&ready_list_lock);
 
@@ -4300,19 +4785,6 @@ int main(int argc, char **argv)
 	env[envcount] = NULL;
 
 	get_stub_name();
-
-	hBreakEvent = CreateEvent(0, 0, 0, 0);
-	if (!hBreakEvent)
-	{
-		fprintf(stderr, "Failed to create event\n");
-		return 1;
-	}
-
-	if (!SetConsoleCtrlHandler(break_handler, TRUE))
-	{
-		fprintf(stderr, "Failed to set ^C handler\n");
-		return 1;
-	}
 
 	debug_init();
 	while (n < argc)
@@ -4372,13 +4844,14 @@ int main(int argc, char **argv)
 	inet4_handle = inet4_init();
 	winfs_init();
 	devfs_init();
+	procfs_init();
 
-	context->cwdfp = filp_open(context->cwd, O_RDONLY, 0, 0);
-	if (L_PTR_ERROR(context->cwdfp) < 0)
+	p->cwdfp = filp_open(p->cwd, O_RDONLY, 0, 0);
+	if (L_PTR_ERROR(p->cwdfp) < 0)
 	{
 		fprintf(stderr,
 			"Failed to open current working directory (%s)\n",
-			context->cwd);
+			p->cwd);
 		goto out;
 	}
 
@@ -4400,8 +4873,8 @@ int main(int argc, char **argv)
 	 * create new address space then
 	 * sys_exec(argv, env);
 	 */
-	current = context;
-	r = create_nt_process(context, debugObject);
+	current = p;
+	r = create_nt_process(p, debugObject);
 	if (r != STATUS_SUCCESS)
 	{
 		fprintf(stderr, "create_nt_process failed with error %08lx\n", r);
@@ -4412,24 +4885,25 @@ int main(int argc, char **argv)
 	 * check if stdout is actually a console or not and
 	 * allocate a console for the first process only
 	 */
-	console_handle = GetStdHandle(STD_OUTPUT_HANDLE);
-	if (!GetConsoleMode(console_handle, &console_mode))
+	console_in = GetStdHandle(STD_INPUT_HANDLE);
+	console_out = GetStdHandle(STD_OUTPUT_HANDLE);
+	if (!GetConsoleMode(console_out, &console_mode))
 		fprintf(stderr, "output not a console...\n");
 
 	/* PGID of leader is its own PID */
-	context->leader = context;
-	current->tty = get_vt100_console(console_handle, context->leader);
+	p->leader = p;
+	current->tty = get_vt100_console(console_in, console_out, p->leader);
 
-	context->handles[0].fp = current->tty;
-	context->handles[0].flags = 0;
-	current->tty->refcount++;
+	p->handles[0].fp = current->tty;
+	p->handles[0].flags = 0;
+	p->tty->refcount++;
 
-	context->handles[1].fp = current->tty;
-	context->handles[1].flags = 0;
-	current->tty->refcount++;
+	p->handles[1].fp = current->tty;
+	p->handles[1].flags = 0;
+	p->tty->refcount++;
 
-	context->handles[2].fp = current->tty;
-	context->handles[2].flags = 0;
+	p->handles[2].fp = current->tty;
+	p->handles[2].flags = 0;
 	current->tty->refcount++;
 
 	/* move exec into fiber */
@@ -4440,7 +4914,7 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
-	r = create_first_thread(context);
+	r = create_first_thread(p);
 	if (r != STATUS_SUCCESS)
 	{
 		fprintf(stderr, "create_first_thread() failed: %08lx\n", r);
@@ -4469,13 +4943,12 @@ int main(int argc, char **argv)
 
 	wait_fiber = ConvertThreadToFiber(NULL);
 
-	while (first_process != NULL)
+	while (!LIST_EMPTY(&process_list))
 	{
 		HANDLE handles[4];
 		int n = 0;
 		DWORD timeout;
 
-		handles[n++] = hBreakEvent;
 		handles[n++] = debugObject;
 		handles[n++] = loop_event;
 		handles[n++] = inet4_handle;
@@ -4484,27 +4957,13 @@ int main(int argc, char **argv)
 
 		r = MsgWaitForMultipleObjectsEx(n, handles, timeout,
 					QS_ALLEVENTS, MWMO_ALERTABLE);
-		if (r == WAIT_OBJECT_0)
-		{
-			fprintf(stderr,"User abort!\n");
-			if (backtrace_on_ctrl_c)
-			{
-				SuspendThread(first_process->thread);
-				context = first_process;
-				read_process_registers(context);
-				debug_dump_regs(&current->regs);
-				dump_stack(current);
-				debug_backtrace(current);
-			}
-			break;
-		}
-		else if (r == (WAIT_OBJECT_0 + 1))
+		if (r == (WAIT_OBJECT_0))
 		{
 			r = ReadDebugPort(debugObject);
 			if (r != STATUS_SUCCESS)
 				break;
 		}
-		else if (r == (WAIT_OBJECT_0 + 3))
+		else if (r == (WAIT_OBJECT_0 + 2))
 		{
 			inet4_process_events();
 		}
@@ -4524,16 +4983,22 @@ int main(int argc, char **argv)
 			DispatchMessage(&msg);
 		}
 
+		/* process work items in the main thread */
+		work_process();
+
 		/* wake fibers that are ready, in context of main loop */
 		process_ready_list();
 	}
 
 out:
-	while (first_process)
-		process_free(first_process);
+	while (!LIST_EMPTY(&process_list))
+	{
+		struct process *p = LIST_HEAD(&process_list);
+		LIST_REMOVE(&process_list, p, item);
+		process_free(p);
+	}
 
 	CloseHandle(debugObject);
-	CloseHandle(hBreakEvent);
 
 	return 0;
 }

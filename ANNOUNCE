@@ -1,5 +1,12 @@
 Announcement & Release notes
 
+Sun Jun 16 21:51:41 EST 2013
+0.10 - June release
+
+ - implement signal handling, make ^C work
+ - implement ECHO and ECHOCTL
+ - make the dropbear ssh client work
+
 Thu May 16 21:26:41 EST 2013
 0.9 - May release
 

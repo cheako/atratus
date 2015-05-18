@@ -39,9 +39,11 @@ ATRATUS_SRCS = \
 	elf.c \
 	emulate.c \
 	inet.c \
+	ntstatus.c \
 	null.c \
 	pipe.c \
-	ntstatus.c \
+	proc.c \
+	random.c \
 	tty.c \
 	vm.c \
 	vt100.c \

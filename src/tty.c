@@ -34,6 +34,7 @@
 
 static void tty_poll_add(struct filp *f, struct wait_entry *we);
 static void tty_poll_del(struct filp *f, struct wait_entry *we);
+static int tty_write_output(struct tty_filp *tty, unsigned char ch);
 
 static int tty_is_canonical(struct tty_filp *tty)
 {
@@ -97,6 +98,11 @@ static int tty_process_input(struct tty_filp *tty)
 	return end + 1;
 }
 
+static void tty_discard_input(struct tty_filp *tty)
+{
+	tty->ready_count = 0;
+}
+
 static int tty_read(struct filp *f, void *buf, size_t size, loff_t *ofs, int block)
 {
 	struct tty_filp *tty = (struct tty_filp*) f;
@@ -107,7 +113,7 @@ static int tty_read(struct filp *f, void *buf, size_t size, loff_t *ofs, int blo
 	we.p = current;
 	tty_poll_add(&tty->fp, &we);
 
-	while (ret < size && !tty->leader->ttyeof && !done)
+	while (ret < size && !tty->leader->ttyeof && !done && current->state == thread_ready)
 	{
 		BOOL wait = 0;
 		size_t len;
@@ -140,9 +146,17 @@ static int tty_read(struct filp *f, void *buf, size_t size, loff_t *ofs, int blo
 
 		if (wait)
 		{
-			current->state = thread_stopped;
-			yield();
-			current->state = thread_running;
+			int r;
+
+			r = process_pending_signal_check(current);
+			if (r < 0)
+			{
+				if (!ret)
+					r = ret;
+				break;
+			}
+
+			schedule();
 		}
 	}
 
@@ -153,21 +167,79 @@ static int tty_read(struct filp *f, void *buf, size_t size, loff_t *ofs, int blo
 	return ret;
 }
 
+#define FROM_FIELD(type, ptr, field) \
+	((type*)(((char*)(ptr)) - (int)&(((type*)NULL)->field)))
+
+void tty_check_signal(struct workitem *item)
+{
+	struct tty_filp *tty;
+
+	tty = FROM_FIELD(struct tty_filp, item, interrupt_item);
+
+	tty->ops->fn_lock(tty);
+	item->fn = 0;
+	if (tty->suspend)
+		process_signal_group(tty->leader, _L(SIGTSTP));
+	tty->suspend = 0;
+	if (tty->interrupt)
+		process_signal_group(tty->leader, _L(SIGINT));
+	tty->interrupt = 0;
+	tty->ops->fn_unlock(tty);
+}
+
+static uint8_t tty_control_echo[256] =
+{
+	1, 1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1,
+	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+};
+
 void tty_input_add_char(struct tty_filp *tty, char ch)
 {
 	struct wait_entry *we;
+	struct workitem *item = NULL;
 
 	tty->ops->fn_lock(tty);
 
-	/* add data to buffer */
-	if (tty->ready_count < sizeof tty->ready_data)
+	if (ch == tty->tios.c_cc[VSUSP])
+		tty->suspend++;
+	else if (ch == tty->tios.c_cc[VINTR])
+		tty->interrupt++;
+	else if (tty->ready_count < sizeof tty->ready_data)
 		tty->ready_data[tty->ready_count++] = ch;
 
 	/* TODO: send only to the controlling terminal */
-	for (we = tty->wl.head; we; we = we->next)
+	LIST_FOR_EACH(&tty->wl, we, item)
 		ready_list_add(we->p);
 
+	if ((tty->suspend || tty->interrupt) &&
+		!ELEMENT_IN_LIST(&tty->interrupt_item, item))
+	{
+		/* function pointer valid indicates pending */
+		item = &(tty->interrupt_item);
+		if (!item->fn)
+			item->fn = tty_check_signal;
+		else
+			item = NULL;
+	}
+
+	if (tty->tios.c_lflag & ECHOCTL)
+	{
+		if (tty_control_echo[(uint8_t)ch])
+		{
+			tty_write_output(tty, '^');
+			tty_write_output(tty, ch - 1 + 'A');
+		}
+	}
+
+	if (tty->tios.c_lflag & ECHO)
+	{
+		tty_write_output(tty, ch);
+	}
+
 	tty->ops->fn_unlock(tty);
+
+	if (item)
+		work_add(item);
 }
 
 void tty_input_add_string(struct tty_filp *tty, const char *string)
@@ -182,7 +254,7 @@ void tty_input_add_string(struct tty_filp *tty, const char *string)
 		tty->ready_count += len;
 	}
 
-	for (we = tty->wl.head; we; we = we->next)
+	LIST_FOR_EACH(&tty->wl, we, item)
 		ready_list_add(we->p);
 
 	tty->ops->fn_unlock(tty);
@@ -380,6 +452,9 @@ static int tty_ioctl(struct filp *f, int cmd, unsigned long arg)
 		return tty_set_termios(tty, (void*)arg);
 	case TCSETSW:
 		return tty_set_termios(tty, (void*)arg);
+	case TCSETSF:	/* TODO: drain output */
+		tty_discard_input(tty);
+		return tty_set_termios(tty, (void*)arg);
 	case TCSETAW:
 		return tty_set_termios(tty, (void*)arg);
 	case TIOCG:
@@ -414,7 +489,7 @@ static void tty_poll_add(struct filp *f, struct wait_entry *we)
 	struct tty_filp *tty = (struct tty_filp*) f;
 
 	tty->ops->fn_lock(tty);
-	wait_entry_append(&tty->wl, we);
+	LIST_APPEND(&tty->wl, we, item);
 	tty->ops->fn_unlock(tty);
 }
 
@@ -423,7 +498,7 @@ static void tty_poll_del(struct filp *f, struct wait_entry *we)
 	struct tty_filp *tty = (struct tty_filp*) f;
 
 	tty->ops->fn_lock(tty);
-	wait_entry_remove(&tty->wl, we);
+	LIST_REMOVE(&tty->wl, we, item);
 	tty->ops->fn_unlock(tty);
 }
 
@@ -440,10 +515,13 @@ void tty_init(struct tty_filp *tty, struct process *leader)
 {
 	init_fp(&tty->fp, &tty_file_ops);
 
-	tty->tios.c_lflag = ICANON | ECHO;
+	tty->tios.c_lflag = ICANON | ECHO | ECHOCTL;
+	tty->tios.c_cc[VINTR] = 3;
 	tty->tios.c_cc[VERASE] = 8;
 	tty->tios.c_cc[VEOF] = 4;
+	tty->tios.c_cc[VSUSP] = 26;
 	tty->tios.c_oflag = ONLCR | OPOST;
 	tty->ready_count = 0;
 	tty->leader = leader;
+	LIST_ELEMENT_INIT(&tty->interrupt_item, item);
 }

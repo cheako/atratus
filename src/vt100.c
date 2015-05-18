@@ -45,6 +45,7 @@ struct vt100_filp
 	int fg_color;
 	int bg_color;
 	int brightness;
+	int reverse;
 	int cursor_key_mode;
 	int alternate_key_mode;
 	int ansi;
@@ -53,11 +54,11 @@ struct vt100_filp
 	int charset;
 	int scroll_start;
 	int scroll_end;
-	int normal_lf;
 	WCHAR saved_char;
 	WORD saved_attr;
 	HANDLE thread;
-	HANDLE handle;
+	HANDLE in;
+	HANDLE out;
 	CRITICAL_SECTION cs;
 };
 
@@ -65,7 +66,7 @@ static void vt100_get_cursor_pos(struct vt100_filp *vt, int *x, int *y)
 {
 	CONSOLE_SCREEN_BUFFER_INFO info;
 
-	GetConsoleScreenBufferInfo(vt->handle, &info);
+	GetConsoleScreenBufferInfo(vt->out, &info);
 	*x = info.dwCursorPosition.X - info.srWindow.Left + 1;
 	*y = info.dwCursorPosition.Y - info.srWindow.Top + 1;
 }
@@ -79,7 +80,7 @@ static int vt100_set_cursor_pos(struct vt100_filp *vt, int x, int y)
 
 	dprintf("cursor to %d,%d\n", x, y);
 
-	GetConsoleScreenBufferInfo(vt->handle, &info);
+	GetConsoleScreenBufferInfo(vt->out, &info);
 	height = info.srWindow.Bottom - info.srWindow.Top + 1;
 	width = info.srWindow.Right - info.srWindow.Left + 1;
 	if (x >= width)
@@ -93,7 +94,7 @@ static int vt100_set_cursor_pos(struct vt100_filp *vt, int x, int y)
 	coord.X = info.srWindow.Left + x - 1;
 	coord.Y = info.srWindow.Top + y - 1;
 	dprintf("cursor at %d,%d\n", coord.X, coord.Y);
-	r = SetConsoleCursorPosition(vt->handle, coord);
+	r = SetConsoleCursorPosition(vt->out, coord);
 	if (!r)
 		dprintf("failed to set cursor\n");
 	return 0;
@@ -106,7 +107,7 @@ static DWORD vt100_get_attributes(struct vt100_filp *vt)
 	if (vt->brightness)
 		dwAttribute |= FOREGROUND_INTENSITY;
 
-	switch (vt->fg_color)
+	switch (vt->reverse ? vt->bg_color : vt->fg_color)
 	{
 	case 30: /* Black */
 		break;
@@ -133,7 +134,7 @@ static DWORD vt100_get_attributes(struct vt100_filp *vt)
 		break;
 	}
 
-	switch (vt->bg_color)
+	switch (vt->reverse ? vt->fg_color : vt->bg_color)
 	{
 	case 40: /* Black */
 		break;
@@ -181,16 +182,19 @@ static int vt100_set_color(struct vt100_filp *vt)
 			vt->fg_color = 37;
 			vt->bg_color = 40;
 			vt->brightness = 0;
+			vt->reverse = 0;
 		}
 		else if (code == 1)
 			vt->brightness = code;
+		else if (code == 7)
+			vt->reverse = 1;
 		else
 			dprintf("Unhandled color code %d\n", code);
 	}
 
 	dwAttribute = vt100_get_attributes(vt);
 
-	SetConsoleTextAttribute(vt->handle, dwAttribute);
+	SetConsoleTextAttribute(vt->out, dwAttribute);
 	return 0;
 }
 
@@ -211,7 +215,7 @@ static void vt100_scroll(struct vt100_filp *vt, int up)
 	DWORD width;
 	int start, end, target;
 
-	if (!GetConsoleScreenBufferInfo(vt->handle, &info))
+	if (!GetConsoleScreenBufferInfo(vt->out, &info))
 		return;
 
 	width = info.srWindow.Right - info.srWindow.Left + 1;
@@ -249,7 +253,7 @@ static void vt100_scroll(struct vt100_filp *vt, int up)
 
 	ci.Char.AsciiChar = ' ';
 	ci.Attributes = vt100_get_attributes(vt);
-	ScrollConsoleScreenBuffer(vt->handle, &rect, NULL,
+	ScrollConsoleScreenBuffer(vt->out, &rect, NULL,
 				 newpos, &ci);
 }
 
@@ -259,23 +263,6 @@ static void vt100_do_lf(struct vt100_filp *vt)
 	int x, y;
 
 	vt100_get_cursor_pos(vt, &x, &y);
-
-	if (vt->normal_lf)
-	{
-		CONSOLE_SCREEN_BUFFER_INFO info;
-		DWORD count = 0;
-		COORD coord;
-
-		/* preserve the X position */
-		GetConsoleScreenBufferInfo(vt->handle, &info);
-		coord.X = info.dwCursorPosition.X;
-		WriteConsole(vt->handle, "\n", 1, &count, NULL);
-		GetConsoleScreenBufferInfo(vt->handle, &info);
-		coord.Y = info.dwCursorPosition.Y;
-		SetConsoleCursorPosition(vt->handle, coord);
-
-		return;
-	}
 
 	if (y >= vt->scroll_end)
 	{
@@ -411,7 +398,7 @@ static int vt100_utf8_out(struct vt100_filp *vt, unsigned char ch)
 		wch[n++] = 0xdc00 | (vt->unicode & 0x3ff);
 	}
 
-	r = WriteConsoleW(vt->handle, &wch, n, &write_count, NULL);
+	r = WriteConsoleW(vt->out, &wch, n, &write_count, NULL);
 	if (!r)
 		return -_L(EIO);
 
@@ -439,15 +426,15 @@ static void vt100_save_char(struct vt100_filp *vt)
 	COORD pos;
 	BOOL r;
 
-	r = GetConsoleScreenBufferInfo(vt->handle, &info);
+	r = GetConsoleScreenBufferInfo(vt->out, &info);
 	if (!r)
 		return;
 
 	pos = info.dwCursorPosition;
 
-	ReadConsoleOutputCharacterW(vt->handle, &vt->saved_char, 1,
+	ReadConsoleOutputCharacterW(vt->out, &vt->saved_char, 1,
 					info.dwCursorPosition, &count);
-	ReadConsoleOutputAttribute(vt->handle, &vt->saved_attr, 1,
+	ReadConsoleOutputAttribute(vt->out, &vt->saved_attr, 1,
 					pos, &count);
 	dprintf("save '%c'\n", (char) vt->saved_char);
 }
@@ -459,16 +446,16 @@ static void vt100_restore_char(struct vt100_filp *vt)
 	COORD pos;
 	BOOL r;
 
-	r = GetConsoleScreenBufferInfo(vt->handle, &info);
+	r = GetConsoleScreenBufferInfo(vt->out, &info);
 	if (!r)
 		return;
 
 	pos = info.dwCursorPosition;
 
 	/* doesn't move cursor ... */
-	WriteConsoleOutputCharacterW(vt->handle, &vt->saved_char, 1,
+	WriteConsoleOutputCharacterW(vt->out, &vt->saved_char, 1,
 					pos, &count);
-	WriteConsoleOutputAttribute(vt->handle, &vt->saved_attr, 1,
+	WriteConsoleOutputAttribute(vt->out, &vt->saved_attr, 1,
 					pos, &count);
 
 	dprintf("restore '%c'\n", (char) vt->saved_char);
@@ -482,7 +469,7 @@ static void vt100_device_status(struct vt100_filp *vt, int req)
 	switch (req)
 	{
 	case 6: /* query cursor position */
-		GetConsoleScreenBufferInfo(vt->handle, &info);
+		GetConsoleScreenBufferInfo(vt->out, &info);
 		sprintf(response, "\x1b[%d;%dR",
 			info.dwCursorPosition.Y+1,
 			info.dwCursorPosition.X+1);
@@ -508,7 +495,7 @@ static void vt100_erase(struct vt100_filp *vt, int mode)
 
 	memset(&info, 0, sizeof info);
 
-	if (!GetConsoleScreenBufferInfo(vt->handle, &info))
+	if (!GetConsoleScreenBufferInfo(vt->out, &info))
 	{
 		/* this happens if the handle is a file */
 		dprintf("GetConsoleScreenBufferInfo() failed\n");
@@ -543,9 +530,9 @@ static void vt100_erase(struct vt100_filp *vt, int mode)
 		attr[i] = dwAttribute;
 	}
 
-	WriteConsoleOutputCharacterW(vt->handle, row, width,
+	WriteConsoleOutputCharacterW(vt->out, row, width,
 					pos, &count);
-	WriteConsoleOutputAttribute(vt->handle, attr, width,
+	WriteConsoleOutputAttribute(vt->out, attr, width,
 					pos, &count);
 }
 
@@ -553,8 +540,8 @@ static void vt100_clear(struct vt100_filp *vt, DWORD length, COORD pos)
 {
 	DWORD count = 0;
 	DWORD attribute = vt100_get_attributes(vt);
-	FillConsoleOutputCharacter(vt->handle, ' ', length, pos, &count);
-	FillConsoleOutputAttribute(vt->handle, attribute, length, pos, &count);
+	FillConsoleOutputCharacter(vt->out, ' ', length, pos, &count);
+	FillConsoleOutputAttribute(vt->out, attribute, length, pos, &count);
 }
 
 static void vt100_erase_screen(struct vt100_filp *vt, int n)
@@ -563,7 +550,7 @@ static void vt100_erase_screen(struct vt100_filp *vt, int n)
 	COORD pos, top;
 	DWORD width, height;
 
-	GetConsoleScreenBufferInfo(vt->handle, &info);
+	GetConsoleScreenBufferInfo(vt->out, &info);
 
 	pos = info.dwCursorPosition;
 	top.X = info.srWindow.Left;
@@ -596,7 +583,7 @@ static void vt100_move_cursor(struct vt100_filp *vt, int delta_x, int delta_y)
 	CONSOLE_SCREEN_BUFFER_INFO info;
 	COORD pos;
 
-	GetConsoleScreenBufferInfo(vt->handle, &info);
+	GetConsoleScreenBufferInfo(vt->out, &info);
 
 	pos = info.dwCursorPosition;
 
@@ -612,7 +599,7 @@ static void vt100_move_cursor(struct vt100_filp *vt, int delta_x, int delta_y)
 	if (pos.Y >= info.dwSize.Y)
 		pos.Y = info.dwSize.Y - 1;
 
-	SetConsoleCursorPosition(vt->handle, pos);
+	SetConsoleCursorPosition(vt->out, pos);
 }
 
 static void vt100_cursor_home(struct vt100_filp *vt)
@@ -620,14 +607,14 @@ static void vt100_cursor_home(struct vt100_filp *vt)
 	CONSOLE_SCREEN_BUFFER_INFO info;
 	COORD pos;
 
-	GetConsoleScreenBufferInfo(vt->handle, &info);
+	GetConsoleScreenBufferInfo(vt->out, &info);
 
 	pos = info.dwCursorPosition;
 
 	pos.Y = info.srWindow.Top;
 	pos.X = info.srWindow.Left;
 
-	SetConsoleCursorPosition(vt->handle, pos);
+	SetConsoleCursorPosition(vt->out, pos);
 }
 
 static void vt100_screen_alignment(struct vt100_filp *vt)
@@ -665,9 +652,9 @@ static void vt_hide_cursor(struct vt100_filp *vt, int enable)
 {
 	CONSOLE_CURSOR_INFO cci;
 
-	GetConsoleCursorInfo(vt->handle, &cci);
+	GetConsoleCursorInfo(vt->out, &cci);
 	cci.bVisible = enable;
-	SetConsoleCursorInfo(vt->handle, &cci);
+	SetConsoleCursorInfo(vt->out, &cci);
 }
 
 /*
@@ -752,9 +739,7 @@ static void vt100_enable_scrolling(struct vt100_filp *vt, int start, int end)
 	CONSOLE_SCREEN_BUFFER_INFO info;
 	int max;
 
-	vt->normal_lf = (start == 0 && end == 0);
-
-	GetConsoleScreenBufferInfo(vt->handle, &info);
+	GetConsoleScreenBufferInfo(vt->out, &info);
 	max = info.srWindow.Bottom - info.srWindow.Top + 1;
 
 	/* handle unset case */
@@ -1080,7 +1065,6 @@ static void vt100_send_cursor_code(struct vt100_filp *vt, char ch)
 
 static DWORD WINAPI vt100_input_thread(LPVOID param)
 {
-	HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
 	struct vt100_filp *vt = param;
 	unsigned char ch = 0;
 	DWORD count = 0;
@@ -1089,7 +1073,7 @@ static DWORD WINAPI vt100_input_thread(LPVOID param)
 
 	while (1)
 	{
-		r = ReadConsoleInput(in, &ir, 1, &count);
+		r = ReadConsoleInput(vt->in, &ir, 1, &count);
 		if (!r)
 		{
 			fprintf(stderr, "\nReadConsoleInput failed\n");
@@ -1143,7 +1127,7 @@ static void vt100_get_winsize(struct tty_filp *con, struct winsize *ws)
 	CONSOLE_SCREEN_BUFFER_INFO info;
 	struct vt100_filp *vt= (void*) con;
 
-	GetConsoleScreenBufferInfo(vt->handle, &info);
+	GetConsoleScreenBufferInfo(vt->out, &info);
 
 	ws->ws_col = info.srWindow.Right - info.srWindow.Left + 1;
 	ws->ws_row = info.srWindow.Bottom - info.srWindow.Top + 1;
@@ -1172,7 +1156,10 @@ struct con_ops vt100_ops = {
 	.fn_get_winsize = vt100_get_winsize,
 };
 
-static struct filp* alloc_vt100_console(HANDLE handle, struct process *leader)
+static struct vt100_filp *vt100_device;
+
+static struct vt100_filp*
+alloc_vt100_console(HANDLE in, HANDLE out, struct process *leader)
 {
 	struct vt100_filp *vt;
 	struct tty_filp *con;
@@ -1188,22 +1175,25 @@ static struct filp* alloc_vt100_console(HANDLE handle, struct process *leader)
 
 	tty_init(con, leader);
 
-	vt->handle = handle;
+	vt->in = in;
+	vt->out = out;
 	vt100_reset(vt);
-	SetConsoleMode(handle, ENABLE_PROCESSED_INPUT);
+	if (!SetConsoleMode(in, 0))
+		return NULL;
+	if (!SetConsoleMode(out, ENABLE_PROCESSED_OUTPUT))
+		return NULL;
 
 	InitializeCriticalSection(&vt->cs);
 
 	vt->thread = CreateThread(NULL, 0, &vt100_input_thread, con, 0, &id);
 
-	return &con->fp;
+	return vt;
 }
 
-static struct filp *condev;
-
-struct filp* get_vt100_console(HANDLE console, struct process *leader)
+struct filp*
+get_vt100_console(HANDLE in, HANDLE out, struct process *leader)
 {
-	if (!condev)
-		condev = alloc_vt100_console(console, leader);
-	return condev;
+	if (!vt100_device)
+		vt100_device = alloc_vt100_console(in, out, leader);
+	return &vt100_device->con.fp;
 }

@@ -30,15 +30,29 @@
 
 #define _l_WNOHANG (1)
 
+#define _l_SIGINT  (2)
 #define _l_SIGILL  (4)
 #define _l_SIGKILL (9)
 #define _l_SIGSEGV (11)
+#define _l_SIGTERM (15)
 #define _l_SIGCHLD (17)
 #define _l_SIGCONT (18)
 #define _l_SIGSTOP (19)
+#define _l_SIGTSTP (20)
+#define _l_SIGTTIN (21)
+#define _l_SIGTTOU (22)
 
 #define _l_SIG_IGN ((void*) 1)
 #define _l_SIG_DFL ((void*) 0)
+
+#define _l_SA_NOCLDSTOP (1 << 0)
+#define _l_SA_NOCLDWAIT (1 << 1)
+#define _l_SA_SIGINFO (1 << 2)
+#define _l_SA_RESTORER (1 << 26)
+#define _l_SA_ONSTACK (1 << 27)
+#define _l_SA_RESTART (1 << 28)
+#define _l_SA_NODEFER (1 << 30)
+#define _l_SA_RESETHAND (1 << 31)
 
 #define _l_CLONE_VM (0x100)
 #define _l_CLONE_PARENT_SETTID  (0x100000)
@@ -127,6 +141,10 @@
 #define _l_TCP_MAXSEG 2
 #define _l_TCP_CORK 3
 
+#define _l_IPPROTO_IP 0
+#define _l_IPPROTO_TCP 6
+#define _l_IPPROTO_UDP 17
+
 #define _l_SHUT_RD 0
 #define _l_SHUT_WR 1
 #define _l_SHUT_RDWR 2
@@ -148,11 +166,14 @@
 #define TIOCG     0x5401
 #define TIOCS     0x5402
 #define TCSETSW   0x5403
+#define TCSETSF   0x5404
 #define TCSETAW   0x5407
 #define TCFLUSH   0x540b
 
 #define VERASE 2
+#define VINTR 0
 #define VEOF 4
+#define VSUSP 10
 
 #define IGNBRK  (1 << 0)
 #define BRKINT  (1 << 1)
@@ -307,6 +328,28 @@ struct l_sigaction {
 	unsigned long sa_flags;
 	void *sa_restorer;
 	l_sigset_t sa_mask;
+} PACKED;
+
+typedef uint32_t l_clock_t;
+
+struct l_siginfo_t {
+	int si_signo;
+	int si_errno;
+	int si_code;
+	int si_trapno;
+	int si_pid;
+	int si_uid;
+	l_clock_t si_status;
+	l_clock_t si_uctime;
+	int si_value;
+	int si_int;
+	void *si_ptr;
+	int si_overrun;
+	int si_timerid;
+	void *si_addr;
+	long si_band;
+	int si_fd;
+	short si_addr_lsb;
 };
 
 #define SECSPERDAY 86400

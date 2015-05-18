@@ -85,8 +85,8 @@ struct socket_filp
 	HANDLE handle;
 	OVERLAPPED overlapped;
 	struct process *thread;
-	struct socket_filp *next;
-	struct wait_list wl;
+	LIST_ELEMENT(struct socket_filp, item);
+	LIST_ANCHOR(struct wait_entry) wl;
 	enum socket_state state;
 	int type;
 	uint8_t buffer[ACCEPTEX_ADDRSIZE * 2];
@@ -99,7 +99,7 @@ static HWND inet_hwnd;
 static LPFN_CONNECTEX pConnectEx;
 static LPFN_ACCEPTEX pAcceptEx;
 static LPFN_GETACCEPTEXSOCKADDRS pGetAcceptExSockaddrs;
-static struct socket_filp *inet_first_socket;
+static LIST_ANCHOR(struct socket_filp) inet_sockets;
 
 static struct socket_filp *inet_alloc_socket(SOCKET s);
 static int inet_alloc_fd(struct socket_filp *sfp);
@@ -159,12 +159,11 @@ static int inet_error_from_overlapped(struct socket_filp *sfp)
 static int inet_socket_wait_complete(struct socket_filp *sfp)
 {
 	/* wait for connect to complete */
-	while (!HasOverlappedIoCompleted(&sfp->overlapped))
+	while (!HasOverlappedIoCompleted(&sfp->overlapped) &&
+		 current->state != thread_terminated)
 	{
 		sfp->thread = current;
-		current->state = thread_stopped;
-		yield();
-		current->state = thread_running;
+		schedule();
 		sfp->thread = NULL;
 	}
 
@@ -218,6 +217,9 @@ static int inet_read(struct filp *fp, void *buf, size_t size, loff_t *off, int b
 		bytesCopied += bytesRead;
 		buf = (char*) buf + bytesRead;
 		size -= bytesRead;
+
+		if (!block)
+			break;
 	}
 
 	return bytesCopied;
@@ -233,26 +235,29 @@ static int inet_write(struct filp *fp, const void *buf, size_t size, loff_t *off
 
 	while (size)
 	{
+		SOCKET s = (SOCKET) sfp->handle;
 		ULONG sz = size;
 		DWORD bytesWritten;
 		ULONG bytesRead = 0;
-		BOOL ret;
+		WSABUF wsabuf;
+		int r;
 
 		if (sz > sizeof buffer)
 			sz = sizeof buffer;
 
-		ret = ReadProcessMemory(current->process, buf,
+		r = ReadProcessMemory(current->process, buf,
 					buffer, sz, &bytesRead);
-		if (!ret)
+		if (!r)
 			return -_L(EFAULT);
 
-		bytesWritten = 0;
-		ret = WriteFile(sfp->handle, buffer, bytesRead,
-				&bytesWritten, &sfp->overlapped);
-		if (!ret)
-		{
-			int r;
+		wsabuf.buf = (char*) buffer;
+		wsabuf.len = bytesRead;
 
+		bytesWritten = 0;
+		r = WSASend(s, &wsabuf, 1, &bytesWritten, 0,
+				 &sfp->overlapped, NULL);
+		if (r == SOCKET_ERROR)
+		{
 			if (GetLastError() != ERROR_IO_PENDING)
 			{
 				dprintf("WriteFile %p failed %ld\n",
@@ -283,24 +288,8 @@ static void inet_close(struct filp *fp)
 {
 	struct socket_filp *sfp = (struct socket_filp*) fp;
 	SOCKET s = (SOCKET) sfp->handle;
-	struct socket_filp **p;
-	int found = 0;
 
-	for (p = &inet_first_socket; *p; p = &(*p)->next)
-	{
-		if (*p == sfp)
-		{
-			*p = sfp->next;
-			found = 1;
-			break;
-		}
-	}
-
-	if (!found)
-	{
-		fprintf(stderr, "closing unknown socket %p\n", sfp);
-		exit(1);
-	}
+	LIST_REMOVE(&inet_sockets, sfp, item);
 
 	closesocket(s);
 }
@@ -369,6 +358,14 @@ static int inet_setsockopt(struct socket_filp *sfp, int level, int optname,
 		dprintf("unknown socket option %d\n", optname);
 	}
 
+	return -_L(EINVAL);
+}
+
+static int inet_getsockopt(struct socket_filp *sfp, int level, int optname,
+		 void *optval, size_t *optlen)
+{
+	dprintf("getsockopt(%p,%d,%d,%p,%p)\n",
+		sfp, level, optname, optval, optlen);
 	return -_L(EINVAL);
 }
 
@@ -925,10 +922,12 @@ static int inet_sockcall(int call, struct filp *fp, unsigned long *args, int blo
 	case _L(SYS_RECVFROM):
 		return inet_recvfrom(sfp, (void*) args[1], args[2], args[3],
 					 (void*) args[4], (void*) args[5]);
+	case _L(SYS_GETSOCKOPT):
+		return inet_getsockopt(sfp, args[1], args[2],
+				 (void*)args[3], (void*) args[4]);
 	case _L(SYS_SOCKETPAIR):
 	case _L(SYS_SENDTO):
 	case _L(SYS_RECV):
-	case _L(SYS_GETSOCKOPT):
 	case _L(SYS_SENDMSG):
 	case _L(SYS_RECVMSG):
 		printf("socketcall(%d) unhandled\n", call);
@@ -943,14 +942,14 @@ static void inet_poll_add(struct filp *f, struct wait_entry *we)
 {
 	struct socket_filp *sfp = (struct socket_filp*) f;
 
-	wait_entry_append(&sfp->wl, we);
+	LIST_APPEND(&sfp->wl, we, item);
 }
 
 static void inet_poll_del(struct filp *f, struct wait_entry *we)
 {
 	struct socket_filp *sfp = (struct socket_filp *) f;
 
-	wait_entry_remove(&sfp->wl, we);
+	LIST_REMOVE(&sfp->wl, we, item);
 }
 
 static int inet_poll(struct filp *f)
@@ -958,12 +957,18 @@ static int inet_poll(struct filp *f)
 	struct socket_filp *sfp = (struct socket_filp*) f;
 	int events = 0;
 
-	if (sfp->state == ss_accepting ||
-		sfp->state == ss_connecting)
+	switch (sfp->state)
 	{
+	case ss_accepting:
+	case ss_connecting:
 		if (HasOverlappedIoCompleted(&sfp->overlapped))
 			events |= _L(POLLIN);
 		return events;
+	case ss_disconnected:
+	case ss_disconnecting:
+		return _L(POLLHUP);
+	default:
+		break;
 	}
 
 	if (sfp->async_events & FD_ACCEPT)
@@ -1017,16 +1022,18 @@ int inet4_socket(int type, int protocol)
 	{
 	case SOCK_STREAM:
 		dprintf("SOCK_STREAM\n");
+		if (protocol != _L(IPPROTO_IP) && protocol != _L(IPPROTO_TCP))
+			return -_L(EINVAL);
 		break;
 	case SOCK_DGRAM:
 		dprintf("SOCK_DGRAM\n");
+		if (protocol != _L(IPPROTO_IP) && protocol != _L(IPPROTO_UDP))
+			return -_L(EINVAL);
 		break;
 	default:
 		return -_L(EINVAL);
 	}
 
-	if (protocol != 0)
-		return -_L(EINVAL);
 
 	s = WSASocket(AF_INET, type, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
 	if (s == INVALID_SOCKET)
@@ -1044,10 +1051,14 @@ int inet4_socket(int type, int protocol)
 static struct socket_filp *inet_alloc_socket(SOCKET s)
 {
 	struct socket_filp *sfp;
+	int r;
 
 	sfp = malloc(sizeof (*sfp));
 	if (!sfp)
+	{
+		closesocket(s);
 		return NULL;
+	}
 
 	memset(sfp, 0, sizeof *sfp);
 
@@ -1057,11 +1068,17 @@ static struct socket_filp *inet_alloc_socket(SOCKET s)
 	init_fp(&sfp->fp, &inet_ops);
 	sfp->handle = (HANDLE) s;
 
-	sfp->next = inet_first_socket;
-	inet_first_socket = sfp;
+	LIST_APPEND(&inet_sockets, sfp, item);
 
-	WSAAsyncSelect(s, inet_hwnd, WM_USER,
+	r = WSAAsyncSelect(s, inet_hwnd, WM_USER,
 		FD_READ | FD_WRITE | FD_ACCEPT | FD_CONNECT | FD_CLOSE);
+	if (r == SOCKET_ERROR)
+	{
+		dprintf("WSAAsync select failed (%d)\n", WSAGetLastError());
+		closesocket(s);
+		free(sfp);
+		return NULL;
+	}
 
 	return sfp;
 }
@@ -1092,7 +1109,7 @@ void inet4_process_events(void)
 
 	ResetEvent(inet_event);
 
-	for (sfp = inet_first_socket; sfp; sfp = sfp->next)
+	LIST_FOR_EACH(&inet_sockets, sfp, item)
 	{
 		if (sfp->thread &&
 			HasOverlappedIoCompleted(&sfp->overlapped))
@@ -1163,19 +1180,19 @@ static void inet_on_async_select(WPARAM wParam, LPARAM lParam)
 
 	dprintf("async_select %d %08lx\n", wParam, lParam);
 
-	for (sfp = inet_first_socket; sfp; sfp = sfp->next)
+	LIST_FOR_EACH(&inet_sockets, sfp, item)
 	{
 		SOCKET s = (SOCKET) sfp->handle;
 		if (s == wParam)
 		{
 			struct wait_entry *we;
 
-			sfp->async_events = lParam;
+			sfp->async_events |= lParam;
 
 			if (sfp->thread)
 				ready_list_add(sfp->thread);
 
-			for (we = sfp->wl.head; we; we = we->next)
+			LIST_FOR_EACH(&sfp->wl, we, item)
 				ready_list_add(we->p);
 
 			return;
