@@ -223,6 +223,8 @@ void _start(int dummy)
 		case R_386_RELATIVE:
 			elf_apply_reloc(ld_base, &rel[i]);
 			break;
+		case R_386_32:
+			break;
 		default:
 			err = __LINE__;
 			goto error;

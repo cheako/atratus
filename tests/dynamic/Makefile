@@ -4,8 +4,14 @@ CC = gcc
 TARGETS = \
 	args \
 	bsearch \
+	getopt \
+	getopt_long \
 	hw \
-	strncmp
+	malloc \
+	stdio \
+	string \
+	strtoul \
+	uname
 
 all: $(TARGETS)
 

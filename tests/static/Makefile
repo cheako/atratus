@@ -3,6 +3,7 @@ CC = gcc
 
 TARGETS = \
 	args \
+	brk \
 	cat \
 	date \
 	dir \

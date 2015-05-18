@@ -1,5 +1,11 @@
 Announcement & Release notes
 
+Tue Oct 16 06:50:47 EST 2012
+0.2 - October release
+
+ - Added rudimentary stdio implmentation
+ - Some busybox utils work (cat, date, echo, hostname, uname, wc)
+
 Sat Sep 15 12:10:11 EST 2012
 0.1 - Initial release
 

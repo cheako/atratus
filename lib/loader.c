@@ -31,372 +31,19 @@
 
 #include "loader.h"
 #include "string.h"
+#include "stdlib.h"
 
 #define NULL ((void *)0)
+
+static int verbose = 0;
+static struct module_info loader_module;
+static struct module_info main_module;
+char **ld_environment;
 
 /*
  * errno should be per thread,
  * leave as global until we can load an ELF binary
  */
-static int errno;
-static int verbose = 0;
-static struct module_info loader_module;
-static struct module_info main_module;
-static char **ld_environment;
-
-#define EXPORT __attribute__((visibility("default")))
-
-static inline int set_errno(int r)
-{
-	if ((r & 0xfffff000) == 0xfffff000)
-	{
-		errno = -r;
-		r = -1;
-	}
-	return r;
-}
-
-EXPORT void exit(int status)
-{
-	while (1)
-	{
-		__asm__ __volatile__ (
-			"\tpushl %%ebx\n"
-			"\tmov $1, %%eax\n"
-			"\tint $0x80\n"
-			"\tpopl %%ebx\n"
-		:: "a"(status) : "memory");
-	}
-}
-
-EXPORT int ioctl(int fd, int request, int value)
-{
-	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmovl $54, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(fd), "c"(request), "d"(value) : "memory");
-	return set_errno(r);
-}
-
-EXPORT int read(int fd, void *buffer, size_t length)
-{
-	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmovl $3, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(fd), "c"(buffer), "d"(length) : "memory");
-	return set_errno(r);
-}
-
-int dl_write(int fd, const void *buffer, size_t length)
-{
-	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $4, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(fd), "c"(buffer), "d"(length) : "memory");
-
-	return set_errno(r);
-}
-
-EXPORT int write(int fd, const void *buffer, size_t length)
-{
-	return dl_write(fd, buffer, length);
-}
-
-EXPORT int open(const char *filename, int flags)
-{
-	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $5, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(filename), "c"(flags) : "memory");
-
-	return set_errno(r);
-}
-
-EXPORT int close(int fd)
-{
-	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $6, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(fd) : "memory");
-
-	return set_errno(r);
-}
-
-EXPORT int getuid(void)
-{
-	int r;
-	__asm__ __volatile__ (
-		"\tmov $24, %%eax\n"
-		"\tint $0x80\n"
-	:"=a"(r):: "memory");
-
-	return set_errno(r);
-}
-
-EXPORT int dup2(int oldfd, int newfd)
-{
-	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $63, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(oldfd), "c"(newfd) : "memory");
-
-	return set_errno(r);
-}
-
-EXPORT size_t strlen(const char *x)
-{
-	size_t n = 0;
-	while (x[n])
-		n++;
-	return n;
-}
-
-int dl_strcmp(const char *a, const char *b)
-{
-	while (*a || *b)
-	{
-		if (*a == *b)
-		{
-			a++;
-			b++;
-			continue;
-		}
-		if (*a < *b)
-			return -1;
-		else
-			return 1;
-	}
-	return 0;
-}
-
-EXPORT int strcmp(const char *a, const char *b)
-{
-	return dl_strcmp(a, b);
-}
-
-EXPORT int strncmp(const char *a, const char *b, size_t n)
-{
-	int i;
-
-	for (i = 0; i < n; i++)
-	{
-		if (a[i] == b[i])
-			continue;
-		if (a[i] < b[i])
-			return -1;
-		else
-			return 1;
-	}
-	return 0;
-}
-
-EXPORT int memcmp(const void *s1, const void *s2, size_t n)
-{
-	const unsigned char *left = s1, *right = s2;
-	int r = 0;
-	int i;
-
-	for (i = 0; r == 0 && i < n; i++)
-		r = left[n] - right[n];
-
-	return r;
-}
-
-EXPORT int puts(const char *str)
-{
-	size_t len = strlen(str);
-	if (len != dl_write(1, str, len))
-		return EOF;
-	dl_write(1, "\n", 1);
-	return len;
-}
-
-EXPORT int putchar(int c)
-{
-	char ch = c;
-
-	if (1 != dl_write(1, &ch, 1))
-		return EOF;
-
-	return c;
-}
-
-EXPORT void abort(void)
-{
-	/* FIXME: send SIGABRT */
-	exit(1);
-}
-
-EXPORT int mallopt(int param, int value)
-{
-	switch (param)
-	{
-	case -1:
-		if (verbose)
-			printf("mallopt(M_TRIM_THRESHOLD,%d)\n", value);
-		break;
-	case -2:
-		if (verbose)
-			printf("mallopt(M_TOP_PAD,%d)\n", value);
-		break;
-	case -3:
-		if (verbose)
-			printf("mallopt(M_MMAP_THRESHOLD,%d)\n", value);
-		break;
-	default:
-		printf("mallopt(%d,%d)\n", param, value);
-	}
-	return 0;
-}
-
-EXPORT void *malloc(size_t sz)
-{
-	return NULL;
-}
-
-EXPORT int *__errno_location(void)
-{
-	return &errno;
-}
-
-EXPORT char *strrchr(const char *s, int c)
-{
-	int n = strlen(s);
-
-	while (n)
-	{
-		n--;
-		if (s[n] == c)
-			return (char*) &s[n];
-	}
-
-	return NULL;
-}
-
-EXPORT char *strchr(const char *s, int c)
-{
-	while (*s)
-	{
-		if (*s == c)
-			return (char*) s;
-		s++;
-	}
-	return NULL;
-}
-
-EXPORT void *bsearch(const void *key, const void *base,
-			size_t nmemb, size_t size,
-			int (*compar)(const void *a, const void* b))
-{
-	const void *p;
-	size_t n;
-	int r;
-
-	while (1)
-	{
-		if (nmemb == 0)
-			return NULL;
-
-		n = nmemb/2;
-		p = (const char*)base + n * size;
-
-		r = compar(key, p);
-		if (r == 0)
-			return (void*) p;
-
-		if (nmemb == 1)
-			return NULL;
-
-		if (r > 0)
-		{
-			base = p;
-			nmemb -= n;
-		}
-		else
-			nmemb = n;
-	}
-}
-
-EXPORT char *getenv(const char *name)
-{
-	char **p;
-	size_t len = strlen(name);
-	for (p = ld_environment;
-		*p;
-		p++)
-	{
-		size_t n;
-		char *x = strchr(*p, '=');
-		if (!x)
-			return NULL;
-
-		n = *p - x;
-		if (n != len)
-			continue;
-
-		if (!memcmp(name, *p, n))
-			return *p;
-	}
-
-	return NULL;
-}
-
-typedef int (*fn_main)(int, char * *, char * *);
-typedef void (*fn_init)(void);
-typedef void (*fn_fini)(void);
-typedef void (*fn_rtld_fini)(void);
-
-EXPORT int __libc_start_main(fn_main pmain,
-			int argc, char **ubp_av,
-			fn_init pinit, fn_fini pfini,
-			fn_rtld_fini prtld_fini,
-			void (* stack_end))
-{
-	if (verbose)
-	{
-		printf("%s called\n", __FUNCTION__);
-		printf("main   %p\n", pmain);
-		printf("argc   %d\n", argc);
-		printf("ubp_av %p\n", ubp_av);
-		printf("init   %p\n", pinit);
-		printf("fini   %p\n", pfini);
-		printf("stkend %p\n", stack_end);
-	}
-
-	pinit();
-
-	if (verbose)
-		printf("init() done\n");
-
-	pmain(argc, ubp_av, NULL);
-	if (verbose)
-		printf("main() done\n");
-	exit(0);
-}
 
 static unsigned int ld_get_auxv(Elf32_Aux *auxv, int value)
 {
@@ -476,7 +123,7 @@ static const char *strtab_get(struct module_info *m, Elf32_Word ofs)
 	return (const char*) (m->delta + m->dt.strtab + ofs);
 }
 
-Elf32_Word elf_hash_lookup(struct module_info *m,
+Elf32_Sym *elf_hash_lookup(struct module_info *m,
 				const char *symbol_name)
 {
 	Elf32_Word hash;
@@ -513,7 +160,7 @@ Elf32_Word elf_hash_lookup(struct module_info *m,
 		}
 #endif
 		if (!strcmp(name, symbol_name))
-			return sym->st_value;
+			return sym;
 
 		index = chains[index];
 		count--;
@@ -527,7 +174,7 @@ Elf32_Word elf_hash_lookup(struct module_info *m,
 }
 
 /* https://blogs.oracle.com/ali/entry/gnu_hash_elf_sections */
-Elf32_Word elf_gnu_hash_lookup(struct module_info *m,
+Elf32_Sym *elf_gnu_hash_lookup(struct module_info *m,
 				const char *symbol_name)
 {
 	struct {
@@ -539,7 +186,7 @@ Elf32_Word elf_gnu_hash_lookup(struct module_info *m,
 	} *gnuhash;
 	Elf32_Word *chain, *buckets;
 
-	Elf32_Word r = 0;
+	Elf32_Sym *r = 0;
 	Elf32_Word hash;
 	Elf32_Word index;
 	int last = 0;
@@ -570,7 +217,7 @@ Elf32_Word elf_gnu_hash_lookup(struct module_info *m,
 			name = strtab_get(m, sym->st_name);
 			if (!strcmp(name, symbol_name))
 			{
-				r = sym->st_value;
+				r = sym;
 				break;
 			}
 		}
@@ -589,32 +236,52 @@ Elf32_Word elf_gnu_hash_lookup(struct module_info *m,
 Elf32_Word module_get_symbol_address(struct module_info *m,
 					const char *symbol_name)
 {
-	Elf32_Word r = 0;
+	Elf32_Sym *r = 0;
 
 	if (m->dt.gnu_hash)
 		r = elf_gnu_hash_lookup(m, symbol_name);
 	else if (m->dt.hash)
 		r = elf_hash_lookup(m, symbol_name);
 
-	return r;
+	if (r && r->st_size)
+		return r->st_value;
+
+	return 0;
 }
 
-Elf32_Word ld_get_symbol_address(const char *sym)
+static Elf32_Word ld_get_symbol_address_exclude(const char *sym,
+					 struct module_info *exclude)
 {
 	Elf32_Word r;
 
-	r = module_get_symbol_address(&loader_module, sym);
-	if (r)
-		return (loader_module.delta + r);
+	/*
+	 * search order...?
+	 * main module first
+	 * then libraries
+	 */
+	if (exclude != &main_module)
+	{
+		r = module_get_symbol_address(&main_module, sym);
+		if (r)
+			return (main_module.delta + r);
+	}
 
-	r = module_get_symbol_address(&main_module, sym);
-	if (r)
-		return (main_module.delta + r);
+	if (exclude != &loader_module)
+	{
+		r = module_get_symbol_address(&loader_module, sym);
+		if (r)
+			return (loader_module.delta + r);
+	}
 
 	if (verbose)
 		printf("no symbol = %s\n", sym);
 
 	return 0;
+}
+
+static Elf32_Word ld_get_symbol_address(const char *sym)
+{
+	return ld_get_symbol_address_exclude(sym, NULL);
 }
 
 void *__ld_dynamic_resolve(void *arg, unsigned int entry, void *callee)
@@ -773,6 +440,64 @@ void elf_apply_reloc_glob_dat(struct module_info *m, int offset)
 	*p = (uint32_t) value;
 }
 
+void ld_apply_reloc_copy(struct module_info *m, Elf32_Rel *rel)
+{
+	Elf32_Word syminfo = ELF32_R_SYM(rel->r_info);
+	const char *symbol_name;
+	Elf32_Sym *st = (Elf32_Sym*) (m->delta + m->dt.symtab);
+	Elf32_Word value;
+	void *src, *dest;
+
+	st += syminfo;
+	symbol_name = (const char*) (m->delta + m->dt.strtab + st->st_name);
+
+	/* find the copy source */
+	value = ld_get_symbol_address_exclude(symbol_name, m);
+	if (!value)
+	{
+		printf("symbol not found: %s\n", symbol_name);
+		return;
+	}
+
+	src = (void*)value;
+	dest = (void*)(st->st_value + m->delta);
+
+	memcpy(dest, (void*)src, st->st_size);
+
+	if (verbose)
+	{
+		printf("R_386_COPY (%s) %p -> %p\n", symbol_name, src, dest);
+	}
+}
+
+static void ld_apply_reloc_32(struct module_info *m, Elf32_Rel *rel)
+{
+	Elf32_Word syminfo = ELF32_R_SYM(rel->r_info);
+	const char *symbol_name;
+	Elf32_Sym *st = (Elf32_Sym*) (m->delta + m->dt.symtab);
+	Elf32_Word value;
+	Elf32_Word *dest;
+
+	st += syminfo;
+	symbol_name = (const char*) (m->delta + m->dt.strtab + st->st_name);
+
+	value = ld_get_symbol_address(symbol_name);
+	if (!value)
+	{
+		printf("symbol '%s' not found\n", symbol_name);
+		exit(1);
+	}
+	value += main_module.delta;
+
+	if (verbose)
+	{
+		printf("R_386_32 reloc applied %s -> %08lx\n",
+			symbol_name, value);
+	}
+	dest = (void*)(m->delta + rel->r_offset);
+	*dest = value;
+}
+
 int ld_apply_relocations(struct module_info *m)
 {
 	int i;
@@ -792,19 +517,43 @@ int ld_apply_relocations(struct module_info *m)
 			elf_apply_reloc_glob_dat(m, i);
 			break;
 		case R_386_COPY:
-			{
-				const char *symbol_name;
-				Elf32_Sym *st = (Elf32_Sym*) m->dt.symtab;
-				st += syminfo;
-				symbol_name = (const char*) (m->delta + m->dt.strtab + st->st_name);
-
-				printf("R_386_COPY %s (not applied)\n", symbol_name);
-			}
+			ld_apply_reloc_copy(m, &rel[i]);
 			break;
 		default:
 			/* FIXME */
 			printf("%08x %06x %d (not applied)\n", rel[i].r_offset,
 				syminfo, symtype);
+		}
+	}
+
+	return 0;
+}
+
+static int ld_apply_loader_relocations(struct module_info *m)
+{
+	int i;
+
+	if (verbose)
+		printf("Applying relocs for %s\n", m->name);
+
+	for (i = 0; i < m->dt.relsz/sizeof (Elf32_Rel); i++)
+	{
+		Elf32_Rel *rel = (void*)(m->dt.rel + m->delta);
+		Elf32_Word syminfo = ELF32_R_SYM(rel[i].r_info);
+		Elf32_Word symtype = ELF32_R_TYPE(rel[i].r_info);
+
+		switch (symtype)
+		{
+		case R_386_RELATIVE:
+			break;
+		case R_386_32:
+			ld_apply_reloc_32(m, &rel[i]);
+			break;
+		default:
+			printf("%08x %06x "
+                               "(symbol type %d not supported)\n",
+				rel[i].r_offset, syminfo, symtype);
+			exit(1);
 		}
 	}
 
@@ -942,6 +691,8 @@ void *ld_main(int argc, char **argv, char **env, Elf32_Aux *auxv)
 	patch_got(&main_module);
 	if (verbose)
 		printf("done returning to %p\n", entry);
+
+	ld_apply_loader_relocations(&loader_module);
 
 	ld_apply_relocations(&main_module);
 

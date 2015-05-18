@@ -192,6 +192,7 @@ DECLARE(DbgUiGetThreadDebugObject)
 DECLARE(DbgUiConnectToDbg);
 DECLARE(DbgUiWaitStateChange)
 DECLARE(DbgUiContinue)
+DECLARE(DbgUiIssueRemoteBreakin)
 DECLARE(NtUnmapViewOfSection)
 DECLARE(KiUserApcDispatcher)
 #undef DECLARE
@@ -215,6 +216,7 @@ static BOOL dynamic_resolve(void)
 		RESOLVE(DbgUiConnectToDbg)
 		RESOLVE(DbgUiWaitStateChange)
 		RESOLVE(DbgUiContinue)
+		RESOLVE(DbgUiIssueRemoteBreakin)
 		RESOLVE(NtUnmapViewOfSection)
 		RESOLVE(KiUserApcDispatcher)
 #undef RESOLVE
@@ -744,6 +746,7 @@ struct process *alloc_process(void)
 	context->process = INVALID_HANDLE_VALUE;
 	context->thread = INVALID_HANDLE_VALUE;
 	context->state = thread_running;
+	context->umask = 0777;
 
 	/* insert at head of list */
 	context->next_process = first_process;
@@ -1241,6 +1244,7 @@ int sys_fork(void)
 	/* chain siblings if they exist */
 	context->sibling = current->child;
 	current->child = context;
+	context->umask = current->umask;
 
 	dprintf("fork() good!\n");
 
@@ -1965,8 +1969,24 @@ int sys_getpid(void)
 {
 	// FIXME: first thread is process ID.
 	ULONG pid = (ULONG)current->id.UniqueProcess;
-	printf("getpid() -> %04x\n", pid);
+	dprintf("getpid() -> %04lx\n", pid);
 	return pid;
+}
+
+int sys_getppid(void)
+{
+	if (!current->parent)
+		return 1;
+	ULONG pid = (ULONG)current->parent->id.UniqueProcess;
+	dprintf("getppid() -> %04lx\n", pid);
+	return pid;
+}
+
+int sys_umask(int umask)
+{
+	int r = current->umask;
+	current->umask = umask;
+	return r;
 }
 
 int sys_kill(int pid, int sig)
@@ -1997,6 +2017,124 @@ int sys_getcwd(char *buf, unsigned long size)
 	return len;
 }
 
+static int get_protection(int prot)
+{
+	DWORD Protection = PAGE_NOACCESS;
+	if (prot & _l_PROT_EXEC)
+		Protection = PAGE_EXECUTE_READWRITE;
+	else if (prot & _l_PROT_WRITE)
+		Protection = PAGE_READWRITE;
+	else if (prot & _l_PROT_READ)
+		Protection = PAGE_READONLY;
+	return Protection;
+}
+
+/*
+ * Move state of non-overlapping pages from
+ * free to committed
+ */
+static PVOID allocate_pages(void *addr, size_t len, int prot)
+{
+	DWORD AllocationType = MEM_RESERVE | MEM_COMMIT;
+	DWORD Protection;
+	ULONG Size;
+	PVOID Address;
+	NTSTATUS r;
+
+	Protection = get_protection(prot);
+
+	Address = (void*)((int)addr & ~0xffff);
+	Size = len;
+	Size += ((int)addr - (int)Address);
+	Size = (Size + 0xffff) & ~0xffff;
+
+	dprintf("NtAllocateVirtualMemory(%p,%08lx,%08lx,%08lx)\n",
+		Address, Size, AllocationType, Protection);
+
+	r = NtAllocateVirtualMemory(current->process, &Address,
+				0, &Size, AllocationType, Protection);
+	if (r != STATUS_SUCCESS)
+	{
+		printf("NtAllocateVirtualMemory failed (%08lx) %s\n",
+			r, ntstatus_to_string(r));
+		return _l_MAP_FAILED;
+	}
+	dprintf("NtAllocateVirtualMemory -> Address=%p Size=%08lx\n",
+		Address, Size);
+
+	return Address;
+}
+
+/*
+ * allocate_fragmented_pages()
+ *
+ * TODO: This should be atomic.
+ * if we fail in the middle for any reason,
+ *   any mappings created should be destroyed
+ */
+static PVOID allocate_fragmented_pages(void *addr, size_t len, int prot)
+{
+	MEMORY_BASIC_INFORMATION info;
+	PVOID Address;
+	ULONG Size;
+	ULONG BlockSize;
+	PVOID Base = addr;
+	NTSTATUS r;
+	DWORD Protection = get_protection(prot);
+
+	dprintf("Allocating fragmented pages at %p len=%08x\n", addr, len);
+
+	while (len > 0)
+	{
+		/* find current state of memory */
+		Address = addr;
+		r = NtQueryVirtualMemory(current->process, Address,
+					MemoryBasicInformation,
+					&info, sizeof info, &Size);
+		if (r != STATUS_SUCCESS)
+		{
+			fprintf(stderr, "NtQueryVirtualMemory failed r=%08x %s\n",
+				r, ntstatus_to_string(r));
+			exit(1);
+		}
+
+		if (len < info.RegionSize)
+			BlockSize = len;
+		else
+			BlockSize = info.RegionSize;
+
+		/* fill in what's not allocated */
+		if (info.State == MEM_FREE)
+		{
+			void *p = allocate_pages(Address, BlockSize, prot);
+			if (p == _l_MAP_FAILED)
+				return p;
+		}
+		else
+		{
+			ULONG old_prot = 0;
+			void *p = addr;
+			if (addr != Address)
+				BlockSize -= (0x10000 - ((char*)addr - (char*)Address));
+			dprintf("Adjusting protection at %p %08lx\n",
+				 p, BlockSize);
+			r = NtProtectVirtualMemory(current->process, &p, &BlockSize,
+						Protection, &old_prot);
+			if (r != STATUS_SUCCESS)
+			{
+				dprintf("NtProtectVirtualMemory failed %08lx\n", r);
+				return _l_MAP_FAILED;
+			}
+		}
+
+		/* next */
+		len -= BlockSize;
+		addr = (char*) addr + BlockSize;
+	}
+
+	return Base;
+}
+
 /*
  * TODO
  *  - return error codes correctly
@@ -2007,12 +2145,9 @@ int sys_getcwd(char *buf, unsigned long size)
 void* sys_mmap(void *addr, ULONG len, int prot, int flags, int fd, off_t offset)
 {
 	NTSTATUS r;
-	DWORD AllocationType = 0;
-	DWORD Protection;
 	PVOID Address;
 	MEMORY_BASIC_INFORMATION info;
 	ULONG Size = 0;
-	ULONG old_prot = 0;
 
 	dprintf("mmap(%p,%08lx,%08x,%08x,%d,%08lx)\n",
 		addr, len, prot, flags, fd, offset);
@@ -2038,76 +2173,40 @@ void* sys_mmap(void *addr, ULONG len, int prot, int flags, int fd, off_t offset)
 		exit(1);
 	}
 
-	if (info.State == MEM_FREE)
-	{
-		/* round to 0x10000 */
-		AllocationType = MEM_RESERVE | MEM_COMMIT;
-		Protection = PAGE_NOACCESS;
-
-		Address = (void*)((int)addr & ~0xffff);
-		Size = len;
-		Size += ((int)addr - (int)Address);
-		Size = (Size + 0xffff) & ~0xffff;
-
-		dprintf("NtAllocateVirtualMemory(%p,%08lx,%08lx,%08lx)\n",
-			Address, Size, AllocationType, Protection);
-
-		r = NtAllocateVirtualMemory(current->process, &Address,
-					0, &Size, AllocationType, Protection);
-		if (r != STATUS_SUCCESS)
-		{
-			printf("NtAllocateVirtualMemory failed (%08lx) %s\n",
-				r, ntstatus_to_string(r));
-			return _l_MAP_FAILED;
-		}
-		dprintf("NtAllocateVirtualMemory -> Address=%p Size=%08lx\n",
-			Address, Size);
-
-		/* handle case where no address was specificied */
-		if (!addr)
-			addr = Address;
-	}
-	else
-	{
-		/* clobber the address passed in */
-		if (!(flags & _l_MAP_FIXED))
-			addr = 0;
-	}
-
 	/*
+	 * Check if something is allocated at this address
+	 *
 	 * Can only change the protection within an allocated block.
 	 * Crossing allocation boundaries will cause a
 	 * STATUS_CONFLICTING_ADDRESS error.
 	 */
-
-	/* round to 0x1000 */
-	Address = (void*)((int)addr & ~0xfff);
-	Size = len;
-	Size += ((int)addr - (int)Address);
-	Size = (Size + 0xfff) & ~0xfff;
-
-	Protection = PAGE_NOACCESS;
-	if (prot & _l_PROT_EXEC)
-		Protection = PAGE_EXECUTE_READWRITE;
-	else if (prot & _l_PROT_WRITE)
-		Protection = PAGE_READWRITE;
-	else if (prot & _l_PROT_READ)
-		Protection = PAGE_READONLY;
-
-	dprintf("NtProtectVirtualMemory(%p,%08lx,%08lx)\n",
-		Address, Size, Protection);
-
-	r = NtProtectVirtualMemory(current->process, &Address, &Size,
-				Protection, &old_prot);
-	if (r != STATUS_SUCCESS)
+	if (info.RegionSize < len ||
+	    info.State != MEM_FREE)
 	{
-		printf("NtProtectVirtualMemory failed (%08lx) %s\n",
-			r, ntstatus_to_string(r));
-		return _l_MAP_FAILED;
+		if (!(flags & _l_MAP_FIXED))
+		{
+			Address = allocate_pages(0, len, prot);
+		}
+		else
+		{
+			/* partial allocate required */
+			Address = allocate_fragmented_pages(addr, len, prot);
+		}
+	}
+	else
+	{
+		/* no conflicts, go */
+		Address = allocate_pages(addr, len, prot);
 	}
 
-	dprintf("NtProtectVirtualMemory -> Address=%p Size=%08lx\n",
-		Address, len);
+	if (Address == _l_MAP_FAILED)
+		return Address;
+
+	/* handle case where no address was specificied */
+	if (!addr)
+		addr = Address;
+
+	dprintf("mmap -> %p\n", addr);
 
 	return addr;
 }
@@ -2157,14 +2256,11 @@ void* sys_brk(void *addr)
 			p = sys_mmap((void*)origin, target - origin,
 				_l_PROT_READ | _l_PROT_WRITE | _l_PROT_EXEC,
 				_l_MAP_FIXED|_l_MAP_PRIVATE|_l_MAP_ANONYMOUS, -1, 0);
-			if (!p)
+			if (p == _l_MAP_FAILED)
 				dprintf("failed to extend brk\n");
+			else
+				current->brk = (unsigned int) target;
 		}
-		else if (target < origin)
-		{
-			fprintf(stderr, "FIXME: reduce brk?\n");
-		}
-		current->brk = (unsigned int) target;
 	}
 	return (void*) current->brk;
 }
@@ -2179,6 +2275,96 @@ int sys_geteuid(void)
 {
 	dprintf("geteuid()\n");
 	return current->euid;
+}
+
+static int filetime_to_unixtime(FILETIME *ft, unsigned int *ns)
+{
+	ULONGLONG seconds;
+
+	seconds = (((ULONGLONG)ft->dwHighDateTime) << 32) + ft->dwLowDateTime;
+	return longlong_to_unixtime(seconds, ns);
+}
+
+int do_stat64(const char *path, struct stat64 *statbuf, BOOL follow_links)
+{
+	WIN32_FILE_ATTRIBUTE_DATA info;
+	char *dospath;
+	BOOL r;
+
+	dprintf("stat64(\"%s\",%p)\n", path, statbuf);
+
+	dospath = unix2dos_path(path);
+	r = GetFileAttributesEx(dospath, GetFileExInfoStandard, &info);
+	free(dospath);
+	if (!r)
+		return -_L(ENOENT);
+
+	memset(statbuf, 0, sizeof *statbuf);
+	statbuf->st_mode = 0755;
+	if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+		statbuf->st_mode |= 040000;
+	else
+		statbuf->st_mode |= 0100000;
+	statbuf->ctime = filetime_to_unixtime(&info.ftCreationTime,
+				&statbuf->ctime_nsec);
+	statbuf->mtime = filetime_to_unixtime(&info.ftLastWriteTime,
+				&statbuf->mtime_nsec);
+	statbuf->atime = filetime_to_unixtime(&info.ftLastAccessTime,
+				&statbuf->atime_nsec);
+	statbuf->st_size = info.nFileSizeLow;
+	//statbuf->st_size += info.nFileSizeHigh * 0x100000000LL;
+	statbuf->st_blksize = 0x1000;
+
+	return 0;
+}
+
+int sys_stat64(const char *ptr, struct stat64 *statbuf)
+{
+	struct stat64 st;
+	int r;
+	char *path = NULL;
+
+	r = read_string(ptr, &path);
+	if (r < 0)
+	{
+		dprintf("stat64(<invalid>,%p)\n", statbuf);
+		return r;
+	}
+
+	dprintf("stat64(\"%s\",%p)\n", path, statbuf);
+
+	r = do_stat64(path, &st, TRUE);
+	if (r == 0)
+		r = current->ops->memcpy_to(statbuf, &st, sizeof st);
+
+	free(path);
+
+	return r;
+}
+
+int sys_lstat64(const char *ptr, struct stat64 *statbuf)
+{
+	struct stat64 st;
+	int r;
+	char *path = NULL;
+
+	r = read_string(ptr, &path);
+	if (r < 0)
+	{
+		dprintf("lstat64(<invalid>,%p)\n", statbuf);
+		return r;
+	}
+
+	/* FIXME: links aren't supported */
+	dprintf("lstat64(\"%s\",%p)\n", path, statbuf);
+
+	r = do_stat64(path, &st, FALSE);
+	if (r == 0)
+		r = current->ops->memcpy_to(statbuf, &st, sizeof st);
+
+	free(path);
+
+	return r;
 }
 
 int sys_set_thread_area(void *ptr)
@@ -2272,6 +2458,12 @@ int sys_ioctl(int fd, unsigned int cmd, unsigned long arg)
 	r = fp->ops->fn_ioctl(fp, cmd, arg);
 
 	return r;
+}
+
+int sys_fcntl(int fd, int cmd, long arg)
+{
+	dprintf("fcntl(%d,%08x,%lx)\n", fd, cmd, arg);
+	return -_l_ENOSYS;
 }
 
 int sys_pipe(int *ptr)
@@ -2527,9 +2719,9 @@ int sys_newuname(struct _l_new_utsname *ptr)
 
 	dprintf("newuname(%p)\n", ptr);
 	strcpy(un.sysname, "Linux");
-	strcpy(un.nodename, "xli");
+	strcpy(un.nodename, "atratus");
 	strcpy(un.release, "2.6.36");
-	strcpy(un.version, "xli v0.1");
+	strcpy(un.version, "atratus v0.1");
 	strcpy(un.machine, "i686");
 	strcpy(un.domainname, "(none)");
 	r = current->ops->memcpy_to(ptr, &un, sizeof un);
@@ -2602,13 +2794,19 @@ int do_syscall(int n, int a1, int a2, int a3, int a4, int a5, int a6)
 	case 54:
 		r = sys_ioctl(a1, a2, a3);
 		break;
+	case 55:
+		r = sys_fcntl(a1, a2, a3);
+		break;
+	case 60:
+		r = sys_umask(a1);
+		break;
 	case 63:
 		r = sys_dup2(a1, a2);
 		break;
-#if 0
 	case 64:
 		r = sys_getppid();
 		break;
+#if 0
 	case 65:
 		r = sys_getpgrp();
 		break;
@@ -2656,13 +2854,13 @@ int do_syscall(int n, int a1, int a2, int a3, int a4, int a5, int a6)
 	case 192:
 		r = (int) sys_mmap(ptr(a1), a2, a3, a4, a5, a6);
 		break;
-#if 0
 	case 195:
 		r = sys_stat64(ptr(a1), ptr(a2));
 		break;
 	case 196:
 		r = sys_lstat64(ptr(a1), ptr(a2));
 		break;
+#if 0
 	case 197:
 		r = sys_fstat64(a1, ptr(a2));
 		break;

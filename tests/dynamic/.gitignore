@@ -1,4 +1,10 @@
 args
 bsearch
+getopt
+getopt_long
 hw
-strncmp
+malloc
+string
+stdio
+strtoul
+uname

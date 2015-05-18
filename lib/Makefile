@@ -5,13 +5,13 @@ CFLAGS += -fvisibility=hidden
 CFLAGS += -I../include
 CFLAGS += -fno-builtin-printf
 
-LDFLAGS += -shared -Bsymbolic -Bsymbolic-functions
+LDFLAGS += -shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions
 LDFLAGS += --no-undefined -nostartfiles -nodefaultlibs
 LDFLAGS += -fpic -g
 
 TARGET = ld-linux.so.2
 
-$(TARGET): loader.o stub.o subr_prf.o
+$(TARGET): c.o loader.o stub.o subr_prf.o
 	$(CC) -o $@ $(LDFLAGS) -e _start $^
 
 clean:

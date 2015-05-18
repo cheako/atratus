@@ -54,6 +54,7 @@ struct process
 	CLIENT_ID			id;
 	USER_STACK			stack_info;
 	thread_state                    state;
+	unsigned int                    umask;
 	int				exit_code;
 	PVOID				fiber;
 };
