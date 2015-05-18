@@ -29,7 +29,9 @@
 #include <unistd.h>
 #include <sys/fcntl.h>
 
+#ifndef alloca
 #define alloca(sz) __builtin_alloca(sz)
+#endif
 
 #include "linux-errno.h"
 #include "linux-defines.h"
@@ -49,6 +51,12 @@
 #include "vm.h"
 #include "elf.h"
 #include "emulate.h"
+
+#ifdef __i386__
+#define SZFMT ""
+#else
+#define SZFMT "I64"
+#endif
 
 struct _l_pollfd {
 	int fd;
@@ -71,26 +79,12 @@ LIST_ANCHOR(struct process) remote_break_list;
 static LPVOID wait_fiber;
 static HANDLE loop_event;
 static HANDLE debugObject;
+static bool is64bit;
 
 static WCHAR stub_exe_name[MAX_PATH];
+static uint32_t stub_entry_point;
 
 #define DEFAULT_STACKSIZE 0x100000
-
-static int vm_memcpy_from(void *local_addr, const void *client_addr, size_t size)
-{
-	return vm_memcpy_from_process(current, local_addr, client_addr, size);
-}
-
-static int vm_memcpy_to(void *client_addr, const void *local_addr, size_t size)
-{
-	return vm_memcpy_to_process(current, client_addr, local_addr, size);
-}
-
-struct process_ops nt_process_ops =
-{
-	.memcpy_from = &vm_memcpy_from,
-	.memcpy_to = &vm_memcpy_to,
-};
 
 struct process *context_from_client_id(CLIENT_ID *id)
 {
@@ -107,12 +101,12 @@ struct process *context_from_client_id(CLIENT_ID *id)
 	return NULL;
 }
 
-BOOL WINAPI GetFileSizeEx(HANDLE handle, PLARGE_INTEGER Size);
 extern void KiUserApcDispatcher(void);
 extern void LdrInitializeThunk(void);
 
-/* mingw32's ntdll doesn't have these functions */
 #define DECLARE(x) typeof(x) *p##x;
+
+/* mingw32's ntdll doesn't have these entry points */
 DECLARE(NtContinue)
 DECLARE(NtCreateWaitablePort)
 DECLARE(DbgUiGetThreadDebugObject)
@@ -125,6 +119,7 @@ DECLARE(KiUserApcDispatcher)
 DECLARE(LdrInitializeThunk)
 DECLARE(NtSetLdtEntries)
 DECLARE(NtRemoveProcessDebug);
+
 #undef DECLARE
 
 static BOOL dynamic_resolve(void)
@@ -164,36 +159,36 @@ static BOOL dynamic_resolve(void)
 	return TRUE;
 }
 
-void* sys_mmap(void *addr, size_t len, int prot,
+user_ptr_t sys_mmap(user_ptr_t addr, user_size_t len, int prot,
 		int flags, int fd, off_t offset);
 static int do_close(int fd);
 void dump_string_list(char **list);
-void __stdcall SyscallHandler(PVOID param);
+void __stdcall process_fiber(PVOID param);
 void process_deliver_signal(struct process *p);
 void signal_queue_free(struct process *p);
 void sys_sigreturn(void);
 void sys_rt_sigreturn(void);
 
-static void dump_user_mem(struct process *context,
-			void *p, unsigned int len)
+static void dump_user_mem(struct process *p,
+			void *ptr, size_t len)
 {
-	unsigned char *x = (unsigned char*) p;
+	unsigned char *x = (unsigned char*) ptr;
 	unsigned char buffer[0x10];
-	int extra;
+	intptr_t extra;
 
 	/* start on a 16 byte boundary */
-	extra = ((int)x) & (16 - 1);
+	extra = ((intptr_t)x) & (16 - 1);
 	x -= extra;
 	len += extra;
 
 	while (len)
 	{
 		ULONG sz = MIN(len, 16);
-		ULONG bytesRead = 0;
+		SIZE_T bytesRead = 0;
 		NTSTATUS r;
 
 		printf("%p  ", x);
-		r = NtReadVirtualMemory(context->process, x, buffer,
+		r = NtReadVirtualMemory(p->process, x, buffer,
 					sz, &bytesRead);
 		if (r != STATUS_SUCCESS)
 		{
@@ -212,7 +207,7 @@ void* get_process_peb(HANDLE process)
 {
 	PROCESS_BASIC_INFORMATION info;
 	NTSTATUS r;
-	ULONG sz;
+	SIZE_T sz;
 
 	memset(&info, 0, sizeof info);
 	r = NtQueryInformationProcess(process, ProcessBasicInformation,
@@ -226,7 +221,7 @@ ULONG get_process_exit_code(HANDLE process)
 {
 	PROCESS_BASIC_INFORMATION info;
 	NTSTATUS r;
-	ULONG sz;
+	SIZE_T sz = 0;
 
 	memset(&info, 0, sizeof info);
 	r = NtQueryInformationProcess(process, ProcessBasicInformation,
@@ -240,7 +235,7 @@ ULONG get_thread_exit_code(HANDLE thread)
 {
 	THREAD_BASIC_INFORMATION info;
 	NTSTATUS r;
-	ULONG sz;
+	SIZE_T sz = 0;
 
 	r = NtQueryInformationThread(thread, ThreadBasicInformation,
 				 &info, sizeof info, &sz);
@@ -249,10 +244,125 @@ ULONG get_thread_exit_code(HANDLE thread)
 	return ~0;
 }
 
+void ucontext_from_context(struct _L(ucontext) *uc, CONTEXT *ctx)
+{
+#define COPY(LR, WR) uc->LR = ctx->WR
+#if defined(__i386__)
+	COPY(gs, SegGs);
+	COPY(fs, SegFs);
+	COPY(es, SegEs);
+	COPY(ds, SegDs);
+	COPY(edi, Edi);
+	COPY(esi, Esi);
+	COPY(ebp, Ebp);
+	COPY(esp, Esp);
+	COPY(ebx, Ebx);
+	COPY(edx, Edx);
+	COPY(ecx, Ecx);
+	COPY(eax, Eax);
+	COPY(cs, SegCs);
+	COPY(ss, SegSs);
+	COPY(eip, Eip);
+	COPY(eflags, EFlags);
+#elif defined(__x86_64__)
+	COPY(gs, SegGs);
+	COPY(fs, SegFs);
+	COPY(es, SegEs);
+	COPY(ds, SegDs);
+	COPY(edi, Rdi);
+	COPY(esi, Rsi);
+	COPY(ebp, Rbp);
+	COPY(esp, Rsp);
+	COPY(ebx, Rbx);
+	COPY(edx, Rdx);
+	COPY(ecx, Rcx);
+	COPY(eax, Rax);
+	COPY(cs, SegCs);
+	COPY(ss, SegSs);
+	COPY(eip, Rip);
+	COPY(eflags, EFlags);
+#else
+#error Define ucontext_from_context
+#endif
+#undef COPY
+}
+
+void context_from_ucontext(CONTEXT *ctx, struct _L(ucontext) *uc)
+{
+	ctx->ContextFlags = CONTEXT_FULL | CONTEXT_SEGMENTS;
+#define COPY(LR, WR) ctx->WR = uc->LR
+#ifdef __i386__
+	COPY(gs, SegGs);
+	COPY(fs, SegFs);
+	COPY(es, SegEs);
+	COPY(ds, SegDs);
+	COPY(edi, Edi);
+	COPY(esi, Esi);
+	COPY(ebp, Ebp);
+	COPY(esp, Esp);
+	COPY(ebx, Ebx);
+	COPY(edx, Edx);
+	COPY(ecx, Ecx);
+	COPY(eax, Eax);
+	COPY(cs, SegCs);
+	COPY(ss, SegSs);
+	COPY(eip, Eip);
+	COPY(eflags, EFlags);
+#elif defined(__x86_64__)
+	COPY(gs, SegGs);
+	COPY(fs, SegFs);
+	COPY(es, SegEs);
+	COPY(ds, SegDs);
+	COPY(edi, Rdi);
+	COPY(esi, Rsi);
+	COPY(ebp, Rbp);
+	COPY(esp, Rsp);
+	COPY(ebx, Rbx);
+	COPY(edx, Rdx);
+	COPY(ecx, Rcx);
+	COPY(eax, Rax);
+	COPY(cs, SegCs);
+	COPY(ss, SegSs);
+	COPY(eip, Rip);
+	COPY(eflags, EFlags);
+#else
+#error Define context_from_ucontext
+#endif
+#undef COPY
+}
+
+NTSTATUS get_thread_ucontext(struct process *p)
+{
+	NTSTATUS r;
+
+	p->winctx.ContextFlags = CONTEXT_FULL | CONTEXT_SEGMENTS;
+	r = NtGetContextThread(p->thread, &p->winctx);
+	if (r == STATUS_SUCCESS)
+		ucontext_from_context(&p->regs, &p->winctx);
+	return r;
+}
+
+NTSTATUS set_thread_ucontext(struct process *p)
+{
+	p->winctx.ContextFlags = CONTEXT_FULL | CONTEXT_SEGMENTS;
+	context_from_ucontext(&p->winctx, &p->regs);
+	return NtSetContextThread(p->thread, &p->winctx);
+}
+
+void signal_ucontext_from_process(struct process *p, struct _L(ucontext) *uc)
+{
+	memcpy(uc, &p->regs, sizeof *uc);
+}
+
+void signal_ucontext_to_process(struct process *p, struct _L(ucontext) *uc)
+{
+	memcpy(&p->regs, uc, sizeof *uc);
+}
+
 static NTSTATUS patch_process(HANDLE process, void *where,
 				const void *inst, size_t inst_sz)
 {
-	ULONG sz = 0;
+	SIZE_T sz = 0;
 	NTSTATUS r;
 	ULONG old_prot = 0;
 	void *addr;
@@ -310,9 +420,10 @@ static NTSTATUS patch_process(HANDLE process, void *where,
  * 6:   57                      push   %edi
  * 7:   e8 xx xx xx xx          call   NtContinue
  */
-static NTSTATUS patch_apc_callback(struct process *context)
+static NTSTATUS patch_apc_callback(struct process *p)
 {
-	NTSTATUS r;
+	NTSTATUS r = STATUS_SUCCESS;
+#if defined(__i386__)
 	struct {
 		uint8_t ops1[8];
 		uint32_t offset;
@@ -320,43 +431,51 @@ static NTSTATUS patch_apc_callback(struct process *context)
 		{ 0x8d, 0x7c, 0x24, 0x10, 0x6a, 0x01, 0x57, 0xe8 }
 	};
 
-	inst.offset = (int) pNtContinue - (int) pKiUserApcDispatcher - sizeof inst;
+	inst.offset = (uintptr_t) pNtContinue - (uintptr_t) pKiUserApcDispatcher - sizeof inst;
 
 	STATIC_ASSERT(sizeof inst == 12);
 
-	r = patch_process(context->process, pKiUserApcDispatcher,
+	r = patch_process(p->process, pKiUserApcDispatcher,
 			&inst, sizeof inst);
 	if (r != STATUS_SUCCESS)
 		return r;
 
 	dprintf("Patched KiUserApcDispatcher @%p\n", pKiUserApcDispatcher);
+#endif
 
 	return r;
 }
 
 /*
-   0:   89 ff                   mov    %edi,%edi
-   2:   55                      push   %ebp
-   3:   89 e5                   mov    %esp,%ebp
-   5:   6a 01                   push   $0x1
-   7:   ff 75 08                pushl  0x8(%ebp)
-   a:   e8 fc ff ff ff          call   0xb
+ * In Windows XP and above threads start at LdrInitializeThunk
+ * instead of at KiUserApcDispatcher (in Windows 2000)
  */
-static NTSTATUS patch_ldr_thunk(struct process *context)
+static NTSTATUS patch_ldr_thunk(struct process *p)
 {
 	NTSTATUS r;
-	struct {
-		uint8_t ops1[11];
-		uint32_t offset;
-	} __attribute__((__packed__)) inst = {{
-		0x89, 0xff, 0x55, 0x89, 0xe5, 0x6a, 0x01, 0xff, 0x75, 0x08, 0xe8
-	}};
+	uint32_t offset;
+	uint8_t inst[] = {
+#if defined(__i386__)
+		0x89, 0xff,			/* mov %edi,%edi    */
+		0x55,				/* push %ebp        */
+		0x89, 0xe5,			/* mov %esp,%ebp    */
+		0x6a, 0x01,			/* push $0x1        */
+		0xff, 0x75, 0x08,		/* pushl 0x8(%ebp)  */
+#elif defined(__x86_64__)
+		0xff, 0xf3,			/* pushq %rbx       */
+		0x48, 0x83, 0xec, 0x20,		/* subq $0x20, %rsp */
+		0xb2, 0x01,			/* mov $1, %dl      */
+#else
+#error No LdrInitializeThunk patch defined
+#endif
+		0xe8, 0, 0, 0, 0		/* call NtContinue */
+	};
 
-	inst.offset = (int) pNtContinue - (int) pLdrInitializeThunk - sizeof inst;
+	offset = (uintptr_t) pNtContinue - (uintptr_t) pLdrInitializeThunk - sizeof inst;
 
-	STATIC_ASSERT(sizeof inst == 15);
+	memcpy(inst + sizeof inst - sizeof offset, &offset, sizeof offset);
 
-	r = patch_process(context->process, pLdrInitializeThunk,
+	r = patch_process(p->process, pLdrInitializeThunk,
 			&inst, sizeof inst);
 	if (r != STATUS_SUCCESS)
 		return r;
@@ -377,35 +496,34 @@ struct process *process_find(int pid)
 
 struct process *alloc_process(void)
 {
-	struct process *context;
-	context = malloc(sizeof *context);
-	memset(context, 0, sizeof *context);
+	struct process *p;
+	p = malloc(sizeof *p);
+	memset(p, 0, sizeof *p);
 
 	/* init */
-	context->ops = &nt_process_ops;
-	context->process = INVALID_HANDLE_VALUE;
-	context->thread = INVALID_HANDLE_VALUE;
-	context->state = thread_ready;
-	context->umask = 0777;
+	p->process = INVALID_HANDLE_VALUE;
+	p->thread = INVALID_HANDLE_VALUE;
+	p->state = thread_ready;
+	p->umask = 0777;
 
 	/* insert at head of list */
-	LIST_ELEMENT_INIT(context, item);
-	LIST_PREPEND(&process_list, context, item);
+	LIST_ELEMENT_INIT(p, item);
+	LIST_PREPEND(&process_list, p, item);
 
-	LIST_ELEMENT_INIT(context, ready_item);
-	LIST_ANCHOR_INIT(&context->signal_list);
-	LIST_ELEMENT_INIT(context, remote_break_item);
+	LIST_ELEMENT_INIT(p, ready_item);
+	LIST_ANCHOR_INIT(&p->signal_list);
+	LIST_ELEMENT_INIT(p, remote_break_item);
 
-	return context;
+	return p;
 }
 
-NTSTATUS create_nt_process(struct process *context,
+NTSTATUS create_nt_process(struct process *p,
 			 HANDLE debugObject)
 {
 	HANDLE file = NULL, section = NULL;
 	NTSTATUS r;
 	OBJECT_ATTRIBUTES oa;
-	VOID *peb;
+	SECTION_IMAGE_INFORMATION si;
 
 	file = CreateFileW(stub_exe_name,
 			GENERIC_READ | FILE_EXECUTE | SYNCHRONIZE,
@@ -432,13 +550,25 @@ NTSTATUS create_nt_process(struct process *context,
 	if (r != STATUS_SUCCESS)
 		goto end;
 
+	/* query the entry point and stack information */
+	memset(&si, 0, sizeof si);
+	r = NtQuerySection(section, SectionImageInformation, &si, sizeof si, NULL);
+	if (r != STATUS_SUCCESS)
+	{
+		fprintf(stderr, "NtQuerySection returned %08lx\n", r);
+		goto end;
+	}
+
+	stub_entry_point = (uint32_t)(uintptr_t) si.EntryPoint;
+	dprintf("si.EntryPoint %08x\n", stub_entry_point);
+
 	memset(&oa, 0, sizeof oa);
 	oa.Length = sizeof oa;
 	oa.RootDirectory = NULL;
 	oa.Attributes = OBJ_CASE_INSENSITIVE;
 
-	context->process = NULL;
-	r = NtCreateProcess(&context->process, PROCESS_ALL_ACCESS, &oa,
+	p->process = NULL;
+	r = NtCreateProcess(&p->process, PROCESS_ALL_ACCESS, &oa,
 			NtCurrentProcess(), FALSE, section, debugObject, NULL);
 	if (r != STATUS_SUCCESS)
 	{
@@ -447,27 +577,34 @@ NTSTATUS create_nt_process(struct process *context,
 		goto end;
 	}
 
-	peb = get_process_peb(context->process);
-
 	/* setup the thread context */
-	context->regs.ContextFlags = CONTEXT_FULL;
-	r = NtGetContextThread(NtCurrentThread(), &context->regs);
+	p->winctx.ContextFlags = CONTEXT_FULL | CONTEXT_SEGMENTS;
+	r = NtGetContextThread(NtCurrentThread(), &p->winctx);
 	if (r != STATUS_SUCCESS)
 		return r;
+
+	/* on x86-64, make the thread a 32bit thread */
+#if defined(__x86_64__)
+	p->winctx.SegCs = 0x23;
+#endif
+	p->winctx.SegFs = 0;
+	p->winctx.SegGs = 0;
+
+	ucontext_from_context(&p->regs, &p->winctx);
 
 	/*
 	 * Patch KiUserApcDispatcher to not enter ntdll
 	 * We don't want or need the stuff that ntdll does
 	 * Jump directly to the program entry point
 	 */
-	r = patch_apc_callback(context);
+	r = patch_apc_callback(p);
 	if (r != STATUS_SUCCESS)
 		goto end;
 
 	/*
 	 * Same as above, but for Windows 7
 	 */
-	r = patch_ldr_thunk(context);
+	r = patch_ldr_thunk(p);
 	if (r != STATUS_SUCCESS)
 		goto end;
 
@@ -488,11 +625,12 @@ void purge_address_space(void)
 	while (1)
 	{
 		MEMORY_BASIC_INFORMATION info;
-		ULONG sz = 0;
+		SIZE_T memsz = 0;
 
+		memset(&info, 0, sizeof info);
 		r = NtQueryVirtualMemory(current->process, Address,
 					MemoryBasicInformation,
-					&info, sizeof info, &sz);
+					&info, sizeof info, NULL);
 		if (r != STATUS_SUCCESS)
 			break;
 
@@ -507,16 +645,16 @@ void purge_address_space(void)
 		if (info.Type == MEM_IMAGE)
 			continue;
 
-		sz = 0;
+		memsz = 0;
 		r = NtFreeVirtualMemory(current->process,
-				&info.BaseAddress, &sz,
+				&info.BaseAddress, &memsz,
 				MEM_RELEASE);
 		if (r != STATUS_SUCCESS)
 		{
 			// this will happen for the TEB, PEB
 			// NT shared memory block, etc.
 			dprintf("failed to free %p %08lx r=%08lx\n",
-				info.BaseAddress, info.RegionSize, r);
+				info.BaseAddress, (DWORD)info.RegionSize, r);
 		}
 	}
 }
@@ -606,21 +744,20 @@ int do_exec(const char *filename, char **argv, char **envp)
 	 * TODO: implement and use MAP_GROWSDOWN here
 	 *       and avoid using a fixed address (and size...)
 	 */
-	PVOID p = NULL;
-	ULONG sz = 0x100000;
-	p = (void*) 0x5ff00000;
+	user_ptr_t p = 0x5ff00000;
+	user_size_t sz = 0x100000;
 
 	p = sys_mmap(p, sz, _l_PROT_READ | _l_PROT_WRITE | _l_PROT_EXEC,
 		 _l_MAP_FIXED|_l_MAP_PRIVATE|_l_MAP_ANONYMOUS, -1, 0);
-	if (p == _l_MAP_FAILED)
+	r = L_PTR_ERROR(p);
+	if (r < 0)
 	{
-		r = -(int)p;
 		dprintf("map failed (r=%d)\n", r);
 		goto end;
 	}
 
-	current->stack_info.StackBase = (void*) ((char*)p + sz);
-	current->stack_info.StackLimit = (void*) p;
+	current->stack_info.StackBase = (void*)(uintptr_t)(p + sz);
+	current->stack_info.StackLimit = (void*)(uintptr_t) p;
 
 	/* copy startup information to the stack */
 	r = elf_stack_setup(current, p, sz, argv, envp, exe, interp);
@@ -632,14 +769,14 @@ int do_exec(const char *filename, char **argv, char **envp)
 	 * ebx should be delta from load address to link address
 	 */
 	if (interp)
-		current->regs.Eip = elf_entry_point_get(interp);
+		current->regs.eip = elf_entry_point_get(interp);
 	else
-		current->regs.Eip = elf_entry_point_get(exe);
+		current->regs.eip = elf_entry_point_get(exe);
 
 	do_close_on_exec(current);
 
-	dprintf("Eip = %08lx\n", current->regs.Eip);
-	dprintf("Esp = %08lx\n", current->regs.Esp);
+	dprintf("eip = %08x\n", current->regs.eip);
+	dprintf("esp = %08x\n", current->regs.esp);
 end:
 	elf_object_free(exe);
 	elf_object_free(interp);
@@ -679,19 +816,6 @@ const char *debug_state_to_string(DBG_STATE state)
 	}
 }
 
-static NTSTATUS read_process_registers(struct process *context)
-{
-	NTSTATUS r;
-
-	memset(&context->regs, 0, sizeof context->regs);
-	context->regs.ContextFlags = CONTEXT_i386 | CONTEXT_FULL;
-	r = NtGetContextThread(context->thread, &context->regs);
-	if (r != STATUS_SUCCESS)
-		fprintf(stderr, "NtThreadGetContext() failed %08lx\n", r);
-
-	return r;
-}
-
 void dump_exception(EXCEPTION_RECORD *er)
 {
 	int i;
@@ -707,25 +831,25 @@ void dump_exception(EXCEPTION_RECORD *er)
 			er->ExceptionInformation[i]);
 }
 
-void dump_stack(struct process *context)
+void dump_stack(struct process *p)
 {
-	void *stack = (void*)context->regs.Esp;
+	void *stack = (void*)(uintptr_t)p->regs.esp;
 	printf("stack @%p\n", stack);
-	dump_user_mem(context, stack, 0x100);
+	dump_user_mem(p, stack, 0x100);
 }
 
-NTSTATUS dump_tls(struct process *context)
+NTSTATUS dump_tls(struct process *p)
 {
-	ULONG sz = 0;
+	SIZE_T sz = 0;
 	NTSTATUS r;
 	THREAD_BASIC_INFORMATION info;
 
-	r = NtQueryInformationThread(context->thread, ThreadBasicInformation,
+	r = NtQueryInformationThread(p->thread, ThreadBasicInformation,
 				 &info, sizeof info, &sz);
 	if (r != STATUS_SUCCESS)
 		return r;
 
-	dump_user_mem(context, info.TebBaseAddress, 0x100);
+	dump_user_mem(p, info.TebBaseAddress, 0x100);
 
 	return r;
 }
@@ -814,7 +938,7 @@ static void process_vtls_copy(struct process *to, struct process *from)
 static int do_fork(struct process **newproc)
 {
 	HANDLE parent = NULL;
-	struct process *context;
+	struct process *p;
 	OBJECT_ATTRIBUTES oa;
 	NTSTATUS r;
 
@@ -826,14 +950,14 @@ static int do_fork(struct process **newproc)
 	 * it will succeed but create a blank address space
 	 */
 	parent = OpenProcess(PROCESS_CREATE_PROCESS | PROCESS_DUP_HANDLE,
-				FALSE, (DWORD) current->id.UniqueProcess);
+				FALSE, (DWORD)(DWORD_PTR) current->id.UniqueProcess);
 	if (!parent)
 	{
 		dprintf("OpenProcess failed (r = %08lx)\n", GetLastError());
 		return -_L(EPERM);
 	}
 
-	context = alloc_process();
+	p = alloc_process();
 
 	memset(&oa, 0, sizeof oa);
 	oa.Length = sizeof oa;
@@ -846,7 +970,7 @@ static int do_fork(struct process **newproc)
 	 * NT kernel supported fork
 	 * Which versions of kernel does it work for?
 	 */
-	r = NtCreateProcess(&context->process, PROCESS_ALL_ACCESS, &oa,
+	r = NtCreateProcess(&p->process, PROCESS_ALL_ACCESS, &oa,
 			parent, FALSE, NULL, debugObject, NULL);
 	if (r != STATUS_SUCCESS)
 	{
@@ -864,10 +988,10 @@ static int do_fork(struct process **newproc)
 	 * probably because the kernel cannot push an exception CONTEXT
 	 * onto the user stack and gives up in a bad state...
 	 */
-	vm_mappings_copy(context, current);
+	vm_mappings_copy(p, current);
 
 	/* duplicate the stack info */
-	context->stack_info = current->stack_info;
+	p->stack_info = current->stack_info;
 
 	/*
 	 * TODO: deal with multiple threads here
@@ -875,19 +999,22 @@ static int do_fork(struct process **newproc)
 	 */
 
 	/* copy the parent thread's context into this one's */
-	context->regs = current->regs;
+	p->regs = current->regs;
+	p->winctx = current->winctx;
 
-	context->fiber = CreateFiber(0, &SyscallHandler, context);
-	if (!context->fiber)
+	p->fiber = CreateFiber(0, &process_fiber, p);
+	if (!p->fiber)
 	{
 		r = STATUS_UNSUCCESSFUL;
 		goto out;
 	}
 
 	/* create a thread to run in the process */
-	r = NtCreateThread(&context->thread, THREAD_ALL_ACCESS, NULL,
-			 context->process, &context->id,
-			 &context->regs, &context->stack_info, TRUE);
+	p->regs.eax = 0;
+	context_from_ucontext(&p->winctx, &p->regs);
+	r = NtCreateThread(&p->thread, THREAD_ALL_ACCESS, NULL,
+			 p->process, &p->id,
+			 &p->winctx, &p->stack_info, TRUE);
 	if (r != STATUS_SUCCESS)
 	{
 		fprintf(stderr, "NtCreateThread failed %08lx (%s)\n",
@@ -895,21 +1022,14 @@ static int do_fork(struct process **newproc)
 		goto out;
 	}
 
-	dprintf("fork: created thread %p:%p\n",
-		context->id.UniqueProcess,
-		context->id.UniqueThread);
+	NtSetContextThread(p->thread, &p->winctx);
 
-	/* return the new PID */
-	context->regs.Eax = 0;
-	r = NtSetContextThread(context->thread, &context->regs);
-	if (r != STATUS_SUCCESS)
-	{
-		fprintf(stderr, "NtSetContextThread() failed: %08lx\n", r);
-		goto out;
-	}
+	dprintf("fork: created thread %p:%p\n",
+		p->id.UniqueProcess,
+		p->id.UniqueThread);
 
 	/* go */
-	r = NtResumeThread(context->thread, NULL);
+	r = NtResumeThread(p->thread, NULL);
 	if (r != STATUS_SUCCESS)
 	{
 		fprintf(stderr, "NtResumeThread() failed: %08lx\n", r);
@@ -917,35 +1037,35 @@ static int do_fork(struct process **newproc)
 	}
 
 	/* dup the fd set */
-	copy_fd_set(context, current);
+	copy_fd_set(p, current);
 
-	context->cwd = strdup(current->cwd);
-	context->cwdfp = current->cwdfp;
-	context->cwdfp->refcount++;
+	p->cwd = strdup(current->cwd);
+	p->cwdfp = current->cwdfp;
+	p->cwdfp->refcount++;
 
-	context->brk = current->brk;
+	p->brk = current->brk;
 
 	/* set the process parent */
-	context->parent = current;
+	p->parent = current;
 
 	/* chain siblings if they exist */
-	LIST_ELEMENT_INIT(context, sibling);
-	LIST_APPEND(&current->children, context, sibling);
+	LIST_ELEMENT_INIT(p, sibling);
+	LIST_APPEND(&current->children, p, sibling);
 
-	context->umask = current->umask;
-	context->tty = current->tty;
-	context->tty->refcount++;
-	context->leader = current->leader;
-	context->uid = current->uid;
-	context->gid = current->gid;
-	context->euid = current->euid;
-	context->egid = current->egid;
+	p->umask = current->umask;
+	p->tty = current->tty;
+	p->tty->refcount++;
+	p->leader = current->leader;
+	p->uid = current->uid;
+	p->gid = current->gid;
+	p->euid = current->euid;
+	p->egid = current->egid;
 
-	process_vtls_copy(context, current);
+	process_vtls_copy(p, current);
 
 	dprintf("fork() good!\n");
 
-	*newproc = context;
+	*newproc = p;
 
 	return 0;
 out:
@@ -959,11 +1079,11 @@ int sys_fork(void)
 	int r = do_fork(&process);
 	if (r < 0)
 		return r;
-	return (int) process->id.UniqueProcess;
+	return process_getpid(process);
 }
 
 /* see glibc-2.15/sysdeps/unix/sysv/linux/i386/clone.S */
-int sys_clone(int flags, void *stack, void *ptidptr, int tls, void *ctidptr)
+int sys_clone(int flags, user_ptr_t stack, user_ptr_t ptidptr, int tls, user_ptr_t ctidptr)
 {
 	struct process *process = NULL;
 	size_t max_size = 0;
@@ -973,7 +1093,7 @@ int sys_clone(int flags, void *stack, void *ptidptr, int tls, void *ctidptr)
 	int tid;
 	int r;
 
-	dprintf("clone(%08x,%p,%p,%08x,%p)\n", flags, stack, ptidptr, tls, ctidptr);
+	dprintf("clone(%08x,%08x,%08x,%08x,%08x)\n", flags, stack, ptidptr, tls, ctidptr);
 
 	/* lower 8 bits of flags are signal */
 	valid_flags |= 0xff;
@@ -1015,7 +1135,7 @@ int sys_clone(int flags, void *stack, void *ptidptr, int tls, void *ctidptr)
 	if (r < 0)
 		return r;
 
-	tid = (int) process->id.UniqueProcess;
+	tid = process_getpid(process);
 	if (ctid)
 	{
 		/* translate again, ctid maybe in the parent */
@@ -1082,20 +1202,30 @@ int sys_exit_group(int exit_code)
 	return sys_exit(exit_code);
 }
 
-static int internal_read(struct fdinfo *fdi, void *addr,
-			size_t length, loff_t *ofs)
+static int internal_read(struct fdinfo *fdi, user_ptr_t addr,
+			user_size_t length, loff_t *ofs)
 {
 	int bytesCopied = 0;
 	struct filp *fp = fdi->fp;
+	int nonblock;
 
 	if (!fp->ops->fn_read)
 		return -_L(EPERM);
+
+	nonblock = fdi->flags & _L(O_NONBLOCK);
 
 	while (length)
 	{
 		void *ptr = 0;
 		size_t sz = 0;
 		int r;
+
+		if (process_pending_signal_check(current))
+		{
+			if (bytesCopied)
+				break;
+			return -_L(EINTR);
+		}
 
 		r = vm_get_pointer(current, addr, &ptr, &sz);
 		if (r < 0)
@@ -1107,8 +1237,7 @@ static int internal_read(struct fdinfo *fdi, void *addr,
 
 		sz = MIN(length, sz);
 
-		r = fp->ops->fn_read(fp, ptr, sz, ofs,
-				 !(fdi->flags & _L(O_NONBLOCK)));
+		r = fp->ops->fn_read(fp, ptr, sz, ofs, !nonblock);
 		if (r <= 0)
 		{
 			if (bytesCopied)
@@ -1117,7 +1246,7 @@ static int internal_read(struct fdinfo *fdi, void *addr,
 		}
 
 		bytesCopied += r;
-		addr = (char*) addr + r;
+		addr += r;
 		length -= r;
 		ofs += r;
 
@@ -1128,11 +1257,11 @@ static int internal_read(struct fdinfo *fdi, void *addr,
 	return bytesCopied;
 }
 
-int sys_read(int fd, void *addr, size_t length)
+int sys_read(int fd, user_ptr_t addr, user_size_t length)
 {
 	struct fdinfo *fdi;
 
-	dprintf("read(%d,%p,%d)\n", fd, addr, length);
+	dprintf("read(%d,%08x,%d)\n", fd, addr, length);
 
 	fdi = fdinfo_from_fd(fd);
 	if (!fdi)
@@ -1144,11 +1273,11 @@ int sys_read(int fd, void *addr, size_t length)
 	return internal_read(fdi, addr, length, &fdi->fp->offset);
 }
 
-int sys_pread64(int fd, void *addr, size_t length, loff_t ofs)
+int sys_pread64(int fd, user_ptr_t addr, user_size_t length, loff_t ofs)
 {
 	struct fdinfo *fdi;
 
-	dprintf("pread64(%d,%p,%d,%d)\n", fd, addr, length, (int)ofs);
+	dprintf("pread64(%d,%08x,%d,%d)\n", fd, addr, length, (int)ofs);
 
 	fdi = fdinfo_from_fd(fd);
 	if (!fdi)
@@ -1157,12 +1286,67 @@ int sys_pread64(int fd, void *addr, size_t length, loff_t ofs)
 	return internal_read(fdi, addr, length, &ofs);
 }
 
-int sys_write(int fd, void *addr, size_t length)
+static int internal_write(struct fdinfo *fdi, user_ptr_t addr,
+			 user_size_t length, loff_t *ofs)
+{
+	int written = 0;
+	struct filp *fp = fdi->fp;
+	int nonblock;
+
+	if (!fp->ops->fn_write)
+		return -_L(EPERM);
+
+	nonblock = fdi->flags & _L(O_NONBLOCK);
+
+	while (length)
+	{
+		void *ptr = 0;
+		size_t sz = 0;
+		int r;
+
+		if (process_pending_signal_check(current))
+		{
+			if (written)
+				break;
+			return -_L(EINTR);
+		}
+
+		r = vm_get_pointer(current, addr, &ptr, &sz);
+		if (r < 0)
+		{
+			if (written)
+				break;
+			return -_L(EFAULT);
+		}
+
+		sz = MIN(length, sz);
+
+		r = fp->ops->fn_write(fdi->fp, ptr, sz, &fp->offset, !nonblock);
+		if (r <= 0)
+		{
+			if (written)
+				break;
+			return r;
+		}
+
+		written += r;
+		addr += r;
+		length -= r;
+		(*ofs) += r;
+
+		if (r != sz)
+			break;
+	}
+
+	return written;
+}
+
+int sys_write(int fd, user_ptr_t addr, user_size_t length)
 {
 	struct fdinfo *fdi;
 	struct filp *fp;
 
-	dprintf("write(%d,%p,%d)\n", fd, addr, length);
+	dprintf("write(%d,%08x,%d)\n", fd, addr, length);
 
 	fdi = fdinfo_from_fd(fd);
 	if (!fdi)
@@ -1172,14 +1356,10 @@ int sys_write(int fd, void *addr, size_t length)
 	if (!fp)
 		return -_L(EBADF);
 
-	if (!fp->ops->fn_write)
-		return -_L(EPERM);
-
-	return fp->ops->fn_write(fp, addr, length, &fp->offset,
-				 !(fdi->flags & _L(O_NONBLOCK)));
+	return internal_write(fdi, addr, length, &fdi->fp->offset);
 }
 
-int sys_writev(int fd, const struct iovec *ptr, int iovcnt)
+int sys_writev(int fd, user_ptr_t ptr, int iovcnt)
 {
 	struct fdinfo *fdi;
 	struct iovec *iov;
@@ -1187,7 +1367,7 @@ int sys_writev(int fd, const struct iovec *ptr, int iovcnt)
 	struct filp *fp;
 	int i, r;
 
-	dprintf("writev(%d,%p,%d)\n", fd, ptr, iovcnt);
+	dprintf("writev(%d,%08x,%d)\n", fd, ptr, iovcnt);
 
 	fdi = fdinfo_from_fd(fd);
 	if (!fdi)
@@ -1202,7 +1382,7 @@ int sys_writev(int fd, const struct iovec *ptr, int iovcnt)
 	if (!iov)
 		return -_L(ENOMEM);
 
-	r = current->ops->memcpy_from(iov, ptr, iovcnt * sizeof *iov);
+	r = vm_memcpy_from_process(current, iov, ptr, iovcnt * sizeof *iov);
 
 	/* TODO:
 	 * It would be better to construct an iov in write() and
@@ -1211,9 +1391,9 @@ int sys_writev(int fd, const struct iovec *ptr, int iovcnt)
 	 */
 	for (i = 0; i < iovcnt; i++)
 	{
-		r = fp->ops->fn_write(fp, iov[i].iov_base, iov[i].iov_len,
-					&fp->offset,
-					!(fdi->flags & _L(O_NONBLOCK)));
+		r = internal_write(fdi,
+				 iov[i].iov_base, iov[i].iov_len,
+				 &fp->offset);
 		if (r < 0 && !total)
 			return r;
 		if (r <= 0)
@@ -1310,7 +1490,7 @@ int do_open(const char *file, int flags, int mode)
 	return fd;
 }
 
-int add_dirent(void *ptr, const char* entry, size_t name_len,
+int add_dirent(user_ptr_t ptr, const char* entry, size_t name_len,
 		int avail, unsigned long next_offset,
 		char type, unsigned long ino)
 {
@@ -1335,18 +1515,18 @@ int add_dirent(void *ptr, const char* entry, size_t name_len,
 
 	dprintf("adding %s\n", de->d_name);
 
-	r = current->ops->memcpy_to(ptr, de, len);
+	r = vm_memcpy_to_process(current, ptr, de, len);
 	if (r < 0)
 		return r;
 
 	return len;
 }
 
-int sys_getdents(int fd, struct linux_dirent *de, unsigned int count)
+int sys_getdents(int fd, user_ptr_t de, unsigned int count)
 {
 	struct filp *fp;
 
-	dprintf("sys_getdents(%d,%p,%u)\n", fd, de, count);
+	dprintf("sys_getdents(%d,%08x,%u)\n", fd, de, count);
 
 	fp = filp_from_fd(fd);
 	if (!fp)
@@ -1358,7 +1538,7 @@ int sys_getdents(int fd, struct linux_dirent *de, unsigned int count)
 	return fp->ops->fn_getdents(fp, de, count, &add_dirent);
 }
 
-int add_dirent64(void *ptr, const char* entry, size_t name_len,
+int add_dirent64(user_ptr_t ptr, const char* entry, size_t name_len,
 		int avail, unsigned long next_offset,
 		char type, unsigned long ino)
 {
@@ -1382,18 +1562,18 @@ int add_dirent64(void *ptr, const char* entry, size_t name_len,
 
 	dprintf("added %s\n", de->d_name);
 
-	r = current->ops->memcpy_to(ptr, de, len);
+	r = vm_memcpy_to_process(current, ptr, de, len);
 	if (r < 0)
 		return r;
 
 	return len;
 }
 
-int sys_getdents64(int fd, struct linux_dirent *de, unsigned int count)
+int sys_getdents64(int fd, user_ptr_t de, unsigned int count)
 {
 	struct filp *fp;
 
-	dprintf("sys_getdents64(%d,%p,%u)\n", fd, de, count);
+	dprintf("sys_getdents64(%d,%08x,%u)\n", fd, de, count);
 
 	fp = filp_from_fd(fd);
 	if (!fp)
@@ -1405,17 +1585,18 @@ int sys_getdents64(int fd, struct linux_dirent *de, unsigned int count)
 	return fp->ops->fn_getdents(fp, de, count, &add_dirent64);
 }
 
-int read_string_list(char ***out, const char **ptr)
+int read_string_list(char ***out, user_ptr_t ptr)
 {
 	char *strings[100];
 	NTSTATUS r;
-	ULONG sz;
+	SIZE_T sz;
 	size_t n = 0;
-	void *p;
+	user_ptr_t p;
 
 	while (1)
 	{
-		r = NtReadVirtualMemory(current->process, &ptr[n],
+		r = NtReadVirtualMemory(current->process,
+					(void*) (ptr + n * sizeof (user_ptr_t)),
 					&p, sizeof p, &sz);
 		if (r != STATUS_SUCCESS || sz != sizeof p)
 		{
@@ -1430,7 +1611,7 @@ int read_string_list(char ***out, const char **ptr)
 		}
 		else
 		{
-			strings[n] = p;
+			strings[n] = 0;
 			break;
 		}
 		n++;
@@ -1472,7 +1653,7 @@ void dump_string_list(char **list)
 		dprintf("[%u] = %s\n", n, list[n]);
 }
 
-int sys_open(const char *ptr, int flags, int mode)
+int sys_open(user_ptr_t ptr, int flags, int mode)
 {
 	int r;
 	char *filename = NULL;
@@ -1480,7 +1661,7 @@ int sys_open(const char *ptr, int flags, int mode)
 	r = vm_string_read(current, ptr, &filename);
 	if (r < 0)
 	{
-		dprintf("open(%p=<invalid>,%08x,%08x)\n", ptr, flags, mode);
+		dprintf("open(%08x=<invalid>,%08x,%08x)\n", ptr, flags, mode);
 		return r;
 	}
 
@@ -1493,7 +1674,7 @@ int sys_open(const char *ptr, int flags, int mode)
 	return r;
 }
 
-int sys_creat(const char *ptr, int mode)
+int sys_creat(user_ptr_t ptr, int mode)
 {
 	int flags = _L(O_CREAT)|_L(O_WRONLY)|_L(O_TRUNC);
 	char *filename = NULL;
@@ -1502,7 +1683,7 @@ int sys_creat(const char *ptr, int mode)
 	r = vm_string_read(current, ptr, &filename);
 	if (r < 0)
 	{
-		dprintf("creat(%p=<invalid>,%08x)\n", ptr, mode);
+		dprintf("creat(%08x=<invalid>,%08x)\n", ptr, mode);
 		return r;
 	}
 
@@ -1544,7 +1725,7 @@ static int do_openat(struct filp *dirp, const char *filename, int flags,
 	return fd;
 }
 
-int sys_openat(int fd, const char *ptr, int flags, int mode)
+int sys_openat(int fd, user_ptr_t ptr, int flags, int mode)
 {
 	char *filename = NULL;
 	int r;
@@ -1553,7 +1734,7 @@ int sys_openat(int fd, const char *ptr, int flags, int mode)
 	r = vm_string_read(current, ptr, &filename);
 	if (r < 0)
 	{
-		dprintf("openat(%p=<invalid>,%08x,%08x)\n", ptr, flags, mode);
+		dprintf("openat(%08x=<invalid>,%08x,%08x)\n", ptr, flags, mode);
 		return r;
 	}
 
@@ -1600,7 +1781,7 @@ static int do_unlink(const char *filename)
 	return r;
 }
 
-static int sys_unlink(const char *ptr)
+static int sys_unlink(user_ptr_t ptr)
 {
 	int r;
 	char *filename = NULL;
@@ -1608,7 +1789,7 @@ static int sys_unlink(const char *ptr)
 	r = vm_string_read(current, ptr, &filename);
 	if (r < 0)
 	{
-		dprintf("unlink(%p=<invalid>)\n", ptr);
+		dprintf("unlink(%08x=<invalid>)\n", ptr);
 		return r;
 	}
 
@@ -1642,7 +1823,7 @@ static int do_mkdir(const char *parent, const char *dir, int mode)
 	return r;
 }
 
-static int sys_mkdir(void *ptr, int mode)
+static int sys_mkdir(user_ptr_t ptr, int mode)
 {
 	int r;
 	char *dirname = NULL, *parent, *child, *p;
@@ -1650,7 +1831,7 @@ static int sys_mkdir(void *ptr, int mode)
 	r = vm_string_read(current, ptr, &dirname);
 	if (r < 0)
 	{
-		dprintf("mkdir(%p=<invalid>)\n", ptr);
+		dprintf("mkdir(%08x=<invalid>)\n", ptr);
 		return r;
 	}
 
@@ -1696,7 +1877,7 @@ static int do_rmdir(const char *dirname)
 	return r;
 }
 
-static int sys_rmdir(void *ptr)
+static int sys_rmdir(user_ptr_t ptr)
 {
 	char *dirname = NULL;
 	int r;
@@ -1704,7 +1885,7 @@ static int sys_rmdir(void *ptr)
 	r = vm_string_read(current, ptr, &dirname);
 	if (r < 0)
 	{
-		dprintf("rmdir(%p=<invalid>)\n", ptr);
+		dprintf("rmdir(%08x=<invalid>)\n", ptr);
 		return r;
 	}
 
@@ -1743,14 +1924,14 @@ int sys_close(int fd)
 }
 
 int sys_llseek(unsigned int fd, unsigned long offset_high,
-	unsigned long offset_low, loff_t *result, unsigned int whence)
+	unsigned long offset_low, user_ptr_t result, unsigned int whence)
 {
 	struct filp* fp;
 	uint64_t pos;
 	uint64_t out;
 	int r;
 
-	dprintf("llseek(%d,%lu,%lu,%p,%u)\n", fd,
+	dprintf("llseek(%d,%lu,%lu,%08x,%u)\n", fd,
 		offset_high, offset_low, result, whence);
 
 	fp = filp_from_fd(fd);
@@ -1770,7 +1951,7 @@ int sys_llseek(unsigned int fd, unsigned long offset_high,
 	if (r < 0)
 		return r;
 
-	return current->ops->memcpy_to(result, &out, sizeof *result);
+	return vm_memcpy_to_process(current, result, &out, sizeof out);
 }
 
 int sys_lseek(unsigned int fd, long offset, unsigned int whence)
@@ -1814,24 +1995,24 @@ static void gettimeval(struct timeval *tv)
 	tv->tv_sec = (time_t)(seconds&0xffffffff);
 }
 
-int sys_time(time_t *tloc)
+int sys_time(user_ptr_t tloc)
 {
 	struct timeval tv;
 
-	dprintf("sys_time(%p)\n", tloc);
+	dprintf("sys_time(%08x)\n", tloc);
 
 	timeout_now(&tv);
 
 	if (tloc)
 	{
 		// TODO: How is an error returned here?
-		current->ops->memcpy_to(tloc, &tv.tv_sec, sizeof tv.tv_sec);
+		vm_memcpy_to_process(current, tloc, &tv.tv_sec, sizeof tv.tv_sec);
 	}
 
 	return tv.tv_sec;
 }
 
-int sys_exec(const char *fn, const char **ap, const char **ep)
+int sys_exec(user_ptr_t fn, user_ptr_t ap, user_ptr_t ep)
 {
 	int r;
 	char *filename = NULL;
@@ -1841,21 +2022,21 @@ int sys_exec(const char *fn, const char **ap, const char **ep)
 	r = vm_string_read(current, fn, &filename);
 	if (r < 0)
 	{
-		dprintf("exec(%p=<invalid>,%p,%p)\n", fn, ap, ep);
+		dprintf("exec(%08x=<invalid>,%08x,%08x)\n", fn, ap, ep);
 		goto error;
 	}
 
 	r = read_string_list(&argv, ap);
 	if (r < 0)
 	{
-		dprintf("exec(%s,%p=<invalid>,%p)\n", filename, ap, ep);
+		dprintf("exec(%s,%08x=<invalid>,%08x)\n", filename, ap, ep);
 		goto error;
 	}
 
 	r = read_string_list(&envp, ep);
 	if (r < 0)
 	{
-		dprintf("exec(%s,%p,%p=<invalid>)\n", filename, argv, ep);
+		dprintf("exec(%s,%p,%08x=<invalid>)\n", filename, argv, ep);
 		goto error;
 	}
 
@@ -1870,14 +2051,12 @@ error:
 
 int process_getpid(struct process *p)
 {
-	return (int) p->id.UniqueProcess;
+	return (int)(intptr_t) p->id.UniqueProcess;
 }
 
 int sys_getpid(void)
 {
 	// FIXME: first thread is process ID.
-	ULONG pid = (ULONG)current->id.UniqueProcess;
-	dprintf("getpid() -> %04lx\n", pid);
 	return process_getpid(current);
 }
 
@@ -1885,8 +2064,8 @@ int sys_getppid(void)
 {
 	if (!current->parent)
 		return 1;
-	ULONG pid = (ULONG)current->parent->id.UniqueProcess;
-	dprintf("getppid() -> %04lx\n", pid);
+	int pid = process_getpid(current->parent);
+	dprintf("getppid() -> %04x\n", pid);
 	return pid;
 }
 
@@ -1912,17 +2091,17 @@ int sys_kill(int pid, int sig)
 	return 0;
 }
 
-int sys_getcwd(char *buf, unsigned long size)
+int sys_getcwd(user_ptr_t buf, unsigned long size)
 {
 	const char *dir = current->cwd;
 	size_t len;
 	int r;
 
-	dprintf("getcwd(%p,%lu)\n", buf, size);
+	dprintf("getcwd(%08x,%lu)\n", buf, size);
 	len = strlen(dir) + 1;
 	if (len > size)
 		return -_L(ERANGE);
-	r = current->ops->memcpy_to(buf, dir, len);
+	r = vm_memcpy_to_process(current, buf, dir, len);
 	if (r < 0)
 		return r;
 	return len;
@@ -1966,7 +2145,7 @@ static int do_chdir(const char *dir)
 	return r;
 }
 
-int sys_chdir(const void *ptr)
+int sys_chdir(user_ptr_t ptr)
 {
 	int r;
 	char *dirname = NULL;
@@ -1974,7 +2153,7 @@ int sys_chdir(const void *ptr)
 	r = vm_string_read(current, ptr, &dirname);
 	if (r < 0)
 	{
-		dprintf("chdir(%p=<invalid>)\n", ptr);
+		dprintf("chdir(%08x=<invalid>)\n", ptr);
 		return r;
 	}
 
@@ -1985,12 +2164,12 @@ int sys_chdir(const void *ptr)
 	return r;
 }
 
-void *sys_old_mmap(void *ptr)
+user_ptr_t sys_old_mmap(user_ptr_t ptr)
 {
 	struct
 	{
-		void *addr;
-		size_t len;
+		user_ptr_t addr;
+		user_size_t len;
 		int prot;
 		int flags;
 		int fd;
@@ -1999,67 +2178,67 @@ void *sys_old_mmap(void *ptr)
 	struct filp *fp = NULL;
 	int r;
 
-	dprintf("old_mmap(%p)\n", ptr);
+	dprintf("old_mmap(%08x)\n", ptr);
 
-	r = current->ops->memcpy_from(&args, ptr, sizeof args);
+	r = vm_memcpy_from_process(current, &args, ptr, sizeof args);
 	if (r < 0)
-		return L_ERROR_PTR(EFAULT);
+		return -_L(EFAULT);
 
-	dprintf("mmap(%p,%08x,%08x,%08x,%d,%08lx)\n",
+	dprintf("mmap(%08x,%08x,%08x,%08x,%d,%08lx)\n",
 		args.addr, args.len, args.prot, args.flags, args.fd, args.offset);
 
 	if (!(args.flags & _l_MAP_ANONYMOUS))
 	{
 		fp = filp_from_fd(args.fd);
 		if (!fp)
-			return L_ERROR_PTR(EBADF);
+			return -_L(EBADF);
 	}
 
 	return vm_process_map(current, args.addr, args.len, args.prot, args.flags, fp, args.offset);
 }
 
-void* sys_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset)
+user_ptr_t sys_mmap(user_ptr_t addr, user_size_t len, int prot, int flags, int fd, off_t offset)
 {
 	struct filp *fp = NULL;
 
-	dprintf("mmap(%p,%08x,%08x,%08x,%d,%08lx)\n",
+	dprintf("mmap(%08x,%08x,%08x,%08x,%d,%08lx)\n",
 		addr, len, prot, flags, fd, offset);
 
 	if (!(flags & _l_MAP_ANONYMOUS))
 	{
 		fp = filp_from_fd(fd);
 		if (!fp)
-			return L_ERROR_PTR(EBADF);
+			return -_L(EBADF);
 	}
 
 	return vm_process_map(current, addr, len, prot, flags, fp, offset);
 }
 
-int sys_mprotect(void *addr, size_t len, int prot)
+int sys_mprotect(user_ptr_t addr, user_size_t len, int prot)
 {
-	dprintf("mprotect(%p,%08x,%08x)\n", addr, len, prot);
+	dprintf("mprotect(%08x,%08x,%08x)\n", addr, len, prot);
 	return vm_process_map_protect(current, addr, len, prot);
 }
 
-int sys_gettimeofday(void *arg)
+int sys_gettimeofday(user_ptr_t arg)
 {
 	struct timeval tv;
 	int r;
 
-	dprintf("sys_gettimeofday(%p)\n", arg);
+	dprintf("sys_gettimeofday(%08x)\n", arg);
 
 	timeout_now(&tv);
 
-	r = current->ops->memcpy_to(arg, &tv, sizeof tv);
+	r = vm_memcpy_to_process(current, arg, &tv, sizeof tv);
 	if (r < 0)
 		return r;
 
 	return 0;
 }
 
-int sys_munmap(void *addr, size_t len)
+int sys_munmap(user_ptr_t addr, user_size_t len)
 {
-	dprintf("munmap(%p,%08x)\n", addr, len);
+	dprintf("munmap(%08x,%08x)\n", addr, len);
 	return vm_process_unmap(current, addr, len);
 }
 
@@ -2076,7 +2255,7 @@ int sys_socket(int domain, int type, int protocol)
 }
 
 /* semi-documented at http://isomerica.net/~dpn/socketcall1.pdf */
-int sys_socketcall(int call, unsigned long *argptr)
+int sys_socketcall(int call, user_ptr_t argptr)
 {
 	int argcount[] = { 3, 3, 3, 2, 3, 3, 3, 4, 4, 4, 6, 6, 2, 5, 5, 3, 3 };
 	unsigned long args[10];
@@ -2084,12 +2263,12 @@ int sys_socketcall(int call, unsigned long *argptr)
 	struct filp* fp;
 	int r;
 
-	dprintf("socketcall(%d,%p)\n", call, argptr);
+	dprintf("socketcall(%d,%08x)\n", call, argptr);
 
 	if (call < 1 || call > 17)
 		return -_L(ENOSYS);
 
-	r = current->ops->memcpy_from(args, argptr, sizeof args[0] * argcount[call - 1]);
+	r = vm_memcpy_from_process(current, args, argptr, sizeof args[0] * argcount[call - 1]);
 	if (r < 0)
 		return r;
 
@@ -2109,30 +2288,32 @@ int sys_socketcall(int call, unsigned long *argptr)
 				 !(fdi->flags & _L(O_NONBLOCK)));
 }
 
-void* sys_brk(void *addr)
+user_ptr_t sys_brk(user_ptr_t addr)
 {
-	dprintf("brk(%p)\n", addr);
+	dprintf("brk(%08x)\n", addr);
 	if (addr)
 	{
-		unsigned int target = (unsigned int) addr;
-		unsigned int origin = (unsigned int) current->brk;
-		void *p;
+		user_ptr_t target = addr;
+		user_ptr_t origin = (user_ptr_t) current->brk;
+		user_ptr_t p;
 
 		target = round_up(target, pagesize);
 		assert(!(origin&(pagesize - 1)));
 		assert(!(target&(pagesize - 1)));
 		if (target > origin)
 		{
-			p = sys_mmap((void*)origin, target - origin,
+			int r;
+			p = sys_mmap(origin, target - origin,
 				_l_PROT_READ | _l_PROT_WRITE | _l_PROT_EXEC,
 				_l_MAP_FIXED|_l_MAP_PRIVATE|_l_MAP_ANONYMOUS, -1, 0);
-			if (p == _l_MAP_FAILED)
+			r = L_PTR_ERROR(p);
+			if (r < 0)
 				dprintf("failed to extend brk\n");
 			else
-				current->brk = (unsigned int) target;
+				current->brk = target;
 		}
 	}
-	return (void*) current->brk;
+	return current->brk;
 }
 
 int sys_setuid(int uid)
@@ -2205,7 +2386,7 @@ static int do_stat64(const char *file, struct stat64 *statbuf, BOOL follow_links
 	return r;
 }
 
-static int sys_access(const char *ptr, int mode)
+static int sys_access(user_ptr_t ptr, int mode)
 {
 	char *path = NULL;
 	struct stat64 st;
@@ -2237,7 +2418,7 @@ static int do_rename(const char *oldptr, const char *newptr)
 	return -_L(EPERM);
 }
 
-static int sys_rename(const char *oldptr, const char *newptr)
+static int sys_rename(user_ptr_t oldptr, user_ptr_t newptr)
 {
 	char *oldpath = NULL, *newpath = NULL;
 	int r;
@@ -2252,7 +2433,7 @@ static int sys_rename(const char *oldptr, const char *newptr)
 
 	dprintf("rename(\"%s\",\"%s\")\n", oldpath, newpath);
 
-	r = do_rename(oldptr, newptr);
+	r = do_rename(oldpath, newpath);
 
 	free(newpath);
 out2:
@@ -2285,7 +2466,7 @@ static void stat_from_stat64(struct stat *st, const struct stat64 *st64)
 #undef X
 }
 
-int sys_stat(const char *ptr, struct stat *statbuf)
+int sys_stat(user_ptr_t ptr, user_ptr_t statbuf)
 {
 	struct stat64 st64;
 	int r;
@@ -2294,18 +2475,18 @@ int sys_stat(const char *ptr, struct stat *statbuf)
 	r = vm_string_read(current, ptr, &path);
 	if (r < 0)
 	{
-		dprintf("stat64(<invalid>,%p)\n", statbuf);
+		dprintf("stat64(<invalid>,%08x)\n", statbuf);
 		return r;
 	}
 
-	dprintf("stat(\"%s\",%p)\n", path, statbuf);
+	dprintf("stat(\"%s\",%08x)\n", path, statbuf);
 
 	r = do_stat64(path, &st64, TRUE);
 	if (r == 0)
 	{
 		struct stat st;
 		stat_from_stat64(&st, &st64);
-		r = current->ops->memcpy_to(statbuf, &st, sizeof st);
+		r = vm_memcpy_to_process(current, statbuf, &st, sizeof st);
 	}
 
 	free(path);
@@ -2313,7 +2494,7 @@ int sys_stat(const char *ptr, struct stat *statbuf)
 	return r;
 }
 
-int sys_stat64(const char *ptr, struct stat64 *statbuf)
+int sys_stat64(user_ptr_t ptr, user_ptr_t statbuf)
 {
 	struct stat64 st;
 	int r;
@@ -2322,15 +2503,15 @@ int sys_stat64(const char *ptr, struct stat64 *statbuf)
 	r = vm_string_read(current, ptr, &path);
 	if (r < 0)
 	{
-		dprintf("stat64(<invalid>,%p)\n", statbuf);
+		dprintf("stat64(<invalid>,%08x)\n", statbuf);
 		return r;
 	}
 
-	dprintf("stat64(\"%s\",%p)\n", path, statbuf);
+	dprintf("stat64(\"%s\",%08x)\n", path, statbuf);
 
 	r = do_stat64(path, &st, TRUE);
 	if (r == 0)
-		r = current->ops->memcpy_to(statbuf, &st, sizeof st);
+		r = vm_memcpy_to_process(current, statbuf, &st, sizeof st);
 
 	free(path);
 
@@ -2347,7 +2528,7 @@ int sys_ftruncate64(int fd, unsigned int offsethi, unsigned int offsetlo)
 	offset <<= 32;
 	offset |= offsetlo;
 
-	dprintf("ftruncate64(%d, %08llx)\n", fd, offset);
+	dprintf("ftruncate64(%d, %08x:%08x)\n", fd, offsethi, offsetlo);
 
 	fp = filp_from_fd(fd);
 	if (!fp)
@@ -2361,7 +2542,7 @@ int sys_ftruncate64(int fd, unsigned int offsethi, unsigned int offsetlo)
 	return r;
 }
 
-int sys_lstat64(const char *ptr, struct stat64 *statbuf)
+int sys_lstat64(user_ptr_t ptr, user_ptr_t statbuf)
 {
 	struct stat64 st;
 	int r;
@@ -2370,29 +2551,29 @@ int sys_lstat64(const char *ptr, struct stat64 *statbuf)
 	r = vm_string_read(current, ptr, &path);
 	if (r < 0)
 	{
-		dprintf("lstat64(<invalid>,%p)\n", statbuf);
+		dprintf("lstat64(<invalid>,%08x)\n", statbuf);
 		return r;
 	}
 
 	/* FIXME: links aren't supported */
-	dprintf("lstat64(\"%s\",%p)\n", path, statbuf);
+	dprintf("lstat64(\"%s\",%08x)\n", path, statbuf);
 
 	r = do_stat64(path, &st, FALSE);
 	if (r == 0)
-		r = current->ops->memcpy_to(statbuf, &st, sizeof st);
+		r = vm_memcpy_to_process(current, statbuf, &st, sizeof st);
 
 	free(path);
 
 	return r;
 }
 
-int sys_fstat(int fd, struct stat *statbuf)
+int sys_fstat(int fd, user_ptr_t statbuf)
 {
 	struct stat64 st64;
 	struct filp* fp;
 	int r;
 
-	dprintf("fstat(%d,%p)\n", fd, statbuf);
+	dprintf("fstat(%d,%08x)\n", fd, statbuf);
 
 	fp = filp_from_fd(fd);
 	if (!fp)
@@ -2406,19 +2587,19 @@ int sys_fstat(int fd, struct stat *statbuf)
 	{
 		struct stat st;
 		stat_from_stat64(&st, &st64);
-		r = current->ops->memcpy_to(statbuf, &st, sizeof st);
+		r = vm_memcpy_to_process(current, statbuf, &st, sizeof st);
 	}
 
 	return r;
 }
 
-int sys_fstat64(int fd, struct stat64 *statbuf)
+int sys_fstat64(int fd, user_ptr_t statbuf)
 {
 	struct stat64 st;
 	struct filp* fp;
 	int r;
 
-	dprintf("fstat64(%d,%p)\n", fd, statbuf);
+	dprintf("fstat64(%d,%08x)\n", fd, statbuf);
 
 	fp = filp_from_fd(fd);
 	if (!fp)
@@ -2429,19 +2610,19 @@ int sys_fstat64(int fd, struct stat64 *statbuf)
 
 	r = fp->ops->fn_stat(fp, &st);
 	if (r == 0)
-		r = current->ops->memcpy_to(statbuf, &st, sizeof st);
+		r = vm_memcpy_to_process(current, statbuf, &st, sizeof st);
 
 	return r;
 }
 
-int sys_set_thread_area(void *ptr)
+int sys_set_thread_area(user_ptr_t ptr)
 {
 	struct user_desc desc;
 	int r;
 
-	dprintf("set_thread_area(%p)\n", ptr);
+	dprintf("set_thread_area(%08x)\n", ptr);
 
-	r = current->ops->memcpy_from(&desc, ptr, sizeof desc);
+	r = vm_memcpy_from_process(current, &desc, ptr, sizeof desc);
 	if (r < 0)
 		return r;
 
@@ -2466,7 +2647,7 @@ int sys_set_thread_area(void *ptr)
 		 * point to the Windows thread's TEB
 		 * Reuse that...
 		 */
-		desc.entry_number = current->regs.SegFs >> 3;
+		desc.entry_number = current->regs.fs >> 3;
 	}
 	else
 	{
@@ -2483,7 +2664,7 @@ int sys_set_thread_area(void *ptr)
 	/*
 	 * copy it back to userland
 	 */
-	r = current->ops->memcpy_to(ptr, &desc, sizeof desc);
+	r = vm_memcpy_to_process(current, ptr, &desc, sizeof desc);
 	if (r < 0)
 		return r;
 
@@ -2552,7 +2733,7 @@ static int sys_fcntl_setfl(int fd, long arg)
 	else
 		current->handles[fd].flags &= ~_L(O_NONBLOCK);
 
-	if (arg & ~_L(O_NONBLOCK))
+	if (arg & ~(_L(O_NONBLOCK) & 3))
 		dprintf("fcntl(): unknown fd flag %08lx\n", arg);
 
 	return 0;
@@ -2642,28 +2823,29 @@ static int do_utimes(const char *filename, struct timeval *ptrtimes)
 	return r;
 }
 
-int sys_utimes(const char *ptr, struct timeval *ptrtimes)
+int sys_utimes(user_ptr_t ptr, user_ptr_t ptrtimes)
 {
 	char *filename = NULL;
 	struct timeval times[2];
+	struct timeval *ptimes = NULL;
 	int r;
 
 	if (ptrtimes)
 	{
-		r = current->ops->memcpy_from(times, ptrtimes, sizeof times);
+		r = vm_memcpy_from_process(current, times, ptrtimes, sizeof times);
 		if (r < 0)
 			return r;
-		ptrtimes = times;
+		ptimes = times;
 	}
 
 	r = vm_string_read(current, ptr, &filename);
 	if (r < 0)
 	{
-		dprintf("utimes(<invalid>,%p)\n", ptrtimes);
+		dprintf("utimes(<invalid>,%08x)\n", ptrtimes);
 		return r;
 	}
 
-	r = do_utimes(filename, times);
+	r = do_utimes(filename, ptimes);
 	free(filename);
 
 	return r;
@@ -2709,18 +2891,18 @@ static int do_pipe(int *fds)
 	return 0;
 }
 
-int sys_pipe(int *ptr)
+int sys_pipe(user_ptr_t ptr)
 {
 	int fds[2];
 	int r;
 
-	dprintf("pipe(%p)\n", ptr);
+	dprintf("pipe(%08x)\n", ptr);
 
 	r = do_pipe(fds);
 	if (r < 0)
 		return r;
 
-	r = current->ops->memcpy_to(ptr, fds, sizeof fds);
+	r = vm_memcpy_to_process(current, ptr, fds, sizeof fds);
 	if (r < 0)
 	{
 		do_close(fds[0]);
@@ -2741,13 +2923,13 @@ static struct process *find_zombie(struct process *parent)
 	return NULL;
 }
 
-int sys_waitpid(int pid, int *stat_addr, int options)
+int sys_waitpid(int pid, user_ptr_t stat_addr, int options)
 {
 	struct process *p = NULL;
 	int r = -_L(ECHILD);
 	int exit_code = 0;
 
-	dprintf("waitpid(%d,%p,%08x)\n", pid, stat_addr, options);
+	dprintf("waitpid(%d,%08x,%08x)\n", pid, stat_addr, options);
 
 	do {
 		p = find_zombie(current);
@@ -2778,11 +2960,11 @@ int sys_waitpid(int pid, int *stat_addr, int options)
 		status |= (p->exit_code & 0xff) << 8;
 		if (p->suspended)
 			status |= 0x7f;
-		r = current->ops->memcpy_to(stat_addr, &status,
+		r = vm_memcpy_to_process(current, stat_addr, &status,
 					 sizeof exit_code);
 		if (r < 0)
 			return r;
-		r = (ULONG)p->id.UniqueProcess;
+		r = process_getpid(p);
 		if (p->state == thread_terminated)
 			work_add(&zombie_reap_work);
 	}
@@ -2842,15 +3024,15 @@ static void poll_timeout_waker(struct timeout *t)
 	current = p;
 }
 
-int sys_nanosleep(struct timespec *in, struct timeval *out)
+int sys_nanosleep(user_ptr_t in, user_ptr_t out)
 {
 	struct poll_timeout pt;
-	struct timespec req;
+	struct _L(timespec) req;
 	int r;
 
-	dprintf("nanosleep(%p,%p)\n", in, out);
+	dprintf("nanosleep(%08x,%08x)\n", in, out);
 
-	r = current->ops->memcpy_from(&req, in, sizeof req);
+	r = vm_memcpy_from_process(current, &req, in, sizeof req);
 	if (r < 0)
 		return r;
 
@@ -2872,7 +3054,7 @@ int sys_nanosleep(struct timespec *in, struct timeval *out)
 	{
 		req.tv_sec = 0;
 		req.tv_nsec = 0;
-		current->ops->memcpy_to(out, &req, sizeof req);
+		vm_memcpy_to_process(current, out, &req, sizeof req);
 	}
 
 	if (!LIST_EMPTY(&current->signal_list))
@@ -2910,17 +3092,14 @@ static int poll_check(struct filp **fps, struct _l_pollfd *fds, int nfds)
 
 int do_poll(int nfds, struct _l_pollfd *fds, struct timeval *tv)
 {
-	struct wait_entry *wait_list;
-	struct filp **fps;
+	struct wait_entry wait_list[nfds];
+	struct filp *fps[nfds];
 	struct poll_timeout pt;
 	int ready;
 	int i;
 
-	wait_list = alloca(nfds * sizeof wait_list[0]);
-	memset(wait_list, 0, nfds * sizeof wait_list[0]);
-
-	fps = alloca(nfds * sizeof fps[0]);
-	memset(fps, 0, nfds * sizeof fps[0]);
+	memset(wait_list, 0, sizeof wait_list[0] * nfds);
+	memset(fps, 0, sizeof fps[0] * nfds);
 
 	for (i = 0; i < nfds; i++)
 	{
@@ -2975,7 +3154,7 @@ int do_poll(int nfds, struct _l_pollfd *fds, struct timeval *tv)
 	return ready;
 }
 
-int sys_poll(struct _l_pollfd *ptr, int nfds, int timeout)
+int sys_poll(user_ptr_t ptr, int nfds, int timeout)
 {
 	int r;
 	int ready;
@@ -2983,7 +3162,7 @@ int sys_poll(struct _l_pollfd *ptr, int nfds, int timeout)
 	struct timeval tv = {0, 0};
 	struct timeval *ptv = NULL;
 
-	dprintf("poll(%p,%d,%d)\n", ptr, nfds, timeout);
+	dprintf("poll(%08x,%d,%d)\n", ptr, nfds, timeout);
 
 	if (nfds < 0)
 		return -_L(EINVAL);
@@ -2992,7 +3171,7 @@ int sys_poll(struct _l_pollfd *ptr, int nfds, int timeout)
 	fds = alloca(nfds * sizeof fds[0]);
 	memset(fds, 0, nfds * sizeof fds[0]);
 
-	r = current->ops->memcpy_from(fds, ptr, nfds * sizeof fds[0]);
+	r = vm_memcpy_from_process(current, fds, ptr, nfds * sizeof fds[0]);
 	if (r < 0)
 		return r;
 
@@ -3006,7 +3185,7 @@ int sys_poll(struct _l_pollfd *ptr, int nfds, int timeout)
 	if (ready >= 0)
 	{
 		/* copy back */
-		r = current->ops->memcpy_to(ptr, fds, nfds * sizeof fds[0]);
+		r = vm_memcpy_to_process(current, ptr, fds, nfds * sizeof fds[0]);
 		if (r < 0)
 			return r;
 	}
@@ -3028,14 +3207,14 @@ static inline void fdset_set(struct fdset *fds, int fd)
 	fds->fds_bits[fd / n] |= mask;
 }
 
-int do_select(int maxfd, void *rfds, void *wfds, void *efds, void *tvptr)
+int do_select(int maxfd, user_ptr_t rfds, user_ptr_t wfds, user_ptr_t efds, user_ptr_t tvptr)
 {
 	struct fdset rdset, wrset, exset;
 	int i, r, nfds, ready;
 	struct _l_pollfd fds[_L(FD_SETSIZE)];
 	struct timeval tv = {0, 0};
 
-	dprintf("select(%d,%p,%p,%p,%p)\n",
+	dprintf("select(%d,%08x,%08x,%08x,%08x)\n",
 		maxfd, rfds, wfds, efds, tvptr);
 
 	if (maxfd < 0 || maxfd > _L(FD_SETSIZE))
@@ -3043,7 +3222,7 @@ int do_select(int maxfd, void *rfds, void *wfds, void *efds, void *tvptr)
 
 	if (tvptr)
 	{
-		r = current->ops->memcpy_from(&tv, tvptr, sizeof tv);
+		r = vm_memcpy_from_process(current, &tv, tvptr, sizeof tv);
 		if (r < 0)
 			return -_L(EFAULT);
 	}
@@ -3054,21 +3233,21 @@ int do_select(int maxfd, void *rfds, void *wfds, void *efds, void *tvptr)
 
 	if (rfds)
 	{
-		r = current->ops->memcpy_from(&rdset, rfds, sizeof rdset);
+		r = vm_memcpy_from_process(current, &rdset, rfds, sizeof rdset);
 		if (r < 0)
 			return -_L(EFAULT);
 	}
 
 	if (wfds)
 	{
-		r = current->ops->memcpy_from(&wrset, wfds, sizeof wrset);
+		r = vm_memcpy_from_process(current, &wrset, wfds, sizeof wrset);
 		if (r < 0)
 			return -_L(EFAULT);
 	}
 
 	if (efds)
 	{
-		r = current->ops->memcpy_from(&exset, efds, sizeof exset);
+		r = vm_memcpy_from_process(current, &exset, efds, sizeof exset);
 		if (r < 0)
 			return -_L(EFAULT);
 	}
@@ -3112,35 +3291,35 @@ int do_select(int maxfd, void *rfds, void *wfds, void *efds, void *tvptr)
 				fdset_set(&exset, fd);
 		}
 		if (rfds)
-			current->ops->memcpy_to(rfds, &rdset, sizeof rdset);
+			vm_memcpy_to_process(current, rfds, &rdset, sizeof rdset);
 		if (wfds)
-			current->ops->memcpy_to(wfds, &wrset, sizeof wrset);
+			vm_memcpy_to_process(current, wfds, &wrset, sizeof wrset);
 		if (efds)
-			current->ops->memcpy_to(efds, &exset, sizeof exset);
+			vm_memcpy_to_process(current, efds, &exset, sizeof exset);
 	}
 
 	return ready;
 }
 
-int sys_select(void *select_args)
+int sys_select(user_ptr_t select_args)
 {
 	struct {
 		int nfds;
-		struct fdset *rfds;
-		struct fdset *wfds;
-		struct fdset *efds;
-		struct timeval *tv;
+		user_ptr_t rfds;
+		user_ptr_t wfds;
+		user_ptr_t efds;
+		user_ptr_t tv;
 	} a;
 	int r;
 
-	r = current->ops->memcpy_from(&a, select_args, sizeof a);
+	r = vm_memcpy_from_process(current, &a, select_args, sizeof a);
 	if (r < 0)
 		return -_L(EFAULT);
 
 	return do_select(a.nfds, a.rfds, a.wfds, a.efds, a.tv);
 }
 
-int sys_select_new(int maxfd, void *rfds, void *wfds, void *efds, void *tvptr)
+int sys_select_new(int maxfd, user_ptr_t rfds, user_ptr_t wfds, user_ptr_t efds, user_ptr_t tvptr)
 {
 	return do_select(maxfd, rfds, wfds, efds, tvptr);
 }
@@ -3171,7 +3350,7 @@ static int do_symlink(const char *dir, const char *file,
 	return r;
 }
 
-static int sys_symlink(const void *oldptr, const void *newptr)
+static int sys_symlink(user_ptr_t oldptr, user_ptr_t newptr)
 {
 	char *oldpath = NULL, *newpath = NULL, *p, *dir, *link;
 	int r;
@@ -3179,14 +3358,14 @@ static int sys_symlink(const void *oldptr, const void *newptr)
 	r = vm_string_read(current, oldptr, &oldpath);
 	if (r < 0)
 	{
-		dprintf("symlink(%p=<invalid>,%p)\n", oldptr, newptr);
+		dprintf("symlink(%08x=<invalid>,%08x)\n", oldptr, newptr);
 		return r;
 	}
 
 	r = vm_string_read(current, newptr, &newpath);
 	if (r < 0)
 	{
-		dprintf("symlink(%s,%p=<invalid>)\n", oldpath, newptr);
+		dprintf("symlink(%s,%08x=<invalid>)\n", oldpath, newptr);
 		free(oldpath);
 		return r;
 	}
@@ -3214,20 +3393,20 @@ static int sys_symlink(const void *oldptr, const void *newptr)
 	return r;
 }
 
-static int sys_link(const char *ptr1, const char *ptr2)
+static int sys_link(user_ptr_t ptr1, user_ptr_t ptr2)
 {
 	/* TODO: can possibly support hard links on NTFS */
 	dprintf("link() - hardlinks are unsupported\n");
 	return -_L(EPERM);
 }
 
-static int do_readlink(const char *path, void *bufptr, size_t bufsize)
+static int do_readlink(const char *path, user_ptr_t bufptr, user_size_t bufsize)
 {
 	char *buf = NULL;
 	int r;
 	struct filp *fp;
 
-	dprintf("readlink(%s,%p,%zd)\n", path, bufptr, bufsize);
+	dprintf("readlink(%s,%08x,%d)\n", path, bufptr, bufsize);
 
 	fp = filp_open(path, O_RDONLY, 0, 0);
 	r = L_PTR_ERROR(fp);
@@ -3243,7 +3422,7 @@ static int do_readlink(const char *path, void *bufptr, size_t bufsize)
 			if (len > bufsize)
 				len = bufsize;
 
-			r = current->ops->memcpy_to(bufptr, buf, len);
+			r = vm_memcpy_to_process(current, bufptr, buf, len);
 			if (r == 0)
 				r = len;
 
@@ -3258,7 +3437,7 @@ static int do_readlink(const char *path, void *bufptr, size_t bufsize)
 	return r;
 }
 
-int sys_readlink(void *pathptr, void *bufptr, size_t bufsize)
+int sys_readlink(user_ptr_t pathptr, user_ptr_t bufptr, user_size_t bufsize)
 {
 	char *path;
 	int r;
@@ -3266,7 +3445,7 @@ int sys_readlink(void *pathptr, void *bufptr, size_t bufsize)
 	r = vm_string_read(current, pathptr, &path);
 	if (r < 0)
 	{
-		dprintf("readlink(%p=<invalid>,%p,%zd)\n",
+		dprintf("readlink(%08x=<invalid>,%08x,%d)\n",
 			pathptr, bufptr, bufsize);
 	}
 
@@ -3277,11 +3456,11 @@ int sys_readlink(void *pathptr, void *bufptr, size_t bufsize)
 	return r;
 }
 
-int sys_newuname(struct _l_new_utsname *ptr)
+int sys_newuname(user_ptr_t ptr)
 {
 	struct _l_new_utsname un;
 
-	dprintf("newuname(%p)\n", ptr);
+	dprintf("newuname(%08x)\n", ptr);
 	strcpy(un.sysname, "Linux");
 	strcpy(un.nodename, "atratus");
 	strcpy(un.release, "2.6.36");
@@ -3289,11 +3468,10 @@ int sys_newuname(struct _l_new_utsname *ptr)
 	strcpy(un.machine, "i686");
 	strcpy(un.domainname, "(none)");
 
-	return current->ops->memcpy_to(ptr, &un, sizeof un);
+	return vm_memcpy_to_process(current, ptr, &un, sizeof un);
 }
 
-int sys_rt_sigaction(int sig, const struct l_sigaction *act,
-		 struct l_sigaction *oact, size_t sigsetsize)
+int sys_rt_sigaction(int sig, user_ptr_t act, user_ptr_t oact, user_size_t sigsetsize)
 {
 	struct l_sigaction sa;
 	struct process *p = current;
@@ -3301,7 +3479,7 @@ int sys_rt_sigaction(int sig, const struct l_sigaction *act,
 
 	memset(&sa, 0, sizeof sa);
 
-	dprintf("rt_sigaction(%d,%p,%p,%d)\n", sig, act, oact, sigsetsize);
+	dprintf("rt_sigaction(%d,%08x,%08x,%d)\n", sig, act, oact, sigsetsize);
 
 	if (sig == _L(SIGKILL) || sig == _L(SIGSTOP))
 		return -_L(EINVAL);
@@ -3322,9 +3500,9 @@ int sys_rt_sigaction(int sig, const struct l_sigaction *act,
 		if (r < 0)
 			return r;
 
-		dprintf("handler:  %p\n", sa.sa_handler);
+		dprintf("handler:  %08x\n", sa.sa_handler);
 		dprintf("flags:    %08lx\n", sa.sa_flags);
-		dprintf("restorer: %p\n", sa.sa_restorer);
+		dprintf("restorer: %08x\n", sa.sa_restorer);
 
 		/*
 		 * set in glibc-2.15/sysdeps/unix/sysv/linux/i386/sigaction.c
@@ -3344,13 +3522,13 @@ int sys_rt_sigaction(int sig, const struct l_sigaction *act,
 	return 0;
 }
 
-int sys_rt_sigprocmask(int how, const unsigned long *set, unsigned long *old)
+int sys_rt_sigprocmask(int how, user_ptr_t set, user_ptr_t old)
 {
-	dprintf("rt_sigprocmask(%d,%p,%p)\n", how, set, old);
+	dprintf("rt_sigprocmask(%d,%08x,%08x)\n", how, set, old);
 	if (old)
 	{
 		unsigned long zero = 0;
-		current->ops->memcpy_to(old, &zero, sizeof zero);
+		vm_memcpy_to_process(current, old, &zero, sizeof zero);
 	}
 	return 0;
 }
@@ -3402,7 +3580,7 @@ int sys_setpgid(int pid, int pgid)
 	return 0;
 }
 
-static int do_futex_wait(unsigned int *uaddr, unsigned int val, struct timespec *ts)
+static int do_futex_wait(unsigned int *uaddr, unsigned int val, struct _L(timespec) *ts)
 {
 	struct poll_timeout pt;
 
@@ -3437,14 +3615,14 @@ static int do_futex_wait(unsigned int *uaddr, unsigned int val, struct timespec 
 	return *uaddr;
 }
 
-static int futex_wait(unsigned int *uaddr, unsigned int val, struct timespec *utime)
+static int futex_wait(user_ptr_t uaddr, unsigned int val, user_ptr_t utime)
 {
-	struct timespec ts, *pts = NULL;
+	struct _L(timespec) ts, *pts = NULL;
 	void *ptr = NULL;
 	size_t max_size = 0;
 	int r;
 
-	dprintf("FUTEX_WAIT %p %d %p\n", uaddr, val, utime);
+	dprintf("FUTEX_WAIT(%08x,%d,%08x)\n", uaddr, val, utime);
 
 	r = vm_get_pointer(current, uaddr, &ptr, &max_size);
 	if (r < 0)
@@ -3464,10 +3642,11 @@ static int futex_wait(unsigned int *uaddr, unsigned int val, struct timespec *ut
 	return do_futex_wait(ptr, val, pts);
 }
 
-int sys_futex(unsigned int *uaddr, int op, unsigned int val,
-	      struct timespec *utime, unsigned int uaddr2, unsigned int val3)
+int sys_futex(user_ptr_t uaddr, int op, unsigned int val,
+	      user_ptr_t utime, unsigned int uaddr2, unsigned int val3)
 {
-	dprintf("futex(%p,%d,%d,%p,%08x,%d)\n", uaddr, op, val, utime, uaddr2, val3);
+	dprintf("futex(%08x,%d,%d,%08x,%08x,%d)\n",
+		uaddr, op, val, utime, uaddr2, val3);
 
 	switch (op)
 	{
@@ -3478,9 +3657,9 @@ int sys_futex(unsigned int *uaddr, int op, unsigned int val,
 	}
 }
 
-static inline void *ptr(int x)
+static inline user_ptr_t ptr(int x)
 {
-	return (void*)x;
+	return (user_ptr_t) x;
 }
 
 int do_syscall(int n, int a1, int a2, int a3, int a4, int a5, int a6)
@@ -3496,7 +3675,7 @@ int do_syscall(int n, int a1, int a2, int a3, int a4, int a5, int a6)
 		r = sys_fork();
 		break;
 	case 3:
-		r = sys_read(a1, ptr(a2), a3);
+		r = sys_read(a1, a2, a3);
 		break;
 	case 4:
 		r = sys_write(a1, ptr(a2), a3);
@@ -3670,7 +3849,7 @@ int do_syscall(int n, int a1, int a2, int a3, int a4, int a5, int a6)
 		r = sys_getcwd(ptr(a1), a2);
 		break;
 	case 192:
-		r = (int) sys_mmap(ptr(a1), a2, a3, a4, a5, a6);
+		r = sys_mmap(ptr(a1), a2, a3, a4, a5, a6);
 		break;
 	case 194:
 		r = sys_ftruncate64(a1, a2, a3);
@@ -3735,42 +3914,66 @@ int do_syscall(int n, int a1, int a2, int a3, int a4, int a5, int a6)
 }
 
 typedef NTSTATUS (*EventHandlerFn)(DEBUGEE_EVENT *event,
-				struct process *context);
+				struct process *p);
 
 static NTSTATUS OnDebuggerIdle(DEBUGEE_EVENT *event,
-				struct process *context)
+				struct process *p)
 {
 	return STATUS_SUCCESS;
 }
 
 static NTSTATUS OnDebuggerPendingReply(DEBUGEE_EVENT *event,
-					 struct process *context)
+					 struct process *p)
 {
 	return STATUS_SUCCESS;
 }
 
 static NTSTATUS OnDebuggerCreateThread(DEBUGEE_EVENT *event,
-					struct process *context)
+					struct process *p)
 {
 	return STATUS_SUCCESS;
 }
 
 static NTSTATUS OnDebuggerCreateProcess(DEBUGEE_EVENT *event,
-					struct process *context)
+					struct process *p)
 {
 	return pDbgUiContinue(&event->ClientId, DBG_CONTINUE);
 }
 
 static NTSTATUS OnDebuggerExitThread(DEBUGEE_EVENT *event,
-					struct process *context)
+					struct process *p)
 {
 	return STATUS_SUCCESS;
 }
 
 static NTSTATUS OnDebuggerExitProcess(DEBUGEE_EVENT *event,
-					struct process *context)
+					struct process *p)
 {
 	return STATUS_SUCCESS;
+}
+
+/*
+ * On x86-64 NtSetContextThread doesn't seem to want to set SegGs to zero
+ * We need it to be cleared so that exceptions are generated and %gs accesses
+ * can be emulated
+ *
+ * This hack clears %gs in userland. This needs more investigation...
+ */
+void ClearGsHack(struct process *p)
+{
+	uint32_t stack = p->regs.esp;
+	uint32_t args[3];
+	int r;
+
+	stack -= sizeof args;
+	args[0] = 0;
+	args[1] = p->regs.eax;
+	args[2] = p->regs.eip;
+	r = vm_memcpy_to_process(p, stack, args, sizeof args);
+	if (r < 0)
+		p->state = thread_terminated;
+	p->regs.eip = stub_entry_point;
+	p->regs.esp = stack;
 }
 
 void process_continue(struct process *p)
@@ -3783,80 +3986,51 @@ void process_continue(struct process *p)
 		schedule();
 		process_deliver_signal(p);
 	}
+
+	ClearGsHack(p);
+
 	if (p->state == thread_terminated)
 		return;
 
-	p->regs.ContextFlags = CONTEXT_i386 | CONTEXT_FULL;
-	r = NtSetContextThread(p->thread, &p->regs);
+	r = set_thread_ucontext(p);
 	if (r != STATUS_SUCCESS)
 	{
-		process_shutdown(p, _L(SIGSEGV));
+		dprintf("Failed to set context, terminating\n");
+		p->state = thread_terminated;
 		return;
 	}
 
-	if (p->state == thread_ready)
+	if (p->state != thread_ready)
+		return;
+
+	p->state = thread_running;
+	r = pDbgUiContinue(&p->id, DBG_CONTINUE);
+	if (r != STATUS_SUCCESS)
 	{
-		p->state = thread_running;
-		r = pDbgUiContinue(&p->id, DBG_CONTINUE);
-		if (r != STATUS_SUCCESS)
-			process_shutdown(p, _L(SIGSEGV));
+		dprintf("Failed to continue, terminating\n");
+		p->state = thread_terminated;
 	}
 }
 
 static NTSTATUS OnDebuggerException(DEBUGEE_EVENT *event,
-					struct process *context)
+					struct process *p)
 {
 	EXCEPTION_RECORD *er = &event->Exception.ExceptionRecord;
 
-	if (ELEMENT_IN_LIST(context, remote_break_item))
-	{
-		context->state = thread_interrupted;
-		SwitchToFiber(context->fiber);
-		return STATUS_SUCCESS;
-	}
+	p->exception = *er;
+	p->state = thread_ready;
 
-	context->state = thread_ready;
-
-	if (er->ExceptionCode == STATUS_ACCESS_VIOLATION)
-	{
-		CONTEXT *regs = &context->regs;
-		unsigned char buffer[2];
-
-		if (0 > vm_memcpy_from_process(context, buffer,
-					(void*) context->regs.Eip, sizeof buffer))
-		{
-			dprintf("failed to read instruction at %08lx\n",
-				context->regs.Eip);
-			process_signal(context, _L(SIGSEGV));
-		}
-		if (buffer[0] == 0xcd && buffer[1] == 0x80)
-		{
-			/* fork() relies on pre-increment here */
-			regs->Eip += 2;
-			SwitchToFiber(context->fiber);
-			/* syscall fiber will continue the client thread */
-			return STATUS_SUCCESS;
-		}
-		else if (!emulate_instruction(context, buffer))
-		{
-			dprintf("invalid instruction at %08lx\n",
-				context->regs.Eip);
-			/* queue a SIGILL */
-			process_signal(context, _L(SIGILL));
-		}
-
-	}
+	if (ELEMENT_IN_LIST(p, remote_break_item))
+		p->wake_reason = wake_break_in;
 	else
-	{
-		process_signal(context, _L(SIGILL));
-	}
+		p->wake_reason = wake_exception;
 
-	process_continue(context);
+	SwitchToFiber(p->fiber);
 	return STATUS_SUCCESS;
 }
 
 static NTSTATUS OnDebuggerBreakpoint(DEBUGEE_EVENT *event,
-					struct process *context)
+					struct process *p)
 {
 	// hook ptrace into here
 	die("Breakpoint...\n");
@@ -3865,31 +4039,28 @@ static NTSTATUS OnDebuggerBreakpoint(DEBUGEE_EVENT *event,
 }
 
 static NTSTATUS OnDebuggerSingleStep(DEBUGEE_EVENT *event,
-					struct process *context)
+					struct process *p)
 {
 	return STATUS_SUCCESS;
 }
 
 static NTSTATUS OnDebuggerLoadDll(DEBUGEE_EVENT *event,
-					struct process *context)
+					struct process *p)
 {
-	if (0)
-	{
-		PVOID Base = event->LoadDll.Base;
-		char name[0x100];
+	PVOID Base = event->LoadDll.Base;
+	char name[0x100];
 
-		printf("dll base = %p\n", Base);
-		if (GetMappedFileName(context->process, Base, name, sizeof name))
-			printf("Filename -> %s\n", name);
-		else
-			printf("GetMappedFileName failed\n");
-	}
+	dprintf("OnDebuggerLoadDll, dll base = %p\n", Base);
+	if (GetMappedFileName(p->process, Base, name, sizeof name))
+		dprintf("Filename -> %s\n", name);
+	else
+		dprintf("GetMappedFileName failed\n");
 
 	return pDbgUiContinue(&event->ClientId, DBG_EXCEPTION_NOT_HANDLED);
 }
 
 static NTSTATUS OnDebuggerUnloadDll(DEBUGEE_EVENT *event,
-					struct process *context)
+					struct process *p)
 {
 	return STATUS_SUCCESS;
 }
@@ -3918,16 +4089,14 @@ NTSTATUS DebugCheckRemoteBreaks(void)
 	{
 		struct process *next = LIST_NEXT(p, remote_break_item);
 
-		r = read_process_registers(p);
+		r = get_thread_ucontext(p);
 		if (r == STATUS_SUCCESS)
 		{
 			current = p;
 			dprintf("interrupted!\n");
 			LIST_REMOVE(&remote_break_list, p, remote_break_item);
-			if (p->state == thread_running)
-				p->state = thread_interrupted;
-			else
-				dprintf("not running, state = %d\n", p->state);
+			p->state = thread_ready;
+			p->wake_reason = wake_break_in;
 			SwitchToFiber(p->fiber);
 		}
 
@@ -3939,7 +4108,7 @@ NTSTATUS DebugCheckRemoteBreaks(void)
 
 static NTSTATUS ReadDebugPort(HANDLE debugObject)
 {
-	struct process *context;
+	struct process *p;
 	NTSTATUS r;
 	LARGE_INTEGER timeout;
 	DEBUGEE_EVENT event = {0};
@@ -3960,15 +4129,18 @@ static NTSTATUS ReadDebugPort(HANDLE debugObject)
 		return r;
 	}
 
+	if (event.NewState == DbgIdle)
+		return STATUS_SUCCESS;
+
 	if (event.NewState > sizeof handlers/sizeof handlers[0])
 		return STATUS_UNSUCCESSFUL;
 
-	context = context_from_client_id(&event.ClientId);
-	if (!context)
+	p = context_from_client_id(&event.ClientId);
+	if (!p)
 	{
-		dprintf("received event for unknown process %08x:%08x\n",
-			(UINT)event.ClientId.UniqueProcess,
-			(UINT)event.ClientId.UniqueThread);
+		dprintf("received event for unknown process %p:%p\n",
+			event.ClientId.UniqueProcess,
+			event.ClientId.UniqueThread);
 
 		return DebugCheckRemoteBreaks();
 	}
@@ -3979,43 +4151,89 @@ static NTSTATUS ReadDebugPort(HANDLE debugObject)
 	 *  - one to wait on debugger state
 	 */
 
-	read_process_registers(context);
-	return handlers[event.NewState](&event, context);
+	get_thread_ucontext(p);
+	return handlers[event.NewState](&event, p);
 }
 
-void __stdcall SyscallHandler(PVOID param)
+void process_syscall(struct process *p)
+{
+	struct _L(ucontext) *regs = &p->regs;
+
+	if (regs->eax == 119)
+		sys_sigreturn();
+	else if (regs->eax == 173)
+		sys_rt_sigreturn();
+	else
+	{
+		int32_t r;
+		r = do_syscall(regs->eax, regs->ebx,
+				regs->ecx, regs->edx,
+				regs->esi, regs->edi,
+				regs->ebp);
+		regs->eax = r;
+	}
+}
+
+void process_exception(struct process *p, EXCEPTION_RECORD *er)
+{
+	if (er->ExceptionCode == STATUS_ACCESS_VIOLATION)
+	{
+		struct _L(ucontext) *regs = &p->regs;
+		unsigned char buffer[2];
+
+		if (0 > vm_memcpy_from_process(p, buffer,
+						p->regs.eip, sizeof buffer))
+		{
+			dprintf("failed to read instruction at %08x\n",
+				p->regs.eip);
+			process_signal(p, _L(SIGSEGV));
+		}
+		else if (buffer[0] == 0xcd && buffer[1] == 0x80)
+		{
+			/* fork() relies on pre-increment here */
+			regs->eip += 2;
+			process_syscall(p);
+		}
+		else if (!emulate_instruction(p, buffer))
+		{
+			dprintf("invalid instruction [%02x %02x] at %08x\n",
+				buffer[0], buffer[1], p->regs.eip);
+			debug_log_regs(&p->regs);
+			/* queue a SIGILL */
+			process_signal(p, _L(SIGILL));
+		}
+	}
+	else
+	{
+		process_signal(p, _L(SIGILL));
+	}
+
+	process_continue(p);
+}
+
+
+void __stdcall process_fiber(PVOID param)
 {
 	struct process *p = param;
 	current = p;
 
 	while (p->state != thread_terminated)
 	{
-		CONTEXT *regs = &p->regs;
-		ULONG r;
-
-		/* stopped by a signal or a syscall? */
-		if (p->state != thread_interrupted)
+		if (p->wake_reason == wake_exception)
 		{
-			if (regs->Eax == 119)
-				sys_sigreturn();
-			else if (regs->Eax == 173)
-				sys_rt_sigreturn();
-			else
-			{
-				r = do_syscall(regs->Eax, regs->Ebx,
-						regs->Ecx, regs->Edx,
-						regs->Esi, regs->Edi,
-						regs->Ebp);
-				regs->Eax = r;
-			}
-
-			if (p->state == thread_terminated)
-				break;
+			process_exception(p, &p->exception);
+		}
+		else if (p->wake_reason == wake_break_in)
+		{
+			dprintf("breakin...\n");
+			process_continue(p);
 		}
 		else
-			p->state = thread_ready;
+		{
+			dprintf("wake for unknown reason, terminating\n");
+			p->state = thread_terminated;
+		}
 
-		process_continue(p);
 		if (p->state == thread_terminated)
 			break;
 
@@ -4048,15 +4266,18 @@ NTSTATUS create_first_thread(struct process *p)
 {
 	NTSTATUS r;
 
-	p->fiber = CreateFiber(0, &SyscallHandler, p);
+	p->fiber = CreateFiber(0, &process_fiber, p);
 	if (!p->fiber)
 		return STATUS_UNSUCCESSFUL;
 
+	context_from_ucontext(&p->winctx, &p->regs);
 	/* create a thread to run in the process */
-	p->regs.ContextFlags = CONTEXT_FULL;
 	r = NtCreateThread(&p->thread, THREAD_ALL_ACCESS, NULL,
 			 p->process, &p->id,
-			 &p->regs, &p->stack_info, FALSE);
+			 &p->winctx, &p->stack_info, FALSE);
+
+	NtSetContextThread(p->thread, &p->winctx);
+
 	return r;
 }
 
@@ -4075,54 +4296,26 @@ NTSTATUS GetClientId(HANDLE thread, CLIENT_ID *id)
 	return r;
 }
 
-DWORD GetThreadId(HANDLE thread)
-{
-	NTSTATUS r;
-	CLIENT_ID id;
-
-	r = GetClientId(thread, &id);
-	if (r != STATUS_SUCCESS)
-		return 0;
-
-	return (DWORD) id.UniqueThread;
-}
-
-DWORD GetProcessId(HANDLE process)
-{
-	NTSTATUS r;
-	PROCESS_BASIC_INFORMATION info;
-
-	memset(&info, 0, sizeof info);
-
-	r = NtQueryInformationProcess(process, ProcessBasicInformation,
-					 &info, sizeof info, NULL);
-	if (r != STATUS_SUCCESS)
-		return 0;
-
-	return info.UniqueProcessId;
-}
-
 static BOOL Is64Bit(void)
 {
-	BOOL (WINAPI *pfnIsWow64)(HANDLE, PBOOL);
+	BOOL wow64 = TRUE;
+#if !defined(__x86_64__)
+	BOOL WINAPI (*pIsWow64Process)(HANDLE, PBOOL);
 	PVOID k32;
-	BOOL wow64 = FALSE;
 	BOOL r;
 
 	k32 = GetModuleHandle("kernel32");
 	if (!k32)
 		return FALSE;
 
-	pfnIsWow64 = GetProcAddress(k32, "IsWow64Process");
-	if (!pfnIsWow64)
+	pIsWow64Process = (void*) GetProcAddress(k32, "IsWow64Process");
+	if (!pIsWow64Process)
 		return FALSE;
 
-	r = pfnIsWow64(GetCurrentProcess(), &wow64);
+	r = pIsWow64Process(GetCurrentProcess(), &wow64);
 	if (!r)
 		return FALSE;
-
-	dprintf("wow64 = %d\n", wow64);
-
+#endif
 	return wow64;
 }
 
@@ -4171,7 +4364,8 @@ void process_free(struct process *process)
 	dprintf("freeing process %p\n", process);
 	process_migrate_children_to_parent(process);
 	process_unlink_from_sibling_list(process);
-	DeleteFiber(process->fiber);
+	if (process->fiber)
+		DeleteFiber(process->fiber);
 	free(process->cwd);
 	process->cwd = NULL;
 	filp_close(process->cwdfp);
@@ -4301,92 +4495,22 @@ void signal_handle_default(struct process *p, int signal)
 	}
 }
 
-struct ucontext
-{
-	uint16_t gs;
-	uint16_t fs;
-	uint16_t es;
-	uint16_t ds;
-	uint32_t edi;
-	uint32_t esi;
-	uint32_t ebp;
-	uint32_t esp;
-	uint32_t ebx;
-	uint32_t edx;
-	uint32_t ecx;
-	uint32_t eax;
-	uint32_t trapno;
-	uint32_t err;
-	uint32_t eip;
-	uint16_t cs;
-	uint32_t eflags;
-	uint32_t esp_at_signal;
-	uint16_t ss;
-	void *fpustate;
-	uint32_t oldmask;
-	uint32_t cr2;
-};
-
-void signal_ucontext_from_process(struct process *p, struct ucontext *uc)
-{
-#define COPY(LR, WR) uc->LR = p->regs.WR
-	COPY(gs, SegGs);
-	COPY(fs, SegFs);
-	COPY(es, SegEs);
-	COPY(ds, SegDs);
-	COPY(edi, Edi);
-	COPY(esi, Esi);
-	COPY(ebp, Ebp);
-	COPY(esp, Esp);
-	COPY(ebx, Ebx);
-	COPY(edx, Edx);
-	COPY(ecx, Ecx);
-	COPY(eax, Eax);
-	COPY(cs, SegCs);
-	COPY(ss, SegSs);
-	COPY(eip, Eip);
-	COPY(eflags, EFlags);
-#undef COPY
-}
-
-void signal_ucontext_to_process(struct process *p, struct ucontext *uc)
-{
-#define COPY(LR, WR) p->regs.WR = uc->LR
-	COPY(gs, SegGs);
-	COPY(fs, SegFs);
-	COPY(es, SegEs);
-	COPY(ds, SegDs);
-	COPY(edi, Edi);
-	COPY(esi, Esi);
-	COPY(ebp, Ebp);
-	COPY(esp, Esp);
-	COPY(ebx, Ebx);
-	COPY(edx, Edx);
-	COPY(ecx, Ecx);
-	COPY(eax, Eax);
-	COPY(cs, SegCs);
-	COPY(ss, SegSs);
-	COPY(eip, Eip);
-	COPY(eflags, EFlags);
-#undef COPY
-}
-
 struct signal_stack_layout {
-	void *ret;
+	user_ptr_t ret;
 	int signo;
-	struct ucontext uc;
+	struct _L(ucontext) uc;
 };
 
 void sys_sigreturn(void)
 {
 	struct process *p = current;
 	struct signal_stack_layout frame;
-	void *stack;
+	user_ptr_t stack;
 	int r;
 
 	dprintf("%s()\n", __FUNCTION__);
 
-	stack = (void*)(p->regs.Esp - 8);
+	stack = p->regs.esp - 8;
 
 	r = vm_memcpy_from_process(p, &frame, stack, sizeof frame);
 	if (r < 0)
@@ -4399,24 +4523,24 @@ void sys_sigreturn(void)
 }
 
 struct sigaction_stack_layout {
-	void *ret;
+	user_ptr_t /*void * */ ret;
 	int signo;
-	struct l_siginfo_t *si_ptr;
-	struct ucontext *uc_ptr;
+	user_ptr_t /*struct l_siginfo_t* */ si_ptr;
+	user_ptr_t /*struct _L(ucontext)* */ uc_ptr;
 	struct l_siginfo_t si;
-	struct ucontext uc;
+	struct _L(ucontext) uc;
 };
 
 void sys_rt_sigreturn(void)
 {
 	struct process *p = current;
 	struct sigaction_stack_layout frame;
-	void *stack;
+	user_ptr_t stack;
 	int r;
 
-	dprintf("%s(esp=%08lx)\n", __FUNCTION__, p->regs.Esp);
+	dprintf("%s(esp=%08x)\n", __FUNCTION__, p->regs.esp);
 
-	stack = (void*)(p->regs.Esp - 4);
+	stack = p->regs.esp - 4;
 
 	r = vm_memcpy_from_process(p, &frame, stack, sizeof frame);
 	if (r < 0)
@@ -4434,18 +4558,20 @@ void sys_rt_sigreturn(void)
  */
 void signal_push_on_stack(struct process *p, struct sigqueue *sq)
 {
-	uint8_t *stack;
+	user_ptr_t stack;
 	int r;
 
-	stack = (void*) p->regs.Esp;
+	stack = p->regs.esp;
 
 	if (p->sa[sq->signal].sa_flags & _L(SA_SIGINFO))
 	{
 		struct sigaction_stack_layout frame = {0};
+		struct sigaction_stack_layout *st = (void*)(uintptr_t) stack;
+
 		stack -= sizeof frame;
 
-		frame.si_ptr = &(((struct sigaction_stack_layout*) stack)->si);
-		frame.uc_ptr = &(((struct sigaction_stack_layout*) stack)->uc);
+		frame.si_ptr = (user_ptr_t)(uintptr_t) &st->si;
+		frame.uc_ptr = (user_ptr_t)(uintptr_t) &st->uc;
 
 		signal_ucontext_from_process(p, &frame.uc);
 
@@ -4476,9 +4602,9 @@ void signal_push_on_stack(struct process *p, struct sigqueue *sq)
 		}
 	}
 
-	p->regs.Eip = (uintptr_t) p->sa[sq->signal].sa_handler;
-	p->regs.Esp = (uintptr_t) stack;
-	dprintf("Entering signal handler at %p stack at %p\n",
+	p->regs.eip = p->sa[sq->signal].sa_handler;
+	p->regs.esp = stack;
+	dprintf("Entering signal handler at %08x stack at %08x\n",
 		p->sa[sq->signal].sa_handler, stack);
 }
 
@@ -4615,7 +4741,7 @@ void timeout_add_tv(struct timeout *t, struct timeval *ts)
 	timeout_add(t);
 }
 
-void timeout_add_timespec(struct timeout *t, struct timespec *ts)
+void timeout_add_timespec(struct timeout *t, struct _L(timespec) *ts)
 {
 	struct timeval now;
 
@@ -4721,7 +4847,7 @@ static void dump_selectors(void)
 
 	STATIC_ASSERT(sizeof (NT_LDT_ENTRY) == 8);
 
-	printf("Process selectors:\n");
+	dprintf("Process selectors:\n");
 	for (i = 0; i < 0x40; i++)
 	{
 		info.Selector = i;
@@ -4730,10 +4856,97 @@ static void dump_selectors(void)
 		if (r == STATUS_SUCCESS)
 		{
 			ULONG *Value = (void*) &info.Descriptor;
-			printf("selector %04x -> %08x %08x\n", i,
+			dprintf("selector %04x -> %08lx %08lx\n", i,
 				Value[0], Value[1]);
 		}
 	}
+}
+
+static WCHAR tolowerW(WCHAR x)
+{
+	if (x >= 'A' && x <= 'Z')
+		x |= 0x20;
+	return x;
+}
+
+static int equalsW(const WCHAR *left, const WCHAR *right, size_t n)
+{
+	size_t i = 0;
+	while (i < n)
+	{
+		if (tolowerW(left[i]) != tolowerW(right[i]))
+			return 0;
+		if (!left[i])
+			break;
+		i++;
+	}
+	return 1;
+}
+
+/*
+ * Start the 64bit binary instead
+ * On a Unix system this would be easier...
+ */
+int Start64BitBinary(int argc, char **argv)
+{
+	WCHAR exename[MAX_PATH];
+	WCHAR *cmdline;
+	WCHAR *name;
+	HANDLE mod;
+	BOOL r;
+	size_t i;
+	WCHAR *newcmd;
+	size_t cmdlen, namelen;
+	STARTUPINFOW si;
+	PROCESS_INFORMATION pi;
+
+	/* find our exe's name */
+	mod = GetModuleHandle(NULL);
+	r = GetModuleFileNameW(mod, exename, sizeof exename/sizeof exename[0]);
+	if (!r)
+		return 1;
+
+	name = exename + lstrlenW(exename);
+	while (name > exename && name[-1] != '\\')
+		name--;
+
+	/* identify our exe in the command line */
+	cmdline = GetCommandLineW();
+	cmdlen = lstrlenW(cmdline);
+	namelen = lstrlenW(name);
+	for (i = 0; i < cmdlen; i++)
+		if (equalsW(name, &cmdline[i], namelen))
+			break;
+
+	if (i == cmdlen)
+		goto fail;
+
+	/* append 64 to our exe's name */
+	newcmd = malloc((cmdlen + 2) * sizeof (WCHAR));
+	lstrcpyW(newcmd, cmdline);
+	while (newcmd[i] && newcmd[i] != '.')
+		i++;
+	if (!newcmd[i])
+		goto fail;
+	memmove(&newcmd[i + 2], &newcmd[i], (cmdlen - i + 1) * sizeof (WCHAR));
+	memcpy(&newcmd[i], L"64", 2 * sizeof (WCHAR));
+
+	/* start the new process */
+	memset(&si, 0, sizeof si);
+	si.cb = sizeof si;
+	memset(&pi, 0, sizeof pi);
+	r = CreateProcessW(NULL, newcmd, NULL, NULL, FALSE,
+			 NORMAL_PRIORITY_CLASS, NULL, NULL, &si, &pi);
+	if (!r)
+		goto fail;
+
+	WaitForSingleObject(pi.hProcess, INFINITE);
+
+	return 0;
+
+fail:
+	printf("On 64bit systems, please use atratus64.exe\n");
+	return 0;
 }
 
 int main(int argc, char **argv)
@@ -4745,9 +4958,15 @@ int main(int argc, char **argv)
 	HANDLE console_in, console_out;
 	HANDLE inet4_handle;
 	DWORD console_mode = 0;
-	BOOL backtrace_on_ctrl_c = 0;
 	char *env[16];
 	int envcount = 0;
+	OSVERSIONINFO VersionInfo;
+
+	is64bit = Is64Bit();
+#ifdef __i386__
+	if (is64bit)
+		return Start64BitBinary(argc, argv);
+#endif
 
 	if (!dynamic_resolve())
 	{
@@ -4755,15 +4974,9 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (Is64Bit())
-	{
-		if (0)
-			dump_selectors();
-		fprintf(stderr, "Atratus doesn't work on 64-bit windows as yet\n");
-		fprintf(stderr, "Press enter to continue...\n");
-		getchar();
-		return 0;
-	}
+	VersionInfo.dwOSVersionInfoSize = sizeof VersionInfo;
+	if (!GetVersionEx(&VersionInfo))
+		return 1;
 
 	vm_init();
 
@@ -4804,13 +5017,6 @@ int main(int argc, char **argv)
 			continue;
 		}
 
-		if (!strcmp(argv[n], "-c"))
-		{
-			backtrace_on_ctrl_c = 1;
-			n++;
-			continue;
-		}
-
 		if (!strcmp(argv[n], "-e") && (n + 1) < argc)
 		{
 			if ((envcount + 1) >= sizeof env/sizeof env[0])
@@ -4831,6 +5037,15 @@ int main(int argc, char **argv)
 
 		break;
 	}
+
+	dprintf("Windows %ld.%ld build %ld platform %ld %dbit\n",
+		VersionInfo.dwMajorVersion,
+		VersionInfo.dwMinorVersion,
+		VersionInfo.dwBuildNumber,
+		VersionInfo.dwPlatformId,
+		is64bit ? 64 : 32);
+
+	dump_selectors();
 
 	if (n >= argc)
 	{

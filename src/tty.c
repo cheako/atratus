@@ -27,6 +27,7 @@
 #include <assert.h>
 #include "filp.h"
 #include "process.h"
+#include "vm.h"
 #include "tty.h"
 #include "linux-errno.h"
 #include "linux-defines.h"
@@ -103,7 +104,7 @@ static void tty_discard_input(struct tty_filp *tty)
 	tty->ready_count = 0;
 }
 
-static int tty_read(struct filp *f, void *buf, size_t size, loff_t *ofs, int block)
+static int tty_read(struct filp *f, void *buf, user_size_t size, loff_t *ofs, int block)
 {
 	struct tty_filp *tty = (struct tty_filp*) f;
 	int ret = 0;
@@ -168,7 +169,7 @@ static int tty_read(struct filp *f, void *buf, size_t size, loff_t *ofs, int blo
 }
 
 #define FROM_FIELD(type, ptr, field) \
-	((type*)(((char*)(ptr)) - (int)&(((type*)NULL)->field)))
+	((type*)(((char*)(ptr)) - (uintptr_t)&(((type*)NULL)->field)))
 
 void tty_check_signal(struct workitem *item)
 {
@@ -189,8 +190,8 @@ void tty_check_signal(struct workitem *item)
 
 static uint8_t tty_control_echo[256] =
 {
-	1, 1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1,
-	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+	1, 1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1,
+	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1,
 };
 
 void tty_input_add_char(struct tty_filp *tty, char ch)
@@ -311,42 +312,21 @@ static void tty_debug_dump_buffer(const unsigned char *buffer, size_t sz)
 	dprintf("tty out -> '%.*s'\n", n, out);
 }
 
-static int tty_write(struct filp *f, const void *buf, size_t size, loff_t *off, int block)
+static int tty_write(struct filp *f, const void *buffer, user_size_t size, loff_t *off, int block)
 {
 	struct tty_filp *tty = (struct tty_filp*) f;
 	DWORD written = 0;
-	unsigned char *p = NULL;
-	unsigned char buffer[0x1000];
-	ULONG buf_remaining = 0;
+	const unsigned char *p = buffer;
 	int r, i;
+
+	tty_debug_dump_buffer(buffer, size);
 
 	for (i = 0; i < size; i++)
 	{
-		if (buf_remaining == 0)
-		{
-			int sz = size;
-			if (sz > sizeof buffer)
-				sz = sizeof buffer;
-			r = current->ops->memcpy_from(buffer, buf, sz);
-			if (r < 0)
-			{
-				dprintf("memcpy_from failed\n");
-				if (written)
-					break;
-				return r;
-			}
-			tty_debug_dump_buffer(buffer, sz);
-			buf_remaining = sz;
-			buf = (char*)buf + buf_remaining;
-			p = buffer;
-		}
-		if (buf_remaining == 0)
-			break;
 		r = tty_write_output(tty, *p);
 		if (r < 0)
 			break;
 		written++;
-		buf_remaining--;
 		p++;
 	}
 
@@ -355,7 +335,7 @@ static int tty_write(struct filp *f, const void *buf, size_t size, loff_t *off, 
 	return written;
 }
 
-static int tty_set_termios(struct tty_filp *tty, void *p)
+static int tty_set_termios(struct tty_filp *tty, user_ptr_t p)
 {
 	int r;
 	/*
@@ -364,7 +344,7 @@ static int tty_set_termios(struct tty_filp *tty, void *p)
 	 */
 	STATIC_ASSERT(sizeof tty->tios == 36);
 
-	r = current->ops->memcpy_from(&tty->tios, p, sizeof tty->tios);
+	r = vm_memcpy_from_process(current, &tty->tios, p, sizeof tty->tios);
 	if (r < 0)
 		return r;
 	dprintf("tios: %s %s %s %s %s\n",
@@ -378,19 +358,19 @@ static int tty_set_termios(struct tty_filp *tty, void *p)
 	return 0;
 }
 
-static int tty_get_termios(struct tty_filp *tty, void *p)
+static int tty_get_termios(struct tty_filp *tty, user_ptr_t p)
 {
-	dprintf("get termios(%p)\n", p);
+	dprintf("get termios(%08x)\n", p);
 	STATIC_ASSERT(sizeof tty->tios == 36);
-	return current->ops->memcpy_to(p, &tty->tios, sizeof tty->tios);
+	return vm_memcpy_to_process(current, p, &tty->tios, sizeof tty->tios);
 }
 
-static int tty_get_winsize(struct tty_filp *tty, void *ptr)
+static int tty_get_winsize(struct tty_filp *tty, user_ptr_t ptr)
 {
 	struct winsize ws;
 
 	tty->ops->fn_get_winsize(tty, &ws);
-	return current->ops->memcpy_to(ptr, &ws, sizeof ws);
+	return vm_memcpy_to_process(current, ptr, &ws, sizeof ws);
 }
 
 static int tty_tcflush(struct tty_filp *tty, int what)
@@ -398,22 +378,22 @@ static int tty_tcflush(struct tty_filp *tty, int what)
 	return 0;
 }
 
-static int tty_get_process_group(struct tty_filp *tty, void *ptr)
+static int tty_get_process_group(struct tty_filp *tty, user_ptr_t ptr)
 {
 	int pgid = process_getpid(tty->leader);
 	dprintf("TIOCGPGRP -> %d\n", pgid);
-	return current->ops->memcpy_to(ptr, &pgid, sizeof pgid);
+	return vm_memcpy_to_process(current, ptr, &pgid, sizeof pgid);
 }
 
-static int tty_set_process_group(struct tty_filp *tty, void *ptr)
+static int tty_set_process_group(struct tty_filp *tty, user_ptr_t ptr)
 {
 	struct process *p;
 	int pgid;
 	int r;
 
-	dprintf("TIOCSPGRP -> %p\n", ptr);
+	dprintf("TIOCSPGRP -> %08x\n", ptr);
 
-	r = current->ops->memcpy_from(&pgid, ptr, sizeof pgid);
+	r = vm_memcpy_from_process(current, &pgid, ptr, sizeof pgid);
 	if (r < 0)
 		return r;
 
@@ -440,27 +420,27 @@ static int tty_ioctl(struct filp *f, int cmd, unsigned long arg)
 	switch (cmd)
 	{
 	case TIOCGPGRP:
-		return tty_get_process_group(tty, (void*)arg);
+		return tty_get_process_group(tty, arg);
 	case TIOCSPGRP:
-		return tty_set_process_group(tty, (void*) arg);
+		return tty_set_process_group(tty, arg);
 
 	/*
 	 * TODO: termios handling is wrong
 	 *       Set calls do subtly different things.
 	 */
 	case TIOCS:
-		return tty_set_termios(tty, (void*)arg);
+		return tty_set_termios(tty, arg);
 	case TCSETSW:
-		return tty_set_termios(tty, (void*)arg);
+		return tty_set_termios(tty, arg);
 	case TCSETSF:	/* TODO: drain output */
 		tty_discard_input(tty);
-		return tty_set_termios(tty, (void*)arg);
+		return tty_set_termios(tty, arg);
 	case TCSETAW:
-		return tty_set_termios(tty, (void*)arg);
+		return tty_set_termios(tty, arg);
 	case TIOCG:
-		return tty_get_termios(tty, (void*)arg);
+		return tty_get_termios(tty, arg);
 	case TIOCGWINSZ:
-		return tty_get_winsize(tty, (void*)arg);
+		return tty_get_winsize(tty, arg);
 	case TCFLUSH:
 		return tty_tcflush(tty, arg);
 	default:

@@ -32,20 +32,20 @@
 #include "debug.h"
 #include "vm.h"
 
-#define CARRY(regs) ((regs).EFlags & 1)
+#define CARRY(regs) ((regs).flags & 1)
 
-static inline PULONG getwreg(struct process *p, int reg)
+static inline uint32_t* getwreg(struct process *p, int reg)
 {
 	switch (reg & 7)
 	{
-	case 0: return &p->regs.Eax;
-	case 1: return &p->regs.Ecx;
-	case 2: return &p->regs.Edx;
-	case 3: return &p->regs.Ebx;
-	case 4: return &p->regs.Esp;
-	case 5: return &p->regs.Ebp;
-	case 6: return &p->regs.Esi;
-	case 7: return &p->regs.Edi;
+	case 0: return &p->regs.eax;
+	case 1: return &p->regs.ecx;
+	case 2: return &p->regs.edx;
+	case 3: return &p->regs.ebx;
+	case 4: return &p->regs.esp;
+	case 5: return &p->regs.ebp;
+	case 6: return &p->regs.esi;
+	case 7: return &p->regs.edi;
 	default:
 		abort();
 	}
@@ -64,14 +64,14 @@ static inline PULONG getwreg(struct process *p, int reg)
 			instsz++;					\
 			switch ((modrm) & 7)				\
 			{						\
-			case 0: out = process->regs.Eax; break;		\
-			case 1: out = process->regs.Ecx; break;		\
-			case 2: out = process->regs.Edx; break;		\
-			case 3: out = process->regs.Ebx; break;		\
+			case 0: out = process->regs.eax; break;		\
+			case 1: out = process->regs.ecx; break;		\
+			case 2: out = process->regs.edx; break;		\
+			case 3: out = process->regs.ebx; break;		\
 			case 4: return -_L(EFAULT);			\
-			case 5: out = process->regs.Ebp; break;		\
-			case 6: out = process->regs.Esi; break;		\
-			case 7: out = process->regs.Edi; break;		\
+			case 5: out = process->regs.ebp; break;		\
+			case 6: out = process->regs.esi; break;		\
+			case 7: out = process->regs.edi; break;		\
 			}						\
 			out += disp8;					\
 			break;						\
@@ -85,10 +85,10 @@ static inline PULONG getwreg(struct process *p, int reg)
 		}							\
 		switch ((modrm) & 7)					\
 		{							\
-		case 0: out = process->regs.Eax; break;			\
-		case 1: out = process->regs.Ecx; break;			\
-		case 2: out = process->regs.Edx; break;			\
-		case 3: out = process->regs.Ebx; break;			\
+		case 0: out = process->regs.eax; break;			\
+		case 1: out = process->regs.ecx; break;			\
+		case 2: out = process->regs.edx; break;			\
+		case 3: out = process->regs.ebx; break;			\
 		case 5: 						\
 			r = vm_memcpy_from_process(process, &out,	\
 					 eip + instsz, sizeof out);	\
@@ -96,8 +96,8 @@ static inline PULONG getwreg(struct process *p, int reg)
 				return -_L(EFAULT);			\
 			instsz += 4;					\
 			break;						\
-		case 6: out = process->regs.Esi; break;			\
-		case 7: out = process->regs.Edi; break;			\
+		case 6: out = process->regs.esi; break;			\
+		case 7: out = process->regs.edi; break;			\
 		default:						\
 			die("getrm0: unhandled rm %08x\n",		\
 				 (modrm) & 7);				\
@@ -112,7 +112,7 @@ static void handle_mov_reg_to_seg_reg(struct process *p, uint8_t modrm)
 	}
 	else
 	{
-		ULONG *reg = getwreg(p, modrm & 7);
+		uint32_t *reg = getwreg(p, modrm & 7);
 		unsigned int x = ((*reg) >> 3) - 0x80;
 		if (x >= MAX_VTLS_ENTRIES)
 		{
@@ -120,27 +120,27 @@ static void handle_mov_reg_to_seg_reg(struct process *p, uint8_t modrm)
 		}
 		p->vtls_selector = x;
 	}
-	p->regs.Eip += 2;
+	p->regs.eip += 2;
 }
 
 static int handle_mov_eax_to_gs_addr(struct process *p)
 {
 	unsigned int offset = 0;
 	int r;
-	unsigned char *tls;
-	char *eip = (char*) p->regs.Eip;
+	user_ptr_t tls;
+	user_ptr_t eip = p->regs.eip;
 
 	r = vm_memcpy_from_process(p, &offset, eip + 2, sizeof offset);
 	if (r < 0)
 		return r;
 
-	tls = (unsigned char*) p->vtls[p->vtls_selector].base_addr;
+	tls = p->vtls[p->vtls_selector].base_addr;
 	tls += offset;
-	r = vm_memcpy_to_process(p, tls, &p->regs.Eax, 4);
+	r = vm_memcpy_to_process(p, tls, &p->regs.eax, 4);
 	if (r < 0)
 		return r;
 
-	p->regs.Eip += 6;
+	p->regs.eip += 6;
 
 	return 0;
 }
@@ -149,30 +149,30 @@ static int handle_mov_gs_addr_to_eax(struct process *p)
 {
 	unsigned int offset = 0;
 	int r;
-	unsigned char *tls;
-	char *eip = (char*) p->regs.Eip;
+	user_ptr_t tls;
+	user_ptr_t eip = p->regs.eip;
 
 	r = vm_memcpy_from_process(p, &offset, eip + 2, sizeof offset);
 	if (r < 0)
 		return r;
 
-	tls = (unsigned char*) p->vtls[p->vtls_selector].base_addr;
+	tls = p->vtls[p->vtls_selector].base_addr;
 	tls += offset;
-	r = vm_memcpy_from_process(p, &p->regs.Eax, tls, 4);
+	r = vm_memcpy_from_process(p, &p->regs.eax, tls, 4);
 	if (r < 0)
 		return r;
 
-	p->regs.Eip += 6;
+	p->regs.eip += 6;
 	return r;
 }
 
 static int handle_movl_to_gs_reg(struct process *p)
 {
 	int r;
-	unsigned char *tls;
+	user_ptr_t tls;
 	int8_t modrm;
 	uint32_t value;
-	char *eip = (char*) p->regs.Eip;
+	user_ptr_t eip = p->regs.eip;
 	uint32_t val;
 	int instsz = 3;
 
@@ -183,7 +183,7 @@ static int handle_movl_to_gs_reg(struct process *p)
 	if (modrm & 0x38)
 		return -_L(EFAULT);
 
-	tls = (unsigned char*) p->vtls[p->vtls_selector].base_addr;
+	tls = p->vtls[p->vtls_selector].base_addr;
 	GETRM(p, val, modrm, instsz);
 	tls += val;
 
@@ -196,19 +196,19 @@ static int handle_movl_to_gs_reg(struct process *p)
 	if (r < 0)
 		return r;
 
-	p->regs.Eip += instsz;
+	p->regs.eip += instsz;
 	return r;
 }
 
 static int handle_compare_imm8_to_gs_address(struct process *p)
 {
 	int r;
-	unsigned char *tls;
+	user_ptr_t tls;
 	uint8_t modrm;
 	uint8_t imm8;
 	uint32_t value;
 	uint32_t val;
-	char *eip = (char*) p->regs.Eip;
+	user_ptr_t eip = p->regs.eip;
 	int instsz = 3;
 
 	r = vm_memcpy_from_process(p, &modrm, eip + 2, sizeof modrm);
@@ -222,7 +222,7 @@ static int handle_compare_imm8_to_gs_address(struct process *p)
 		return -1;
 	}
 
-	tls = (unsigned char*) p->vtls[p->vtls_selector].base_addr;
+	tls = p->vtls[p->vtls_selector].base_addr;
 	GETRM(p, val, modrm, instsz);
 	tls += val;
 
@@ -240,10 +240,11 @@ static int handle_compare_imm8_to_gs_address(struct process *p)
 		"\txor %%eax, %%eax\n"
 		"\tcmpl %0, %1\n"
 		"\tlahf\n"
-		"\tmovb %%ah, (%2)\n"
-	: : "r"((uint32_t)imm8), "r"(value), "r"(&p->regs.EFlags) : "eax");
+		"\tmovzx %%ah, %%eax\n"
+		"\tmov %%eax, (%2)\n"
+	: : "r"((uint32_t)imm8), "r"(value), "r"(&p->regs.eflags) : "eax");
 
-	p->regs.Eip += instsz;
+	p->regs.eip += instsz;
 
 	return r;
 }
@@ -251,13 +252,13 @@ static int handle_compare_imm8_to_gs_address(struct process *p)
 static int handle_reg_indirect_to_read(struct process *p)
 {
 	int r;
-	unsigned char *tls;
+	user_ptr_t tls;
 	struct {
 		uint8_t modrm;
 	} __attribute__((__packed__)) buf;
-	unsigned long *preg;
-	char *eip = (char*) p->regs.Eip;
-	int val;
+	uint32_t *preg;
+	user_ptr_t eip = p->regs.eip;
+	user_ptr_t val;
 	int instsz = 3;
 
 	r = vm_memcpy_from_process(p, &buf, eip + 2, sizeof buf);
@@ -265,7 +266,7 @@ static int handle_reg_indirect_to_read(struct process *p)
 		return r;
 
 	// 65 8b 38			mov    %gs:(%eax),%edi
-	tls = (unsigned char*) p->vtls[p->vtls_selector].base_addr;
+	tls = p->vtls[p->vtls_selector].base_addr;
 
 	preg = getwreg(p, buf.modrm >> 3);
 
@@ -276,7 +277,7 @@ static int handle_reg_indirect_to_read(struct process *p)
 	if (r < 0)
 		return r;
 
-	p->regs.Eip += instsz;
+	p->regs.eip += instsz;
 
 	return 0;
 }
@@ -284,20 +285,20 @@ static int handle_reg_indirect_to_read(struct process *p)
 static int handle_reg_indirect_to_write(struct process *p)
 {
 	int r;
-	unsigned char *tls;
+	user_ptr_t tls;
 	struct {
 		uint8_t modrm;
 	} __attribute__((__packed__)) buf;
-	unsigned long *preg;
-	char *eip = (char*) p->regs.Eip;
-	int val;
+	uint32_t *preg;
+	user_ptr_t eip = p->regs.eip;
+	user_ptr_t val;
 	int instsz = 3;
 
 	r = vm_memcpy_from_process(p, &buf, eip + 2, sizeof buf);
 	if (r < 0)
 		return r;
 
-	tls = (unsigned char*) p->vtls[p->vtls_selector].base_addr;
+	tls = p->vtls[p->vtls_selector].base_addr;
 
 	preg = getwreg(p, buf.modrm >> 3);
 
@@ -307,7 +308,7 @@ static int handle_reg_indirect_to_write(struct process *p)
 	if (r < 0)
 		return r;
 
-	p->regs.Eip += instsz;
+	p->regs.eip += instsz;
 
 	return 0;
 }
@@ -315,13 +316,13 @@ static int handle_reg_indirect_to_write(struct process *p)
 static int handle_mem_to_reg_intop(struct process *p, unsigned char op)
 {
 	int r;
-	unsigned char *tls;
+	user_ptr_t tls;
 	struct {
 		uint8_t modrm;
 	} __attribute__((__packed__)) buf;
-	unsigned long *preg;
-	char *eip = (char*) p->regs.Eip;
-	int val;
+	uint32_t *preg;
+	user_ptr_t eip = p->regs.eip;
+	user_ptr_t val;
 	int instsz = 3;
 	unsigned long *source;
 	void *ptr;
@@ -331,7 +332,7 @@ static int handle_mem_to_reg_intop(struct process *p, unsigned char op)
 	if (r < 0)
 		return r;
 
-	tls = (unsigned char*) p->vtls[p->vtls_selector].base_addr;
+	tls = p->vtls[p->vtls_selector].base_addr;
 
 	preg = getwreg(p, buf.modrm >> 3);
 
@@ -346,9 +347,9 @@ static int handle_mem_to_reg_intop(struct process *p, unsigned char op)
 	source = ptr;
 	switch (op)
 	{
-#define ASMOP(op) __asm__ ("\t" #op "l %1, %0; lahf; movb %%ah, (%2)\n" \
+#define ASMOP(op) __asm__ ("\t" #op "l %1, %0; lahf; movzx %%ah, %%eax; mov %%eax, (%2)\n" \
 			: "+r"(*preg) \
-			: "r"(*source), "r"(&p->regs.EFlags) \
+			: "r"(*source), "r"(&p->regs.eflags) \
 			: "eax")
 
 	case 0: ASMOP(add); break;
@@ -364,7 +365,7 @@ static int handle_mem_to_reg_intop(struct process *p, unsigned char op)
 		die("unhandled integer op at %d\n", __LINE__);
 	}
 
-	p->regs.Eip += instsz;
+	p->regs.eip += instsz;
 
 	return 0;
 }
@@ -375,8 +376,8 @@ static int handle_ff_op(struct process *p)
 		uint8_t x;
 		uint32_t offset;
 	} __attribute__((__packed__)) buf;
-	unsigned char *tls;
-	char *eip = (char*) p->regs.Eip;
+	user_ptr_t tls;
+	user_ptr_t eip = p->regs.eip;
 	int r;
 	int instsz = 7;
 
@@ -388,25 +389,24 @@ static int handle_ff_op(struct process *p)
 	{
 		uint32_t val;
 		uint32_t retaddr;
-		uint32_t stack;
+		user_ptr_t stack;
 
-		tls = (unsigned char*) p->vtls[p->vtls_selector].base_addr;
+		tls = p->vtls[p->vtls_selector].base_addr;
 		tls += buf.offset;
 		r = vm_memcpy_from_process(p, &val, tls, sizeof val);
 		if (r < 0)
 			return r;
 
-		retaddr = p->regs.Eip + instsz;
-		stack = p->regs.Esp - 4;
+		retaddr = p->regs.eip + instsz;
+		stack = p->regs.esp - 4;
 
-		// push Eip
-		r = vm_memcpy_to_process(p, (void*)stack,
-					 &retaddr, sizeof retaddr);
+		// push eip
+		r = vm_memcpy_to_process(p, stack, &retaddr, sizeof retaddr);
 		if (r < 0)
 			return r;
 
-		p->regs.Esp = stack;
-		p->regs.Eip = val;
+		p->regs.esp = stack;
+		p->regs.eip = val;
 	}
 	else
 		die("unhandled op: 0x65 0xff 0x%02x\n", buf.x);

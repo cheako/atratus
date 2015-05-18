@@ -60,29 +60,42 @@ struct vt100_filp
 	HANDLE in;
 	HANDLE out;
 	CRITICAL_SECTION cs;
+	CONSOLE_SCREEN_BUFFER_INFO info;
+	bool read_info;
 };
+
+/*
+ * GetConsoleScreenBufferInfo appears to be very slow
+ * Avoid calling it as much as possible.
+ */
+static void vt100_get_info(struct vt100_filp *vt)
+{
+	if (vt->read_info)
+	{
+		GetConsoleScreenBufferInfo(vt->out, &vt->info);
+		vt->read_info = 0;
+	}
+}
 
 static void vt100_get_cursor_pos(struct vt100_filp *vt, int *x, int *y)
 {
-	CONSOLE_SCREEN_BUFFER_INFO info;
-
-	GetConsoleScreenBufferInfo(vt->out, &info);
-	*x = info.dwCursorPosition.X - info.srWindow.Left + 1;
-	*y = info.dwCursorPosition.Y - info.srWindow.Top + 1;
+	vt100_get_info(vt);
+	*x = vt->info.dwCursorPosition.X - vt->info.srWindow.Left + 1;
+	*y = vt->info.dwCursorPosition.Y - vt->info.srWindow.Top + 1;
 }
 
 static int vt100_set_cursor_pos(struct vt100_filp *vt, int x, int y)
 {
 	COORD coord;
-	CONSOLE_SCREEN_BUFFER_INFO info;
 	DWORD height, width;
 	BOOL r;
 
 	dprintf("cursor to %d,%d\n", x, y);
 
-	GetConsoleScreenBufferInfo(vt->out, &info);
-	height = info.srWindow.Bottom - info.srWindow.Top + 1;
-	width = info.srWindow.Right - info.srWindow.Left + 1;
+	vt100_get_info(vt);
+
+	height = vt->info.srWindow.Bottom - vt->info.srWindow.Top + 1;
+	width = vt->info.srWindow.Right - vt->info.srWindow.Left + 1;
 	if (x >= width)
 		x = width;
 	if (y >= height)
@@ -91,12 +104,14 @@ static int vt100_set_cursor_pos(struct vt100_filp *vt, int x, int y)
 		y = 1;
 	if (x < 1)
 		x = 1;
-	coord.X = info.srWindow.Left + x - 1;
-	coord.Y = info.srWindow.Top + y - 1;
+	coord.X = vt->info.srWindow.Left + x - 1;
+	coord.Y = vt->info.srWindow.Top + y - 1;
 	dprintf("cursor at %d,%d\n", coord.X, coord.Y);
 	r = SetConsoleCursorPosition(vt->out, coord);
 	if (!r)
 		dprintf("failed to set cursor\n");
+	vt->info.dwCursorPosition.X = coord.X;
+	vt->info.dwCursorPosition.Y = coord.Y;
 	return 0;
 }
 
@@ -208,17 +223,15 @@ static void vt100_do_cr(struct vt100_filp *vt)
 
 static void vt100_scroll(struct vt100_filp *vt, int up)
 {
-	CONSOLE_SCREEN_BUFFER_INFO info;
 	SMALL_RECT rect;
 	COORD newpos;
 	CHAR_INFO ci;
 	DWORD width;
 	int start, end, target;
 
-	if (!GetConsoleScreenBufferInfo(vt->out, &info))
-		return;
+	vt100_get_info(vt);
 
-	width = info.srWindow.Right - info.srWindow.Left + 1;
+	width = vt->info.srWindow.Right - vt->info.srWindow.Left + 1;
 	if (width > 256)
 	{
 		dprintf("scroll area too wide: %ld\n", width);
@@ -242,19 +255,20 @@ static void vt100_scroll(struct vt100_filp *vt, int up)
 		start, end, target);
 
 	/* select the region to move */
-	rect.Top = info.srWindow.Top + start - 1;
-	rect.Bottom = info.srWindow.Top + end - 1;
-	rect.Left = info.srWindow.Left;
-	rect.Right = info.srWindow.Right;
+	rect.Top = vt->info.srWindow.Top + start - 1;
+	rect.Bottom = vt->info.srWindow.Top + end - 1;
+	rect.Left = vt->info.srWindow.Left;
+	rect.Right = vt->info.srWindow.Right;
 
 	/* select the new place */
-	newpos.X = info.srWindow.Left;
-	newpos.Y = info.srWindow.Top + target - 1;
+	newpos.X = vt->info.srWindow.Left;
+	newpos.Y = vt->info.srWindow.Top + target - 1;
 
 	ci.Char.AsciiChar = ' ';
 	ci.Attributes = vt100_get_attributes(vt);
 	ScrollConsoleScreenBuffer(vt->out, &rect, NULL,
 				 newpos, &ci);
+	vt->read_info = 1;
 }
 
 /* line feed. Go down one line, but not to the start */
@@ -402,6 +416,10 @@ static int vt100_utf8_out(struct vt100_filp *vt, unsigned char ch)
 	if (!r)
 		return -_L(EIO);
 
+	vt->info.dwCursorPosition.X++;
+	if (vt->info.dwCursorPosition.X >= vt->info.srWindow.Right)
+		vt->read_info = 1;
+
 	return 0;
 }
 
@@ -421,19 +439,15 @@ static int vt100_write_normal(struct vt100_filp *vt, unsigned char ch)
 
 static void vt100_save_char(struct vt100_filp *vt)
 {
-	CONSOLE_SCREEN_BUFFER_INFO info;
 	DWORD count;
 	COORD pos;
-	BOOL r;
 
-	r = GetConsoleScreenBufferInfo(vt->out, &info);
-	if (!r)
-		return;
+	vt100_get_info(vt);
 
-	pos = info.dwCursorPosition;
+	pos = vt->info.dwCursorPosition;
 
 	ReadConsoleOutputCharacterW(vt->out, &vt->saved_char, 1,
-					info.dwCursorPosition, &count);
+					vt->info.dwCursorPosition, &count);
 	ReadConsoleOutputAttribute(vt->out, &vt->saved_attr, 1,
 					pos, &count);
 	dprintf("save '%c'\n", (char) vt->saved_char);
@@ -441,16 +455,12 @@ static void vt100_save_char(struct vt100_filp *vt)
 
 static void vt100_restore_char(struct vt100_filp *vt)
 {
-	CONSOLE_SCREEN_BUFFER_INFO info;
 	DWORD count;
 	COORD pos;
-	BOOL r;
 
-	r = GetConsoleScreenBufferInfo(vt->out, &info);
-	if (!r)
-		return;
+	vt100_get_info(vt);
 
-	pos = info.dwCursorPosition;
+	pos = vt->info.dwCursorPosition;
 
 	/* doesn't move cursor ... */
 	WriteConsoleOutputCharacterW(vt->out, &vt->saved_char, 1,
@@ -464,15 +474,14 @@ static void vt100_restore_char(struct vt100_filp *vt)
 static void vt100_device_status(struct vt100_filp *vt, int req)
 {
 	char response[16];
-	CONSOLE_SCREEN_BUFFER_INFO info;
 
 	switch (req)
 	{
 	case 6: /* query cursor position */
-		GetConsoleScreenBufferInfo(vt->out, &info);
+		vt100_get_info(vt);
 		sprintf(response, "\x1b[%d;%dR",
-			info.dwCursorPosition.Y+1,
-			info.dwCursorPosition.X+1);
+			vt->info.dwCursorPosition.Y+1,
+			vt->info.dwCursorPosition.X+1);
 		dprintf("response = %s\n", response+1);
 		tty_input_add_string(&vt->con, response);
 		break;
@@ -484,7 +493,6 @@ static void vt100_device_status(struct vt100_filp *vt, int req)
 
 static void vt100_erase(struct vt100_filp *vt, int mode)
 {
-	CONSOLE_SCREEN_BUFFER_INFO info;
 	COORD pos;
 	DWORD count = 0;
 	WCHAR row[256];
@@ -493,29 +501,22 @@ static void vt100_erase(struct vt100_filp *vt, int mode)
 	int width;
 	int i;
 
-	memset(&info, 0, sizeof info);
+	vt100_get_info(vt);
 
-	if (!GetConsoleScreenBufferInfo(vt->out, &info))
-	{
-		/* this happens if the handle is a file */
-		dprintf("GetConsoleScreenBufferInfo() failed\n");
-		return;
-	}
-
-	pos = info.dwCursorPosition;
+	pos = vt->info.dwCursorPosition;
 
 	switch (mode)
 	{
 	case 0: /* from current to end */
-		width = info.srWindow.Right - pos.X;
+		width = vt->info.srWindow.Right - pos.X;
 		break;
 	case 1: /* from start to current */
-		width = pos.X - info.srWindow.Left;
-		pos.X = info.srWindow.Left;
+		width = pos.X - vt->info.srWindow.Left;
+		pos.X = vt->info.srWindow.Left;
 		break;
 	case 2: /* entire line */
-		width = info.srWindow.Right - info.srWindow.Left + 1;
-		pos.X = info.srWindow.Left;
+		width = vt->info.srWindow.Right - vt->info.srWindow.Left + 1;
+		pos.X = vt->info.srWindow.Left;
 		break;
 	default:
 		dprintf("unknown line erase mode %d\n", mode);
@@ -546,25 +547,24 @@ static void vt100_clear(struct vt100_filp *vt, DWORD length, COORD pos)
 
 static void vt100_erase_screen(struct vt100_filp *vt, int n)
 {
-	CONSOLE_SCREEN_BUFFER_INFO info;
 	COORD pos, top;
 	DWORD width, height;
 
-	GetConsoleScreenBufferInfo(vt->out, &info);
+	vt100_get_info(vt);
 
-	pos = info.dwCursorPosition;
-	top.X = info.srWindow.Left;
-	top.Y = info.srWindow.Top;
+	pos = vt->info.dwCursorPosition;
+	top.X = vt->info.srWindow.Left;
+	top.Y = vt->info.srWindow.Top;
 
-	width = info.srWindow.Right - info.srWindow.Left;
-	height = info.srWindow.Bottom - info.srWindow.Top;
+	width = vt->info.srWindow.Right - vt->info.srWindow.Left;
+	height = vt->info.srWindow.Bottom - vt->info.srWindow.Top;
 
 	switch (n)
 	{
 	case 0:
 		/* erase from cursor to end */
-		vt100_clear(vt, (info.srWindow.Bottom - pos.Y) * width +
-				(info.srWindow.Right - pos.X), pos);
+		vt100_clear(vt, (vt->info.srWindow.Bottom - pos.Y) * width +
+				(vt->info.srWindow.Right - pos.X), pos);
 		break;
 	case 1:
 		/* erase from top to cursor */
@@ -580,41 +580,43 @@ static void vt100_erase_screen(struct vt100_filp *vt, int n)
 
 static void vt100_move_cursor(struct vt100_filp *vt, int delta_x, int delta_y)
 {
-	CONSOLE_SCREEN_BUFFER_INFO info;
 	COORD pos;
 
-	GetConsoleScreenBufferInfo(vt->out, &info);
+	vt100_get_info(vt);
 
-	pos = info.dwCursorPosition;
+	pos = vt->info.dwCursorPosition;
 
 	pos.X += delta_x;
 	pos.Y += delta_y;
 
 	if (pos.X < 0)
 		pos.X = 0;
-	if (pos.X >= info.dwSize.X)
-		pos.X = info.dwSize.X - 1;
+	if (pos.X >= vt->info.dwSize.X)
+		pos.X = vt->info.dwSize.X - 1;
 	if (pos.Y < 0)
 		pos.Y = 0;
-	if (pos.Y >= info.dwSize.Y)
-		pos.Y = info.dwSize.Y - 1;
+	if (pos.Y >= vt->info.dwSize.Y)
+		pos.Y = vt->info.dwSize.Y - 1;
 
 	SetConsoleCursorPosition(vt->out, pos);
+	vt->info.dwCursorPosition.X = pos.X;
+	vt->info.dwCursorPosition.Y = pos.Y;
 }
 
 static void vt100_cursor_home(struct vt100_filp *vt)
 {
-	CONSOLE_SCREEN_BUFFER_INFO info;
 	COORD pos;
 
-	GetConsoleScreenBufferInfo(vt->out, &info);
+	vt100_get_info(vt);
 
-	pos = info.dwCursorPosition;
+	pos = vt->info.dwCursorPosition;
 
-	pos.Y = info.srWindow.Top;
-	pos.X = info.srWindow.Left;
+	pos.Y = vt->info.srWindow.Top;
+	pos.X = vt->info.srWindow.Left;
 
 	SetConsoleCursorPosition(vt->out, pos);
+	vt->info.dwCursorPosition.X = pos.X;
+	vt->info.dwCursorPosition.Y = pos.Y;
 }
 
 static void vt100_screen_alignment(struct vt100_filp *vt)
@@ -652,7 +654,7 @@ static void vt_hide_cursor(struct vt100_filp *vt, int enable)
 {
 	CONSOLE_CURSOR_INFO cci;
 
-	GetConsoleCursorInfo(vt->out, &cci);
+	vt100_get_info(vt);
 	cci.bVisible = enable;
 	SetConsoleCursorInfo(vt->out, &cci);
 }
@@ -736,11 +738,10 @@ static void vt100_identify(struct vt100_filp *vt)
 
 static void vt100_enable_scrolling(struct vt100_filp *vt, int start, int end)
 {
-	CONSOLE_SCREEN_BUFFER_INFO info;
 	int max;
 
-	GetConsoleScreenBufferInfo(vt->out, &info);
-	max = info.srWindow.Bottom - info.srWindow.Top + 1;
+	vt100_get_info(vt);
+	max = vt->info.srWindow.Bottom - vt->info.srWindow.Top + 1;
 
 	/* handle unset case */
 	if (!start)
@@ -856,6 +857,7 @@ static void vt100_reset(struct vt100_filp *vt)
 	vt->saved_char = '?';
 	vt->saved_attr = FOREGROUND_RED;
 	vt->ansi = 1;
+	vt->read_info = 1;
 	vt100_enable_scrolling(vt, 0, 0);
 }
 
@@ -1124,13 +1126,12 @@ static DWORD WINAPI vt100_input_thread(LPVOID param)
 
 static void vt100_get_winsize(struct tty_filp *con, struct winsize *ws)
 {
-	CONSOLE_SCREEN_BUFFER_INFO info;
 	struct vt100_filp *vt= (void*) con;
 
-	GetConsoleScreenBufferInfo(vt->out, &info);
+	vt100_get_info(vt);
 
-	ws->ws_col = info.srWindow.Right - info.srWindow.Left + 1;
-	ws->ws_row = info.srWindow.Bottom - info.srWindow.Top + 1;
+	ws->ws_col = vt->info.srWindow.Right - vt->info.srWindow.Left + 1;
+	ws->ws_row = vt->info.srWindow.Bottom - vt->info.srWindow.Top + 1;
 	ws->ws_xpixel = 0;
 	ws->ws_ypixel = 0;
 
@@ -1182,6 +1183,9 @@ alloc_vt100_console(HANDLE in, HANDLE out, struct process *leader)
 		return NULL;
 	if (!SetConsoleMode(out, ENABLE_PROCESSED_OUTPUT))
 		return NULL;
+
+	vt->read_info = 1;
+	vt100_get_info(vt);
 
 	InitializeCriticalSection(&vt->cs);
 

@@ -29,8 +29,6 @@
 #include <unistd.h>
 #include <sys/fcntl.h>
 
-#define alloca(sz) __builtin_alloca(sz)
-
 #include "linux-errno.h"
 #include "linux-defines.h"
 #include "filp.h"
@@ -50,12 +48,12 @@
 struct elf_module
 {
 	struct filp *fp;
-	void *base;
+	user_ptr_t base;
 	uint32_t min_vaddr;
 	uint32_t max_vaddr;
 	Elf32_Ehdr ehdr;
 	Elf32_Shdr *shdr;
-	void *entry_point;
+	user_ptr_t entry_point;
 	int num_to_load;
 	Elf32_Phdr to_load[8];
 	char interpreter[0x40];	/* usually /lib/ld-linux.so.2 */
@@ -85,10 +83,10 @@ static int auxv_count(Elf32Aux *aux)
 	return n;
 }
 
-int elf_alloc_vdso(struct process *proc, void **vdso)
+int elf_alloc_vdso(struct process *proc, user_ptr_t *vdso)
 {
 	int r;
-	void *addr = NULL;
+	user_ptr_t addr;
 	size_t sz = 0x1000;
 	uint8_t code[] = {0xcd, 0x80, 0xc3};
 
@@ -109,7 +107,7 @@ int elf_alloc_vdso(struct process *proc, void **vdso)
 	if (r < 0)
 		return r;
 
-	dprintf("VDSO constructed at %p\n", addr);
+	dprintf("VDSO constructed at %08x\n", addr);
 
 	return 0;
 }
@@ -129,7 +127,7 @@ int elf_alloc_vdso(struct process *proc, void **vdso)
 	NULL
 */
 int elf_stack_setup(struct process *context,
-		void *stack, size_t stack_size,
+		user_ptr_t stack, size_t stack_size,
 		char **argv, char **env,
 		struct elf_module *m,
 		struct elf_module *interp)
@@ -138,25 +136,22 @@ int elf_stack_setup(struct process *context,
 	int n = 0;
 	int i;
 	char *p;
-	void **init_stack;
+	user_ptr_t *init_stack;
 	int pointer_space;
 	int string_space;
 	int offset;
-	unsigned char *addr;
+	user_ptr_t addr;
 	size_t sz;
 	int r;
-	void *vdso = NULL;
-	void *entry_point;
+	user_ptr_t vdso = 0;
 
 	r = elf_alloc_vdso(context, &vdso);
 	if (r < 0)
 		return r;
 
-	entry_point = (void*) m->base - m->min_vaddr + m->ehdr.e_entry;
-
 	memset(&aux, 0, sizeof aux);
 	aux[n].a_type = AT_PHDR;
-	aux[n++].a_value = (int)&((BYTE*)m->base)[m->ehdr.e_phoff];
+	aux[n++].a_value = m->base + m->ehdr.e_phoff;
 	aux[n].a_type = AT_PHENT;
 	aux[n++].a_value = sizeof (Elf32_Phdr);
 	aux[n].a_type = AT_PHNUM;
@@ -186,14 +181,14 @@ int elf_stack_setup(struct process *context,
 	aux[n++].a_value = (int) vdso;
 	assert(n <= sizeof aux/sizeof aux[0]);
 
-	dprintf("entry is %p\n", m->entry_point);
+	dprintf("entry is %08x\n", m->entry_point);
 
 	/* entry, &argc, argv[0..argc-1], NULL, env[0..], NULL, auxv[0..], NULL */
 	int argc = strv_count(argv);
 	pointer_space = (5 + argc
 			   + strv_count(env)
 			   + auxv_count(aux)*2);
-	pointer_space *= sizeof (void*);
+	pointer_space *= sizeof (user_ptr_t*);
 
 	/* env space rounded */
 	string_space = (strv_length(argv) + strv_length(env) + 3) & ~3;
@@ -210,43 +205,43 @@ int elf_stack_setup(struct process *context,
 	n = 0;
 
 	/* base address on local heap */
-	init_stack = (void**) p;
+	init_stack = (user_ptr_t*) p;
 
 	/* base address in client address space */
-	addr = (BYTE*) stack + stack_size - (pointer_space + string_space);
+	addr = stack + stack_size - (pointer_space + string_space);
 
 	/* offset from base address */
 	offset = pointer_space;
 
 	/* copy argc, argv arrays onto the allocated memory */
-	init_stack[n++] = (void*) argc;
+	init_stack[n++] = argc;
 	for (i = 0; argv[i]; i++)
 	{
-		dprintf("adding arg %s at %p\n", argv[i], &addr[offset]);
-		init_stack[n++] = &addr[offset];
+		dprintf("adding arg %s at %08x\n", argv[i], addr + offset);
+		init_stack[n++] = addr + offset;
 		strcpy(&p[offset], argv[i]);
 		offset += strlen(argv[i]) + 1;
 	}
-	init_stack[n++] = NULL;
+	init_stack[n++] = 0;
 
 	/* gcc optimizes out these assignments if volatile is not used */
 	for (i = 0; env[i]; i++)
 	{
-		dprintf("adding env %s at %p\n", env[i], &addr[offset]);
-		init_stack[n++] = &addr[offset];
+		dprintf("adding env %s at %08x\n", env[i], addr + offset);
+		init_stack[n++] = addr + offset;
 		strcpy(&p[offset], env[i]);
 		offset += strlen(env[i]) + 1;
 	}
-	init_stack[n++] = NULL;
+	init_stack[n++] = 0;
 
 	/* set the auxilary vector */
 	for (i = 0; aux[i].a_type; i++)
 	{
-		init_stack[n++] = (void*) aux[i].a_type;
-		init_stack[n++] = (void*) aux[i].a_value;
+		init_stack[n++] = aux[i].a_type;
+		init_stack[n++] = aux[i].a_value;
 	}
 
-	init_stack[n++] = NULL;
+	init_stack[n++] = 0;
 
 	sz = (pointer_space + string_space);
 	r = vm_memcpy_to_process(context, addr, p, sz);
@@ -257,14 +252,14 @@ int elf_stack_setup(struct process *context,
 		return r;
 	}
 
-	context->regs.Esp = (ULONG) addr;
-	context->regs.Eax = 0;
-	context->regs.Ebx = 0;
-	context->regs.Ecx = 0;
-	context->regs.Edx = 0;
-	context->regs.Esi = 0;
-	context->regs.Edi = 0;
-	context->regs.Ebp = 0;
+	context->regs.esp = addr;
+	context->regs.eax = 0;
+	context->regs.ebx = 0;
+	context->regs.ecx = 0;
+	context->regs.edx = 0;
+	context->regs.esi = 0;
+	context->regs.edi = 0;
+	context->regs.ebp = 0;
 
 	return 0;
 }
@@ -347,19 +342,19 @@ int elf_object_map(struct process *proc, struct elf_module *m)
 	dprintf("vaddr -> %08x-%08x\n", m->min_vaddr, m->max_vaddr);
 
 	/* reserve memory for image */
-	m->base = vm_process_map(proc, (void*)m->min_vaddr, m->max_vaddr - m->min_vaddr,
+	m->base = vm_process_map(proc, m->min_vaddr, m->max_vaddr - m->min_vaddr,
 			_l_PROT_NONE, _l_MAP_ANONYMOUS|_l_MAP_PRIVATE, NULL, 0);
 	if (m->base == _l_MAP_FAILED)
 	{
 		dprintf("mmap failed\n");
 		goto error;
 	}
-	dprintf("base = %p\n", m->base);
+	dprintf("base = %08x\n", m->base);
 
 	for (i = 0; i < m->num_to_load; i++)
 	{
 		int mapflags = elf_mmap_flags_get(m->to_load[i].p_flags);
-		void *p;
+		user_ptr_t p;
 		unsigned int vaddr = round_down_to_page(m->to_load[i].p_vaddr);
 		unsigned int vaddr_offset = (m->to_load[i].p_vaddr & pagemask);
 		unsigned int memsz = round_up_to_page(vaddr_offset + m->to_load[i].p_memsz);
@@ -369,9 +364,9 @@ int elf_object_map(struct process *proc, struct elf_module *m)
 
 		elf_map_flags_print(mapflags);
 
-		p = (void*)(m->base - m->min_vaddr + vaddr);
+		p = m->base - m->min_vaddr + vaddr;
 
-		dprintf("map at %p, offset %08x sz %08x\n", p, vaddr, memsz);
+		dprintf("map at %08x, offset %08x sz %08x\n", p, vaddr, memsz);
 		/*
 		 * Map anonymous memory then read the data in
 		 * rather than mapping the file directly.
@@ -390,8 +385,8 @@ int elf_object_map(struct process *proc, struct elf_module *m)
 			goto error;
 		}
 
-		p = (void*)(m->base - m->min_vaddr + m->to_load[i].p_vaddr);
-		dprintf("pread %08x bytes from %08x to %p\n",
+		p = m->base - m->min_vaddr + m->to_load[i].p_vaddr;
+		dprintf("pread %08x bytes from %08x to %08x\n",
 			m->to_load[i].p_filesz, m->to_load[i].p_offset, p);
 
 		r = vm_get_pointer(proc, p, &ptr, &max_sz);
@@ -419,7 +414,7 @@ int elf_object_map(struct process *proc, struct elf_module *m)
 		dprintf("brk at %08x\n", proc->brk);
 	}
 
-	m->entry_point = (void*) m->base - m->min_vaddr + m->ehdr.e_entry;
+	m->entry_point = m->base - m->min_vaddr + m->ehdr.e_entry;
 
 	return 0;
 error:

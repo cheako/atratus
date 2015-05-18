@@ -17,8 +17,9 @@
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
 #
 
-CFLAGS = -Wall -fno-stack-protector
-CFLAGS = -Wall -O2
+CFLAGS += -Wall -fno-stack-protector
+CFLAGS += -O2
+CFLAGS += -m32
 CC = gcc
 
 TARGETS = \
@@ -58,7 +59,8 @@ all: $(TARGETS)
 
 # dynamicly linked with libc
 %: %.c
-	$(CC) $(CFLAGS) -o $@ $<
+	@echo lin32 cc $<
+	@$(CC) $(CFLAGS) -o $@ $<
 
 clean:
 	rm -f $(TARGETS) *.o

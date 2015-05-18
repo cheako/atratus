@@ -58,7 +58,7 @@ static void pipe_wait_change(struct pipe_buffer *pb)
 	LIST_REMOVE(&pb->wl, &we, item);
 }
 
-static int pipe_read(struct filp *f, void *buf, size_t size, loff_t *off, int block)
+static int pipe_read(struct filp *f, void *buf, user_size_t size, loff_t *off, int block)
 {
 	struct pipe_filp *pfp = (void*) f;
 	struct pipe_buffer *pb = pfp->pb;
@@ -113,7 +113,7 @@ static int pipe_read(struct filp *f, void *buf, size_t size, loff_t *off, int bl
 	return bytesCopied;
 }
 
-static int pipe_write(struct filp *f, const void *buf, size_t size, loff_t *off, int block)
+static int pipe_write(struct filp *f, const void *buf, user_size_t size, loff_t *off, int block)
 {
 	struct pipe_filp *pfp = (void*) f;
 	struct pipe_buffer *pb = pfp->pb;
@@ -122,7 +122,6 @@ static int pipe_write(struct filp *f, const void *buf, size_t size, loff_t *off,
 	while (size && current->state != thread_terminated)
 	{
 		int sz;
-		int r;
 		int space = sizeof pb->buffer - pb->available;
 		int pos = (pb->head + pb->available) % sizeof pb->buffer;
 
@@ -145,13 +144,7 @@ static int pipe_write(struct filp *f, const void *buf, size_t size, loff_t *off,
 		if (pos + sz > sizeof pb->buffer)
 			sz = sizeof pb->buffer - pos;
 
-		r = current->ops->memcpy_from(&pb->buffer[pos], buf, sz);
-		if (r < 0)
-		{
-			if (bytesCopied)
-				break;
-			return -_L(EFAULT);
-		}
+		memcpy(&pb->buffer[pos], buf, sz);
 
 		bytesCopied += sz;
 		buf = (char*) buf + sz;

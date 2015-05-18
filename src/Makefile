@@ -17,20 +17,45 @@
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
 #
 
-CFLAGS = -Wall -fno-stack-protector
-CFLAGS += -Wall -O2
-CFLAGS += -fno-builtin
-CFLAGS += -I../include
-CFLAGS += -Wp,-MD,.$@.d -Wp,-MT,$@
+MWCFLAGS += -Wall -fno-stack-protector
+MWCFLAGS += -Wall -O2
+MWCFLAGS += -fno-builtin
+MWCFLAGS += -I../include
+MWCFLAGS += -Wp,-MD,.$@.d -Wp,-MT,$@
 
-MINGWCC = i586-mingw32msvc-gcc
-WINDRES = i586-mingw32msvc-windres
-NATIVEEXEFLAGS = -lntdll -nostartfiles -nodefaultlibs -Wl,--subsystem=native -e __entry
+have_ming32 := $(shell i586-mingw32msvc-gcc -v 2> /dev/null ; echo $$?)
+have_ming64 := $(shell x86_64-w64-mingw32-gcc -v 2> /dev/null ; echo $$?)
 
-all: atratus.exe cygsymlink.exe linux.exe
+MWCFLAGS32 += $(MWCFLAGS)
+MWCFLAGS32 += -m32
+MINGWCC32 = i586-mingw32msvc-gcc
+WINDRES32 = i586-mingw32msvc-windres
+NATIVEEXEFLAGS32 = -lntdll -nostartfiles -nodefaultlibs -Wl,--subsystem=native -e _entry
 
-%.pe.o: %.c
-	$(MINGWCC) -DNT $(CFLAGS) -c -o $@ $<
+MWCFLAGS64 += $(MWCFLAGS)
+MINGWCC64 = x86_64-w64-mingw32-gcc
+WINDRES64 = x86_64-w64-mingw32-windres
+NATIVEEXEFLAGS64 = -lntdll -nostartfiles -nodefaultlibs -Wl,--subsystem=native -e _entry
+
+TARGETS := cygsymlink.exe linux.exe
+
+ifeq ($(have_ming32),0)
+TARGETS += atratus.exe
+endif
+
+ifeq ($(have_ming64),0)
+TARGETS += atratus64.exe
+endif
+
+all: $(TARGETS)
+
+%.pe32.o: %.c
+	@echo win32 cc $<
+	@$(MINGWCC32) -DNT $(MWCFLAGS32) -c -o $@ $<
+
+%.pe64.o: %.c
+	@echo win64 cc $<
+	@$(MINGWCC64) -DNT $(MWCFLAGS64) -c -o $@ $<
 
 ATRATUS_SRCS = \
 	atratus.c \
@@ -56,26 +81,41 @@ STUB_SRCS = \
 CYGSYMLINK_SRCS = \
 	cygsymlink.c
 
-ATRATUS_OBJECTS = $(ATRATUS_SRCS:.c=.pe.o)
-STUB_OBJECTS = $(STUB_SRCS:.c=.pe.o)
-CYGSYMLINK_OBJECTS = $(CYGSYMLINK_SRCS:.c=.pe.o)
+ATRATUS32_OBJECTS = $(ATRATUS_SRCS:.c=.pe32.o)
+ATRATUS64_OBJECTS = $(ATRATUS_SRCS:.c=.pe64.o)
+STUB_OBJECTS = $(STUB_SRCS:.c=.pe32.o)
+CYGSYMLINK_OBJECTS = $(CYGSYMLINK_SRCS:.c=.pe32.o)
 
-OBJECTS = $(ATRATUS_OBJECTS) $(STUB_OBJECTS)
+OBJECTS = $(ATRATUS32_OBJECTS) $(ATRATUS64_OBJECTS) $(STUB_OBJECTS) $(CYGSYMLINK_OBJECTS)
 
 -include $(OBJECTS:%=$(dir %).$(notdir %).d)
 
-%.res: %.rc
-	$(WINDRES) -i $< -o $@ -O coff
+%64.res: %.rc
+	@echo win64 wr $<
+	@$(WINDRES64) -i $< -o $@ -O coff
 
-atratus.exe: $(ATRATUS_OBJECTS) atratus.res
-	$(MINGWCC) -o $@ $^ -lntdll -lkernel32 -lpsapi -lws2_32
+%32.res: %.rc
+	@echo win32 wr $<
+	@$(WINDRES32) -i $< -o $@ -O coff
+
+atratus.exe: $(ATRATUS32_OBJECTS) atratus32.res
+	@echo win32 ld $@
+	@$(MINGWCC32) -o $@ $^ -lntdll -lkernel32 -lpsapi -lws2_32 -liphlpapi
+
+atratus64.exe: $(ATRATUS64_OBJECTS) atratus64.res
+	@echo win64 ld $@
+	@$(MINGWCC64) -o $@ $^ -lntdll -lkernel32 -lpsapi -lws2_32 -liphlpapi
+
 
 # a stub called linux so the task manager shows something sensible
 linux.exe: $(STUB_OBJECTS)
-	$(MINGWCC) -static -o $@ $^ $(NATIVEEXEFLAGS)
+	@echo win32 ld $@
+	@$(MINGWCC32) -static -o $@ $^ $(NATIVEEXEFLAGS32)
 
 cygsymlink.exe: $(CYGSYMLINK_OBJECTS)
-	$(MINGWCC) -static -o $@ $^ -lntdll -lkernel32
+	@echo win32 ld $@
+	@$(MINGWCC32) -static -o $@ $^ -lntdll -lkernel32
 
 clean:
-	rm -f atratus.exe cygsymlink.exe linux.exe *.pe.o .*.pe.o.d *.res
+	@echo clean
+	@rm -f $(TARGETS) $(OBJECTS) .*.o.d *.res

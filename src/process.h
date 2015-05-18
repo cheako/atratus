@@ -33,12 +33,6 @@
 #define MAX_FDS 100
 #define MAX_VTLS_ENTRIES 10
 
-struct process_ops
-{
-	int (*memcpy_from)(void *local_addr, const void *client_addr, size_t size);
-	int (*memcpy_to)(void *client_addr, const void *local_addr, size_t size);
-};
-
 struct user_desc {
 	unsigned int entry_number;
 	unsigned int base_addr;
@@ -56,7 +50,6 @@ typedef enum {
 	thread_ready,
 	thread_stopped,
 	thread_terminated,
-	thread_interrupted,
 } thread_state;
 
 struct fdinfo
@@ -65,15 +58,7 @@ struct fdinfo
 	int flags;
 };
 
-struct vm_mapping
-{
-	LIST_ELEMENT(struct vm_mapping, item);
-	void			*address;
-	size_t			size;
-	uint64_t		offset;
-	int			protection[];
-};
-
+struct vm_mapping;
 struct vm_mapping_list
 {
 	struct vm_mapping	*head, *tail;
@@ -85,18 +70,27 @@ struct sigqueue
 	int signal;
 };
 
+enum wake_reason_t
+{
+	wake_bad = 0,
+	wake_exception = 1,
+	wake_break_in = 2,
+};
+
 struct process
 {
-	struct process_ops		*ops;
 	HANDLE				process;
 	HANDLE				thread;
-	CONTEXT				regs;
+	enum wake_reason_t		wake_reason;
+	EXCEPTION_RECORD		exception;
+	CONTEXT				winctx;
+	struct _L(ucontext)		regs;
 	int                             uid;
 	int                             gid;
 	int                             euid;
 	int                             egid;
 	struct process			*leader;
-	int				brk;
+	user_ptr_t			brk;
 	unsigned int			vtls_selector;
 	unsigned int			vtls_entries;
 	struct user_desc		vtls[MAX_VTLS_ENTRIES];
@@ -140,13 +134,11 @@ struct timeout
 	void (*fn)(struct timeout *t);
 };
 
-struct timespec;
-
 extern void timeout_add(struct timeout *t);
 extern void tv_from_ms(struct timeval *t, int ms);
 extern void timeout_add_ms(struct timeout *t, int ms);
 extern void timeout_add_tv(struct timeout *t, struct timeval *ts);
-extern void timeout_add_timespec(struct timeout *t, struct timespec *ts);
+extern void timeout_add_timespec(struct timeout *t, struct _L(timespec) *ts);
 extern void timeout_remove(struct timeout *t);
 extern void timeout_now(struct timeval *tv);
 

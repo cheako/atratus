@@ -48,7 +48,7 @@ static int proc_stat(struct filp *fp, struct stat64 *statbuf)
 	return 0;
 }
 
-static int proc_getdents(struct filp *fp, void *de,
+static int proc_getdents(struct filp *fp, user_ptr_t de,
 			unsigned int count, fn_add_dirent add_de)
 {
 	struct procfs_filp *pfp = (void*) fp;

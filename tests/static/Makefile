@@ -19,7 +19,8 @@
 
 all:
 
-CFLAGS = -Wall -fno-stack-protector
+CFLAGS += -Wall -fno-stack-protector
+CFLAGS += -m32
 CC = gcc
 
 TARGETS = \
@@ -49,7 +50,8 @@ all: $(TARGETS)
 
 # no libc
 %: %.c
-	$(CC) $(CFLAGS) -o $@ -static -nostartfiles -nodefaultlibs $<
+	@echo lin32 cc $<
+	@$(CC) $(CFLAGS) -o $@ -static -nostartfiles -nodefaultlibs $<
 
 clean:
 	rm -f $(TARGETS) *.o

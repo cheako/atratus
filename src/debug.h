@@ -28,17 +28,26 @@
 		(void) _sa; \
 	} while(0)
 
-#include <windows.h>
+#include "linux-defines.h"
 
 void die(const char *fmt, ...) __attribute__((format(printf,1,2), noreturn));
 int dprintf(const char *fmt, ...) __attribute__((format(printf,1,2)));
 void debug_set_file(const char *filename);
 void debug_set_verbose(int val);
+int debug_get_verbose(void);
 void debug_init(void);
 void debug_line_dump(void *p, unsigned int len);
 void debug_mem_dump(void *p, size_t len);
-void debug_dump_regs(CONTEXT *regs);
+void debug_dump_regs(struct _L(ucontext) *regs);
+void debug_log_regs(struct _L(ucontext) *regs);
 struct process;
 void debug_backtrace(struct process *context);
+
+static inline uint64_t debug_get_timestamp(void)
+{
+	uint64_t t;
+	__asm__ __volatile__ ("\trdtsc\n" :"=A"(t):);
+	return t;
+}
 
 #endif /* __ATRATUS_DEBUG_H__ */

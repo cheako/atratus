@@ -1,12 +1,21 @@
 #ifndef __LINUX_ABI_H__
 #define __LINUX_ABI_H__
 
+#include <stdint.h>
+#include "usertypes.h"
+
 #ifndef PACKED
 #define PACKED __attribute__((__packed__))
 #endif
 
+/* avoid any possible conflicts with mingw windows headers */
+#define _L(err) _l_##err
+
+#define L_ERROR_PTR(x) ((void*)(intptr_t) -_l_##x)
+#define L_PTR_ERROR(x) ((((intptr_t)x) > -80 && (((intptr_t)x) < 0)) ? (intptr_t) x : 0)
+
 /* _l_ prefix is for Linux kernel ABI stuff */
-#define _l_MAP_FAILED ((void*)-1)
+#define _l_MAP_FAILED (-1)
 
 #define _l_FD_SETSIZE 1024
 
@@ -42,8 +51,8 @@
 #define _l_SIGTTIN (21)
 #define _l_SIGTTOU (22)
 
-#define _l_SIG_IGN ((void*) 1)
-#define _l_SIG_DFL ((void*) 0)
+#define _l_SIG_IGN ((user_ptr_t) 1)
+#define _l_SIG_DFL ((user_ptr_t) 0)
 
 #define _l_SA_NOCLDSTOP (1 << 0)
 #define _l_SA_NOCLDWAIT (1 << 1)
@@ -117,6 +126,7 @@
 
 #define _l_SOCK_STREAM 1
 #define _l_SOCK_DGRAM 2
+#define _l_SOCK_RAW 3
 
 #define _l_SOL_SOCKET 1
 
@@ -141,7 +151,9 @@
 #define _l_TCP_MAXSEG 2
 #define _l_TCP_CORK 3
 
+/* IPPROTO values are defined by IP, not the OS */
 #define _l_IPPROTO_IP 0
+#define _l_IPPROTO_ICMP 1
 #define _l_IPPROTO_TCP 6
 #define _l_IPPROTO_UDP 17
 
@@ -169,6 +181,7 @@
 #define TCSETSF   0x5404
 #define TCSETAW   0x5407
 #define TCFLUSH   0x540b
+#define _l_FIONREAD  0x541b
 
 #define VERASE 2
 #define VINTR 0
@@ -225,8 +238,8 @@
 #define NCCS 19
 
 struct iovec {
-	void *iov_base;
-	size_t iov_len;
+	uint32_t iov_base;
+	uint32_t iov_len;
 };
 
 struct termios
@@ -246,13 +259,11 @@ struct winsize {
 	unsigned short	ws_ypixel;
 };
 
-#ifdef WIN32
-struct timespec
+struct _l_timespec
 {
 	unsigned int tv_sec;
 	long tv_nsec;
 };
-#endif
 
 struct fdset
 {
@@ -324,9 +335,9 @@ struct linux_dirent64 {
 typedef unsigned long l_sigset_t;
 
 struct l_sigaction {
-	void *sa_handler;
+	uint32_t sa_handler;
 	unsigned long sa_flags;
-	void *sa_restorer;
+	uint32_t sa_restorer;
 	l_sigset_t sa_mask;
 } PACKED;
 
@@ -413,5 +424,31 @@ struct l_siginfo_t {
          "S"(a4),			\
          "D"(a5)			\
 	:"memory")
+
+struct _l_ucontext
+{
+	uint16_t gs;
+	uint16_t fs;
+	uint16_t es;
+	uint16_t ds;
+	uint32_t edi;
+	uint32_t esi;
+	uint32_t ebp;
+	uint32_t esp;
+	uint32_t ebx;
+	uint32_t edx;
+	uint32_t ecx;
+	uint32_t eax;
+	uint32_t trapno;
+	uint32_t err;
+	uint32_t eip;
+	uint16_t cs;
+	uint32_t eflags;
+	uint32_t esp_at_signal;
+	uint16_t ss;
+	user_ptr_t fpustate;
+	uint32_t oldmask;
+	uint32_t cr2;
+};
 
 #endif

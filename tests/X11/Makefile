@@ -17,8 +17,9 @@
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
 #
 
-CFLAGS = -Wall -fno-stack-protector
-CFLAGS = -Wall -O2
+CFLAGS += -fno-stack-protector
+CFLAGS += -Wall -O2
+CFLAGS += -m32
 CC = gcc
 
 TARGETS = \

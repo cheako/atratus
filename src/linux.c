@@ -19,9 +19,12 @@
  *
  */
 
-unsigned int __stdcall NtTerminateProcess(void *,unsigned int);
-
-void _entry(void)
-{
-	NtTerminateProcess((void*)~0, 0x01234567);
-}
+__asm__ (
+"\n"
+".global _entry\n"
+"_entry:\n"
+	"\tpop %eax\n"
+	"\tmov %ax, %gs\n"
+	"\tpop %eax\n"
+	"\tret"
+);

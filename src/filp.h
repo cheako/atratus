@@ -26,16 +26,14 @@
 #include <stdbool.h>
 
 #include "linux-defines.h"
-
-#define L_ERROR_PTR(x) ((void*) -_L(x))
-#define L_PTR_ERROR(x) ((((unsigned int)x) > 0xffffff80U) ? (int) x : 0)
+#include "usertypes.h"
 
 typedef int64_t loff_t;
 
 typedef struct _poll_list poll_list;
 struct filp;
 
-typedef int (*fn_add_dirent)(void *, const char* entry, size_t entrylen,
+typedef int (*fn_add_dirent)(user_ptr_t, const char* entry, size_t entrylen,
 			int avail, unsigned long dirofs,
 			char type, unsigned long ino);
 typedef void (*fn_wake)(struct filp *f, void *arg);
@@ -43,11 +41,11 @@ typedef void (*fn_wake)(struct filp *f, void *arg);
 struct wait_entry;
 
 struct filp_ops {
-	int (*fn_read)(struct filp *f, void *buf, size_t size, loff_t *ofs, int block);
-	int (*fn_write)(struct filp *f, const void *buf, size_t size, loff_t *ofs, int block);
+	int (*fn_read)(struct filp *f, void *buf, user_size_t size, loff_t *ofs, int block);
+	int (*fn_write)(struct filp *f, const void *buf, user_size_t size, loff_t *ofs, int block);
 	int (*fn_stat)(struct filp *f, struct stat64 *statbuf);
 	int (*fn_ioctl)(struct filp *f, int cmd, unsigned long arg);
-	int (*fn_getdents)(struct filp *f, void *de, unsigned int count, fn_add_dirent fn);
+	int (*fn_getdents)(struct filp *f, user_ptr_t de, unsigned int count, fn_add_dirent fn);
 	int (*fn_poll)(struct filp *f);
 	void (*fn_poll_add)(struct filp *f, struct wait_entry *we);
 	void (*fn_poll_del)(struct filp *f, struct wait_entry *we);

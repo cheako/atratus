@@ -1,5 +1,18 @@
 Announcement & Release notes
 
+Tue Aug 20 06:51:22 EST 2013
+0.12 - August release
+
+ - support x86-64 Windows
+ - build on x86-64 Debian/Linux
+
+Fri Jul 19 13:55:12 EST 2013
+0.11 - July release
+
+ - make DNS lookups work
+ - build on AMD64
+ - improve vt100 speed
+
 Sun Jun 16 21:51:41 EST 2013
 0.10 - June release
 

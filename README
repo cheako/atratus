@@ -19,7 +19,8 @@ WHAT WORKS?
     2) open the atratus-v0.X-bin directory
     3) double click on one of the batch files (e.g. vitetris.bat)
 
-* Some busybox programs, robotfindskitten, vitetris, some BSD games
+* Some busybox programs, robotfindskitten, vitetris, some BSD games,
+    dropbear's ssh client (dbclient)
 
 
 LIMITATIONS?
@@ -55,7 +56,7 @@ TECHNICAL DETAILS?
 
 BUILD INSTRUCTIONS
 
-This software should build on Ubuntu 12.04 LTS (x86)
+This software should build on Ubuntu 12.04 LTS (x86) and Debian Wheezy (AMD64)
 
 * apt-get install gcc-mingw32 build-essential libx11-dev
 * run "make" in the top level directory

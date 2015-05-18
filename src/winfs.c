@@ -38,7 +38,7 @@ struct winfs_filp
 	int dir_count;
 };
 
-BOOL WINAPI GetFileSizeEx(HANDLE handle, PLARGE_INTEGER Size);
+BOOL WINAPI GetFileSizeEx(HANDLE handle, PLARGE_INTEGER Size) __attribute__((dllimport));
 
 static const char symlink_magic[] = {
 	'!', '<', 's','y','m','l','i','n','k', '>'
@@ -322,26 +322,17 @@ static NTAPI void winfs_dir_read_complete(PVOID ptr, PIO_STATUS_BLOCK iosb, ULON
 	ready_list_add(ctx->p);
 }
 
-static int winfs_getdents(struct filp *fp, void *de, unsigned int count, fn_add_dirent add_de)
+static int winfs_getdents(struct filp *fp, user_ptr_t de,
+			unsigned int count, fn_add_dirent add_de)
 {
 	struct winfs_filp *wfp = (void*) fp;
 	int ofs = 0;
 	int r;
-	unsigned char *p = (unsigned char*) de;
 	NTSTATUS ret;
 	IO_STATUS_BLOCK iosb;
 	BYTE buffer[0x1000];
 	FILE_DIRECTORY_INFORMATION *info;
-	WCHAR star[] = { '*' };
-	UNICODE_STRING mask;
 	ULONG EntryOffset;
-
-	mask.Length = sizeof star;
-	mask.MaximumLength = 0;
-	mask.Buffer = star;
-
-	if (count < sizeof *de)
-		return -_L(EINVAL);
 
 	while (1)
 	{
@@ -354,7 +345,7 @@ static int winfs_getdents(struct filp *fp, void *de, unsigned int count, fn_add_
 		ret = NtQueryDirectoryFile(wfp->handle, NULL,
 			&winfs_dir_read_complete, &ctx, &iosb,
 			buffer, sizeof buffer,
-			FileDirectoryInformation, 0, NULL /*&mask*/, wfp->dir_count == 0);
+			FileDirectoryInformation, 0, NULL, wfp->dir_count == 0);
 		if (ret == STATUS_PENDING)
 		{
 			schedule();
@@ -403,8 +394,7 @@ static int winfs_getdents(struct filp *fp, void *de, unsigned int count, fn_add_
 			if (inode == 0)
 				inode = wfp->dir_count + 1000;
 
-			de = (struct linux_dirent*)&p[ofs];
-			r = add_de(de, name, len, count - ofs,
+			r = add_de(de + ofs, name, len, count - ofs,
 				info->NextEntryOffset ? ++wfp->dir_count : INT_MAX,
 				type, inode);
 			if (r < 0)
@@ -419,7 +409,7 @@ static int winfs_getdents(struct filp *fp, void *de, unsigned int count, fn_add_
 	return ofs;
 }
 
-static int winfs_read(struct filp *fp, void *buf, size_t size, loff_t *ofs, int block)
+static int winfs_read(struct filp *fp, void *buf, user_size_t size, loff_t *ofs, int block)
 {
 	struct winfs_filp *wfp = (void*) fp;
 	int bytesCopied = 0;
@@ -485,71 +475,41 @@ static int winfs_read(struct filp *fp, void *buf, size_t size, loff_t *ofs, int 
 	return bytesCopied;
 }
 
-static int winfs_write(struct filp *fp, const void *buf, size_t size, loff_t *ofs, int block)
+static int winfs_write(struct filp *fp, const void *buffer, user_size_t size, loff_t *ofs, int block)
 {
 	struct winfs_filp *wfp = (void*) fp;
-	DWORD bytesCopied = 0;
+	OVERLAPPED ov;
+	DWORD bytesWritten = 0;
+	NTSTATUS r;
 
-	while (size)
+	memset(&ov, 0, sizeof ov);
+	ov.OffsetHigh = (*ofs >> 32);
+	ov.Offset = (*ofs & 0xffffffff);
+
+	r = WriteFile(wfp->handle, buffer, size, &bytesWritten, &ov);
+	if (!r)
 	{
-		OVERLAPPED ov;
-		ULONG sz;
-		DWORD bytesWritten;
-		NTSTATUS r;
-		void *ptr = NULL;
-		size_t max_size = 0;
-
-		r = vm_get_pointer(current, buf, &ptr, &max_size);
-		if (r < 0)
+		DWORD err = GetLastError();
+		if (err == ERROR_IO_PENDING)
 		{
-			if (bytesCopied)
-				break;
-			return -_L(EFAULT);
-		}
-
-		sz = size;
-		if (sz > max_size)
-			sz = max_size;
-
-		memset(&ov, 0, sizeof ov);
-		ov.OffsetHigh = (*ofs >> 32);
-		ov.Offset = (*ofs & 0xffffffff);
-
-		bytesWritten = 0;
-		r = WriteFile(wfp->handle, ptr, sz, &bytesWritten, &ov);
-		if (!r)
-		{
-			DWORD err = GetLastError();
-			if (err == ERROR_IO_PENDING)
-			{
-				if (!GetOverlappedResult(wfp->handle, &ov,
-							&bytesWritten, TRUE))
-				{
-					dprintf("WriteFile failed (%ld) at %d\n",
-						err, __LINE__);
-					return -_L(EIO);
-				}
-
-			}
-			else
+			if (!GetOverlappedResult(wfp->handle, &ov,
+						&bytesWritten, TRUE))
 			{
 				dprintf("WriteFile failed (%ld) at %d\n",
 					err, __LINE__);
 				return -_L(EIO);
 			}
+
 		}
-
-		/* move along */
-		bytesCopied += bytesWritten;
-		size -= bytesWritten;
-		buf = (char*) buf + bytesWritten;
-		(*ofs) += bytesWritten;
-
-		if (bytesWritten != sz)
-			break;
+		else
+		{
+			dprintf("WriteFile failed (%ld) at %d\n",
+				err, __LINE__);
+			return -_L(EIO);
+		}
 	}
 
-	return bytesCopied;
+	return bytesWritten;
 }
 
 static void winfs_close(struct filp *fp)
@@ -1041,7 +1001,7 @@ static struct filp *winfs_openat(struct filp *fp, const char *file, int flags,
 
 	r = winfs_getname(fp, &name);
 	if (r < 0)
-		return (void*)r;
+		return (void*)(intptr_t)r;
 
 	len = strlen(name) + 1 + strlen(file) + 1;
 

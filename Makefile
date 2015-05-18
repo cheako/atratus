@@ -18,17 +18,25 @@
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
 #
 
+have_ming32 := $(shell i586-mingw32msvc-gcc -v 2> /dev/null ; echo $$?)
+
+ifneq ($(have_ming32),0)
+fail:
+	@echo
+	@echo "The mingw32 compiler is not installed."
+	@echo "Try install it with apt-get install mingw32"
+	@echo
+endif
+
 all:
-	cd src && make
-	cd tests/static && make
-	cd tests/dynamic && make
-	cd tests/misc && make
-	cd tests/X11 && make
+	@cd src && $(MAKE)
+	@cd tests/static && $(MAKE)
+	@cd tests/dynamic && $(MAKE)
+	@cd tests/misc && $(MAKE)
 
 clean:
-	cd src && make $@
-	cd tests/static && make $@
-	cd tests/dynamic && make $@
-	cd tests/misc && make $@
-	cd tests/X11 && make $@
+	@cd src && $(MAKE)  $@
+	@cd tests/static && $(MAKE)  $@
+	@cd tests/dynamic && $(MAKE)  $@
+	@cd tests/misc && $(MAKE)  $@
 

@@ -31,14 +31,21 @@
 #include "minmax.h"
 #include "debug.h"
 #include "ntstatus.h"
+#include "vm.h"
 
 static HANDLE vm_section;
 static uint64_t vm_offset;
 static uint32_t vm_maxsize = 0x10000000;
 static PVOID vm_address;
 
-static const int pagesize = 0x1000;
-static const int pagemask = 0x0fff;
+struct vm_mapping
+{
+	LIST_ELEMENT(struct vm_mapping, item);
+	user_ptr_t              address;
+	user_size_t		size;
+	uint64_t		offset;
+	int			protection[];
+};
 
 static void vm_mem_state_to_string(DWORD State, char *string)
 {
@@ -100,7 +107,7 @@ void vm_init(void)
 	NTSTATUS r;
 	LARGE_INTEGER Size;
 	LARGE_INTEGER Offset;
-	ULONG mapped_size = 0;
+	SIZE_T mapped_size = 0;
 
 	Size.QuadPart = vm_maxsize;
 
@@ -121,14 +128,14 @@ void vm_init(void)
 	Offset.QuadPart = 0;
 	r = NtMapViewOfSection(vm_section, NtCurrentProcess(),
 				&vm_address, 0, 0, &Offset,
-				&mapped_size, ViewUnmap, 0, PAGE_READWRITE);
+				&mapped_size, N(ViewUnmap), 0, PAGE_READWRITE);
 	if (r != STATUS_SUCCESS)
 	{
 		die("NtMapViewOfSection failed (%08lx:%s)\n",
 			r, ntstatus_to_string(r));
 	}
 
-	dprintf("Mapped %08lx bytes at %p\n", mapped_size, vm_address);
+	dprintf("Mapped %08lx bytes at %p\n", (ULONG)mapped_size, vm_address);
 }
 
 void vm_mappings_copy(struct process *to, struct process *from)
@@ -136,7 +143,7 @@ void vm_mappings_copy(struct process *to, struct process *from)
 	struct vm_mapping *m, *mapping;
 	NTSTATUS r;
 	PVOID Address;
-	ULONG Size;
+	SIZE_T Size;
 	LARGE_INTEGER Offset;
 	ULONG Protection;
 	ULONG old_prot;
@@ -174,14 +181,15 @@ void vm_mappings_copy(struct process *to, struct process *from)
 
 		memcpy(pto, pfrom, m->size);
 
-		dprintf("Copying mapping %08x bytes at %p, offset=%08llx\n",
-			mapping->size, mapping->address, mapping->offset);
+		dprintf("Copying mapping %08x bytes at %08x, offset=%08lx\n",
+			mapping->size, mapping->address,
+			(unsigned long)mapping->offset);
 
 		Offset.QuadPart = mapping->offset;
-		Address = mapping->address;
+		Address = (void*)(uintptr_t) mapping->address;
 		Size = mapping->size;
 		r = NtMapViewOfSection(vm_section, to->process, &Address, 0,
-					Size, &Offset, &Size, ViewUnmap, 0,
+					Size, &Offset, &Size, N(ViewUnmap), 0,
 					PAGE_EXECUTE_READWRITE);
 		if (r != STATUS_SUCCESS)
 		{
@@ -195,7 +203,7 @@ void vm_mappings_copy(struct process *to, struct process *from)
 		for (i = 0; i < page_count; i++)
 		{
 			Protection = vm_get_protection(mapping->protection[i]);
-			Address = (char*) mapping->address + i * 0x1000;
+			Address = (char*)(uintptr_t) (mapping->address + i * 0x1000);
 			Size = 0x1000;
 			r = NtProtectVirtualMemory(to->process, &Address, &Size,
 						Protection, &old_prot);
@@ -211,15 +219,15 @@ void vm_mappings_copy(struct process *to, struct process *from)
 	}
 }
 
-static struct vm_mapping *vm_mapping_find(struct process *p, const void *addr)
+static struct vm_mapping *vm_mapping_find(struct process *p, user_ptr_t addr)
 {
 	struct vm_mapping *m;
-	void *start, *end;
+	user_ptr_t start, end;
 
 	LIST_FOR_EACH(&p->mapping_list, m, item)
 	{
 		start = m->address;
-		end = (char*) m->address + m->size;
+		end = m->address + m->size;
 		if (start <= addr && addr < end)
 			break;
 	}
@@ -227,36 +235,36 @@ static struct vm_mapping *vm_mapping_find(struct process *p, const void *addr)
 	return m;
 }
 
-static size_t vm_get_hole_size(struct process *p, const void *addr)
+static size_t vm_get_hole_size(struct process *p, user_ptr_t addr)
 {
 	struct vm_mapping *m;
-	size_t max;
-	size_t sz;
+	user_size_t max;
+	user_size_t sz;
 
 	/* assume Windows 2G memory model */
-	if ((size_t)addr >= 0x80000000)
+	if (addr >= 0x80000000)
 		return 0;
-	max = 0x80000000 - (size_t) addr;
+	max = 0x80000000 - addr;
 
 	LIST_FOR_EACH(&p->mapping_list, m, item)
 	{
 		if (m->address <= addr)
 			continue;
 
-		sz = (const char*) m->address - (const char*) addr;
+		sz = m->address - addr;
 		max = MIN(sz, max);
 	}
 
 	return max;
 }
 
-static int vm_change_protection(struct process *p, void *addr,
-				size_t size, int prot)
+static int vm_change_protection(struct process *p, user_ptr_t addr,
+				user_size_t size, int prot)
 {
 	DWORD Protection = vm_get_protection(prot);
 	struct vm_mapping *m;
-	PVOID Address = addr;
-	ULONG sz = size;
+	PVOID Address = (void*) (uintptr_t) addr;
+	SIZE_T sz = size;
 	ULONG old_prot;
 	NTSTATUS r;
 
@@ -279,10 +287,10 @@ static int vm_change_protection(struct process *p, void *addr,
 
 	while (size > 0)
 	{
-		int ofs = ((char*)addr - (char*)m->address)/0x1000;
+		int ofs = (addr - m->address)/0x1000;
 		m->protection[ofs] = prot;
 		size -= 0x1000;
-		addr = (char*) addr + 0x1000;
+		addr = addr + 0x1000;
 	}
 
 	return 0;
@@ -299,7 +307,7 @@ void vm_mappings_free(struct process *p)
 	}
 }
 
-int vm_get_pointer(struct process *p, const void *client_addr,
+int vm_get_pointer(struct process *p, user_ptr_t client_addr,
 		void **addr, size_t *max_size)
 {
 	struct vm_mapping *m;
@@ -309,7 +317,7 @@ int vm_get_pointer(struct process *p, const void *client_addr,
 	if (!m)
 		return -_L(EFAULT);
 
-	ofs = (const char*) client_addr - (const char*) m->address;
+	ofs = client_addr - m->address;
 
 	*addr = (char*) vm_address + m->offset + ofs;
 	*max_size = m->size - ofs;
@@ -318,7 +326,7 @@ int vm_get_pointer(struct process *p, const void *client_addr,
 }
 
 int vm_memcpy_from_process(struct process *p, void *local_addr,
-			const void *client_addr, size_t size)
+			user_ptr_t client_addr, user_size_t size)
 {
 	struct vm_mapping *m;
 	unsigned int ofs;
@@ -330,7 +338,7 @@ int vm_memcpy_from_process(struct process *p, void *local_addr,
 		if (!m)
 			return -_L(EFAULT);
 
-		ofs = (const char*) client_addr - (const char*) m->address;
+		ofs = client_addr - m->address;
 		if (ofs > m->size)
 			die("vm: bad offset at %d\n", __LINE__);
 		if (m->size < ofs + size)
@@ -351,14 +359,14 @@ int vm_memcpy_from_process(struct process *p, void *local_addr,
 
 		size -= n;
 		local_addr = (char*) local_addr + n;
-		client_addr = (const char *) client_addr + n;
+		client_addr += n;
 	}
 
 	return 0;
 }
 
-int vm_memcpy_to_process(struct process *p, void *client_addr,
-				const void *local_addr, size_t size)
+int vm_memcpy_to_process(struct process *p, user_ptr_t client_addr,
+				const void *local_addr, user_size_t size)
 {
 	struct vm_mapping *m;
 	unsigned int ofs;
@@ -370,7 +378,7 @@ int vm_memcpy_to_process(struct process *p, void *client_addr,
 		if (!m)
 			return -_L(EFAULT);
 
-		ofs = (const char*) client_addr - (const char*) m->address;
+		ofs = client_addr - m->address;
 		if (ofs > m->size)
 			die("vm: bad offset at %d\n", __LINE__);
 		if (m->size < ofs + size)
@@ -391,7 +399,7 @@ int vm_memcpy_to_process(struct process *p, void *client_addr,
 
 		size -= n;
 		local_addr = (const char*) local_addr + n;
-		client_addr = (char *) client_addr + n;
+		client_addr += n;
 	}
 
 	return 0;
@@ -401,7 +409,7 @@ int vm_memcpy_to_process(struct process *p, void *client_addr,
  * Move state of non-overlapping pages from
  * free to committed
  */
-static PVOID vm_allocate_pages(struct process *proc, void *addr, size_t len, int prot)
+static user_ptr_t vm_allocate_pages(struct process *proc, user_ptr_t addr, user_size_t len, int prot)
 {
 	DWORD AllocationType = MEM_RESERVE | MEM_COMMIT;
 	struct vm_mapping *mapping;
@@ -409,40 +417,47 @@ static PVOID vm_allocate_pages(struct process *proc, void *addr, size_t len, int
 	DWORD Protection;
 	int page_count;
 	ULONG old_prot;
-	PVOID Address;
-	ULONG Size;
+	user_ptr_t Address;
+	PVOID RequestedAddress;
+	SIZE_T Size;
 	NTSTATUS r;
-	PVOID p;
 	int i;
 
 	/* full access at reserve level */
 	Protection = PAGE_EXECUTE_READWRITE;
 
-	Address = (void*)((int)addr & ~0xffff);
+	Address = addr & ~0xffff;
 	Size = len;
-	Size += ((int)addr - (int)Address);
+	Size += (addr - Address);
 	Size = (Size + 0xffff) & ~0xffff;
 
 	Offset.QuadPart = vm_offset;
 
-	dprintf("NtMapViewOfSection(%p,%08lx,%08lx,%08lx)\n",
-		Address, Size, AllocationType, Protection);
+	dprintf("NtMapViewOfSection(%08x,%08lx,%08lx,%08lx)\n",
+		Address, (ULONG) Size, AllocationType, Protection);
 
 	page_count = (Size + 0xfff)/0x1000;
 	mapping = malloc(sizeof *mapping + page_count * sizeof(int));
 	if (!mapping)
 		return _l_MAP_FAILED;
 
-	r = NtMapViewOfSection(vm_section, proc->process, &Address, 0,
-				Size, &Offset, &Size, ViewUnmap, 0, Protection);
+	RequestedAddress = (PVOID) (uintptr_t) Address;
+
+	r = NtMapViewOfSection(vm_section, proc->process, &RequestedAddress, 0,
+				Size, &Offset, &Size, N(ViewUnmap), 0, Protection);
 	if (r != STATUS_SUCCESS)
 	{
 		dprintf("NtMapViewOfSection failed (%08lx) %s\n",
 			r, ntstatus_to_string(r));
 		return _l_MAP_FAILED;
 	}
-	dprintf("NtMapViewOfSection -> Address=%p Size=%08lx\n",
-		Address, Size);
+	dprintf("NtMapViewOfSection -> Address=%p Size=%08x\n",
+		RequestedAddress, (uint32_t) Size);
+
+	if (((uintptr_t)RequestedAddress) & ~0xffffffff)
+		abort();
+
+	Address = (user_ptr_t)(uintptr_t) RequestedAddress;
 
 	mapping->address = Address;
 	mapping->size = Size;
@@ -450,8 +465,9 @@ static PVOID vm_allocate_pages(struct process *proc, void *addr, size_t len, int
 	for (i = 0; i < page_count; i++)
 		mapping->protection[i] = prot;
 
-	dprintf("New mapping %08x bytes at %p, offset=%08llx\n",
-		mapping->size, mapping->address, mapping->offset);
+	dprintf("New mapping %08x bytes at %08x, offset=%08lx\n",
+		mapping->size, mapping->address,
+		(unsigned long)mapping->offset);
 
 	LIST_ELEMENT_INIT(mapping, item);
 	LIST_APPEND(&proc->mapping_list, mapping, item);
@@ -465,8 +481,8 @@ static PVOID vm_allocate_pages(struct process *proc, void *addr, size_t len, int
 	/* restricted access after committing */
 	Protection = vm_get_protection(prot);
 
-	p = Address;
-	r = NtProtectVirtualMemory(proc->process, &p, &Size,
+	RequestedAddress = (PVOID) (uintptr_t) Address;
+	r = NtProtectVirtualMemory(proc->process, &RequestedAddress, &Size,
 				Protection, &old_prot);
 	if ( r != STATUS_SUCCESS)
 	{
@@ -484,36 +500,36 @@ static PVOID vm_allocate_pages(struct process *proc, void *addr, size_t len, int
  * if we fail in the middle for any reason,
  *   any mappings created should be destroyed
  */
-static void *vm_allocate_fragmented_pages(struct process *proc, void *addr, size_t len, int prot)
+static user_ptr_t vm_allocate_fragmented_pages(struct process *proc, user_ptr_t addr, user_size_t len, int prot)
 {
-	uintptr_t delta = (uintptr_t) addr & pagemask;
-	void *base = addr;
+	uint32_t delta = addr & pagemask;
+	user_ptr_t base = addr;
 
-	addr = (char*) addr - delta;
+	addr -= delta;
 	len += delta;
 
 	len = (len + pagemask) & ~pagemask;
 
-	dprintf("Allocating fragmented pages at %p len=%08x\n", addr, len);
+	dprintf("Allocating fragmented pages at %08x len=%08x\n", addr, len);
 
 	// TODO: atomic updates, avoid failing in the middle
 
 	while (len > 0)
 	{
 		struct vm_mapping *m;
-		size_t sz;
+		user_size_t sz;
 
 		m = vm_mapping_find(proc, addr);
 		if (m)
 		{
-			size_t ofs = (char*) addr - (char*) m->address;
+			user_size_t ofs = addr - m->address;
 			int r;
 
 			sz = MIN(len, m->size - ofs);
 
 			r = vm_change_protection(proc, addr, sz, prot);
 			if (r < 0)
-				return _l_MAP_FAILED;
+				return -_L(EPERM);
 		}
 		else
 		{
@@ -525,13 +541,13 @@ static void *vm_allocate_fragmented_pages(struct process *proc, void *addr, size
 		}
 
 		len -= sz;
-		addr = (char*) addr + sz;
+		addr += sz;
 	}
 
 	return base;
 }
 
-void vm_render_memory(struct process *proc, void *addr,
+void vm_render_memory(struct process *proc, user_ptr_t addr,
 			struct filp *fp, size_t len, loff_t offset)
 {
 	while (len)
@@ -562,7 +578,7 @@ void vm_render_memory(struct process *proc, void *addr,
 			memset(ptr, 0, size);
 
 		len -= size;
-		addr = (char*) addr + size;
+		addr += size;
 	}
 }
 
@@ -573,25 +589,26 @@ void vm_render_memory(struct process *proc, void *addr,
  *  - handle state change differences
  *  - deal with MAP_FIXED correctly
  */
-void* vm_process_map(struct process *proc, void *addr, size_t len,
+user_ptr_t vm_process_map(struct process *proc, user_ptr_t addr, user_size_t len,
 		 int prot, int flags, struct filp *fp, off_t offset)
 {
 	NTSTATUS r;
-	PVOID Address;
+	user_ptr_t Address;
 	MEMORY_BASIC_INFORMATION info;
-	ULONG Size = 0;
 
 	if (offset & pagemask)
-		return L_ERROR_PTR(EINVAL);
+		return -_L(EINVAL);
 
 	if (flags & _L(MAP_SHARED))
 		dprintf("warning: shared mappings not supported\n");
 
+	memset(&info, 0, sizeof info);
+
 	/* find current state of memory */
-	Address = (void*)((int)addr & ~0xffff);
-	r = NtQueryVirtualMemory(proc->process, Address,
+	Address = addr & ~0xffff;
+	r = NtQueryVirtualMemory(proc->process, (void*)(uintptr_t)Address,
 				MemoryBasicInformation,
-				&info, sizeof info, &Size);
+				&info, sizeof info, NULL);
 	if (r != STATUS_SUCCESS)
 		die("NtQueryVirtualMemory failed r=%08lx %s\n",
 			r, ntstatus_to_string(r));
@@ -622,7 +639,7 @@ void* vm_process_map(struct process *proc, void *addr, size_t len,
 		Address = vm_allocate_pages(proc, addr, len, prot);
 	}
 
-	vm_render_memory(proc, Address, fp, len, offset);
+	vm_render_memory(proc, (user_ptr_t) Address, fp, len, offset);
 
 	if (Address == _l_MAP_FAILED)
 		return Address;
@@ -631,26 +648,26 @@ void* vm_process_map(struct process *proc, void *addr, size_t len,
 	if (!addr)
 		addr = Address;
 
-	dprintf("mmap -> %p\n", addr);
+	dprintf("mmap -> %08x\n", addr);
 
 	return addr;
 }
 
-int vm_process_map_protect(struct process *p, void *addr,
-			size_t len, int prot)
+int vm_process_map_protect(struct process *p, user_ptr_t addr,
+			user_size_t len, int prot)
 {
-	addr = (void*) (((uintptr_t) addr) & ~pagemask);
+	addr &= ~pagemask;
 	len = (len + pagemask) & ~pagemask;
 	return vm_change_protection(p, addr, len, prot);
 }
 
-int vm_process_unmap(struct process *proc, void *addr, size_t len)
+int vm_process_unmap(struct process *proc, user_ptr_t addr, user_size_t len)
 {
 	/* FIXME: implement */
 	return 0;
 }
 
-int vm_string_read(struct process *proc, const char *addr, char **out)
+int vm_string_read(struct process *proc, user_ptr_t addr, char **out)
 {
 	void *ptr;
 	size_t len = 0;
@@ -697,7 +714,7 @@ int vm_string_read(struct process *proc, const char *addr, char **out)
 		memcpy(str, ptr, sz);
 
 		str += sz;
-		addr = (char*) addr + sz;
+		addr += sz;
 		len -= sz;
 	}
 
@@ -719,7 +736,7 @@ void vm_dump_address_space(struct process *p)
 	while (1)
 	{
 		MEMORY_BASIC_INFORMATION info;
-		ULONG sz = 0;
+		SIZE_T sz = 0;
 
 		r = NtQueryVirtualMemory(p->process, Address,
 					MemoryBasicInformation,

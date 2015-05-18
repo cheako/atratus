@@ -31,7 +31,7 @@
 
 extern BOOLEAN (APIENTRY *pRtlGenRandom)(void *Buffer, ULONG Size);
 
-static int random_read(struct filp *f, void *buf, size_t size, loff_t *off, int block)
+static int random_read(struct filp *f, void *buf, user_size_t size, loff_t *off, int block)
 {
 	size_t i;
 

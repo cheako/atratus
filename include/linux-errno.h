@@ -1,9 +1,6 @@
 #ifndef __LINUX_ERRNO_H__
 #define __LINUX_ERRNO_H__
 
-/* avoid any possible conflicts with mingw windows headers */
-#define _L(err) _l_##err
-
 #define _l_EPERM 1
 #define _l_ENOENT 2
 #define _l_ESRCH 3

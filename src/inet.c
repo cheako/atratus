@@ -21,17 +21,20 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <winsock2.h>
 #include "ntapi.h"
 #include <windows.h>
 #include <mswsock.h>
-#include <winsock2.h>
 #include <psapi.h>
 #include <assert.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <sys/fcntl.h>
+#include <iphlpapi.h>
 
+#ifndef alloca
 #define alloca(sz) __builtin_alloca(sz)
+#endif
 
 #include "linux-errno.h"
 #include "linux-defines.h"
@@ -102,7 +105,7 @@ static LPFN_GETACCEPTEXSOCKADDRS pGetAcceptExSockaddrs;
 static LIST_ANCHOR(struct socket_filp) inet_sockets;
 
 static struct socket_filp *inet_alloc_socket(SOCKET s);
-static int inet_alloc_fd(struct socket_filp *sfp);
+static int inet_alloc_fd(struct socket_filp *sfp, int flags);
 
 static int WSAToErrno(const char *func)
 {
@@ -133,7 +136,7 @@ static int inet_error_from_overlapped(struct socket_filp *sfp)
 	DWORD err, flags = 0;
 	BOOL r;
 
-	dprintf("getting result for %d\n", s);
+	dprintf("getting result for %p\n", sfp);
 	r = WSAGetOverlappedResult(s, &sfp->overlapped,
 				&bytesTransferred, FALSE, &flags);
 	if (r)
@@ -150,6 +153,8 @@ static int inet_error_from_overlapped(struct socket_filp *sfp)
 		return -_L(ETIMEDOUT);
 	case ERROR_CONNECTION_REFUSED:
 		return -_L(ECONNREFUSED);
+	case ERROR_IO_PENDING:
+		return -_L(EINTR);
 	default:
 		dprintf("unknown socket error %ld\n", err);
 		return -_L(EACCES);
@@ -159,129 +164,105 @@ static int inet_error_from_overlapped(struct socket_filp *sfp)
 static int inet_socket_wait_complete(struct socket_filp *sfp)
 {
 	/* wait for connect to complete */
-	while (!HasOverlappedIoCompleted(&sfp->overlapped) &&
-		 current->state != thread_terminated)
+	while (1)
 	{
+		if (HasOverlappedIoCompleted(&sfp->overlapped))
+			break;
+
+		if (process_pending_signal_check(current) ||
+			current->state == thread_terminated)
+		{
+			WSACancelAsyncRequest(sfp->handle);
+			return -_L(EINTR);
+		}
+
 		sfp->thread = current;
 		schedule();
 		sfp->thread = NULL;
 	}
 
+
 	return inet_error_from_overlapped(sfp);
 }
 
-static int inet_read(struct filp *fp, void *buf, size_t size, loff_t *off, int block)
+static int inet_read(struct filp *fp, void *buf, user_size_t size, loff_t *off, int block)
 {
 	struct socket_filp *sfp = (struct socket_filp*) fp;
 	DWORD bytesRead;
 	int bytesCopied = 0;
+	SOCKET s = (SOCKET) sfp->handle;
+	WSABUF wsabuf;
+	DWORD flags;
+	int r;
 
-	while (size)
+	dprintf("inet_read(%p,%p,%d,%d)\n", sfp, buf, size, block);
+
+	sfp->async_events &= ~FD_READ;
+
+	wsabuf.buf = (void*) buf;
+	wsabuf.len = size;
+	bytesRead = 0;
+	flags = 0;
+	r = WSARecv(s, &wsabuf, 1, &bytesRead, &flags, &sfp->overlapped, NULL);
+	if (r == SOCKET_ERROR)
 	{
-		SOCKET s = (SOCKET) sfp->handle;
-		WSABUF wsabuf;
-		DWORD flags;
 		int r;
 
-		sfp->async_events &= ~FD_READ;
-
-		wsabuf.buf = (void*) buf;
-		wsabuf.len = size;
-		bytesRead = 0;
-		flags = 0;
-		r = WSARecv(s, &wsabuf, 1, &bytesRead, &flags, &sfp->overlapped, NULL);
-		if (r == SOCKET_ERROR)
+		if (WSAGetLastError() != ERROR_IO_PENDING)
 		{
-			int r;
-
-			if (WSAGetLastError() != ERROR_IO_PENDING)
-			{
-				dprintf("WSARecv %p failed %ld\n",
-					sfp->handle, GetLastError());
-				return WSAToErrno("inet_read");
-			}
-
-			r = inet_socket_wait_complete(sfp);
-			if (r < 0)
-			{
-				dprintf("inet_read(): wait failed (%d)\n", r);
-				return r;
-			}
-
-			bytesRead = r;
+			dprintf("WSARecv %p failed %ld\n",
+				sfp->handle, GetLastError());
+			if (bytesCopied)
+				return bytesCopied;
+			return WSAToErrno("inet_read");
 		}
 
-		if (!bytesRead)
-			break;
+		r = inet_socket_wait_complete(sfp);
+		if (r < 0)
+		{
+			if (bytesCopied)
+				return bytesCopied;
+			return r;
+		}
 
-		bytesCopied += bytesRead;
-		buf = (char*) buf + bytesRead;
-		size -= bytesRead;
-
-		if (!block)
-			break;
+		bytesRead = r;
 	}
 
-	return bytesCopied;
+	return bytesRead;
 }
 
-static int inet_write(struct filp *fp, const void *buf, size_t size, loff_t *off, int block)
+static int inet_write(struct filp *fp, const void *buffer, user_size_t size, loff_t *off, int block)
 {
 	struct socket_filp *sfp = (struct socket_filp*) fp;
-	uint8_t buffer[0x1000];
-	DWORD bytesCopied = 0;
+	SOCKET s = (SOCKET) sfp->handle;
+	DWORD bytesWritten;
+	WSABUF wsabuf;
+	int r;
 
-	dprintf("inet_write(%p,%p,%d)\n", sfp, buf, size);
+	dprintf("inet_write(%p,%p,%d)\n", sfp, buffer, size);
 
-	while (size)
+	wsabuf.buf = (char*) buffer;
+	wsabuf.len = size;
+
+	bytesWritten = 0;
+	r = WSASend(s, &wsabuf, 1, &bytesWritten, 0, &sfp->overlapped, NULL);
+	if (r == SOCKET_ERROR)
 	{
-		SOCKET s = (SOCKET) sfp->handle;
-		ULONG sz = size;
-		DWORD bytesWritten;
-		ULONG bytesRead = 0;
-		WSABUF wsabuf;
-		int r;
-
-		if (sz > sizeof buffer)
-			sz = sizeof buffer;
-
-		r = ReadProcessMemory(current->process, buf,
-					buffer, sz, &bytesRead);
-		if (!r)
-			return -_L(EFAULT);
-
-		wsabuf.buf = (char*) buffer;
-		wsabuf.len = bytesRead;
-
-		bytesWritten = 0;
-		r = WSASend(s, &wsabuf, 1, &bytesWritten, 0,
-				 &sfp->overlapped, NULL);
-		if (r == SOCKET_ERROR)
+		if (GetLastError() != ERROR_IO_PENDING)
 		{
-			if (GetLastError() != ERROR_IO_PENDING)
-			{
-				dprintf("WriteFile %p failed %ld\n",
-					sfp->handle, GetLastError());
-				return -_L(EIO);
-			}
-
-			r = inet_socket_wait_complete(sfp);
-			if (r < 0)
-				return r;
-
-			bytesWritten = r;
+			dprintf("WSASend %p failed %ld\n",
+				sfp->handle, GetLastError());
+			return -_L(EIO);
 		}
 
-		if (bytesWritten != bytesRead)
-			break;
+		r = inet_socket_wait_complete(sfp);
+		if (r < 0)
+			return r;
 
-		/* move along */
-		bytesCopied += bytesWritten;
-		size -= bytesWritten;
-		buf = (char*) buf + bytesWritten;
+		bytesWritten = r;
 	}
 
-	return bytesCopied;
+	return bytesWritten;
 }
 
 static void inet_close(struct filp *fp)
@@ -294,7 +275,8 @@ static void inet_close(struct filp *fp)
 	closesocket(s);
 }
 
-static int inet_set_reuseaddr(struct socket_filp *sfp, const void *optval, size_t optlen)
+static int inet_set_reuseaddr(struct socket_filp *sfp,
+				user_ptr_t optval, user_size_t optlen)
 {
 	SOCKET s = (SOCKET) sfp->handle;
 	int val = 0;
@@ -303,11 +285,11 @@ static int inet_set_reuseaddr(struct socket_filp *sfp, const void *optval, size_
 	if (optlen != sizeof val)
 		return -_L(EINVAL);
 
-	r = current->ops->memcpy_from(&val, optval, sizeof val);
+	r = vm_memcpy_from_process(current, &val, optval, sizeof val);
 	if (r < 0)
 		return r;
 
-	dprintf("reuseaddr(%d) -> %d\n", s, val);
+	dprintf("reuseaddr(%p) -> %d\n", sfp, val);
 
 	r = setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
 			(char*) &val, sizeof val);
@@ -315,7 +297,9 @@ static int inet_set_reuseaddr(struct socket_filp *sfp, const void *optval, size_
 	return (r == 0) ? 0 : -_L(EINVAL);
 }
 
-static int inet_set_keepalive(struct socket_filp *sfp, const void *optval, size_t optlen)
+static int inet_set_keepalive(struct socket_filp *sfp,
+				user_ptr_t optval,
+				user_size_t optlen)
 {
 	SOCKET s = (SOCKET) sfp->handle;
 	int val = 0;
@@ -324,11 +308,11 @@ static int inet_set_keepalive(struct socket_filp *sfp, const void *optval, size_
 	if (optlen != sizeof val)
 		return -_L(EINVAL);
 
-	r = current->ops->memcpy_from(&val, optval, sizeof val);
+	r = vm_memcpy_from_process(current, &val, optval, sizeof val);
 	if (r < 0)
 		return r;
 
-	dprintf("keepalive(%d) -> %d\n", s, val);
+	dprintf("keepalive(%p) -> %d\n", sfp, val);
 
 	r = setsockopt(s, SOL_SOCKET, SO_KEEPALIVE,
 			(char*) &val, sizeof val);
@@ -337,9 +321,9 @@ static int inet_set_keepalive(struct socket_filp *sfp, const void *optval, size_
 }
 
 static int inet_setsockopt(struct socket_filp *sfp, int level, int optname,
-		 const void *optval, size_t optlen)
+				user_ptr_t optval, user_size_t optlen)
 {
-	dprintf("setsockopt(%p,%d,%d,%p,%d)\n",
+	dprintf("setsockopt(%p,%d,%d,%08x,%d)\n",
 		sfp, level, optname, optval, optlen);
 
 	if (level != _L(SOL_SOCKET))
@@ -362,26 +346,26 @@ static int inet_setsockopt(struct socket_filp *sfp, int level, int optname,
 }
 
 static int inet_getsockopt(struct socket_filp *sfp, int level, int optname,
-		 void *optval, size_t *optlen)
+		 user_ptr_t optval, user_ptr_t optlen)
 {
-	dprintf("getsockopt(%p,%d,%d,%p,%p)\n",
+	dprintf("getsockopt(%p,%d,%d,%08x,%08x)\n",
 		sfp, level, optname, optval, optlen);
 	return -_L(EINVAL);
 }
 
 static int inet_connect(struct socket_filp *sfp,
-			const struct sockaddr *addr, size_t addrlen, bool block)
+			user_ptr_t addr, user_size_t addrlen, bool block)
 {
 	struct sockaddr_in sin;
 	int r;
 	SOCKET s = (SOCKET) sfp->handle;
 
-	dprintf("connect(%p,%p,%d) block=%d\n", sfp, addr, addrlen, block);
+	dprintf("connect(%p,%08x,%d) block=%d\n", sfp, addr, addrlen, block);
 
 	if (addrlen != sizeof sin)
 		return -_L(EINVAL);
 
-	r = current->ops->memcpy_from(&sin, addr, addrlen);
+	r = vm_memcpy_from_process(current, &sin, addr, addrlen);
 	if (r < 0)
 		return r;
 
@@ -427,6 +411,9 @@ static int inet_connect(struct socket_filp *sfp,
 	 */
 	if (sfp->type == SOCK_DGRAM)
 	{
+		uint8_t *p = (void*) &sin.sin_addr.s_addr;
+		dprintf("Connecting UDP socket to %d.%d.%d.%d\n",
+			p[0], p[1], p[2], p[3]);
 		r = connect(s, (void*) &sin, sizeof sin);
 		if (r != 0)
 			return WSAToErrno("connect");
@@ -435,7 +422,7 @@ static int inet_connect(struct socket_filp *sfp,
 
 	sfp->state = ss_connecting;
 
-	dprintf("socket %d connecting to %ld.%ld.%ld.%ld:%d\n", s,
+	dprintf("socket %p connecting to %ld.%ld.%ld.%ld:%d\n", sfp,
 		(sin.sin_addr.s_addr >> 0) & 0xff,
 		(sin.sin_addr.s_addr >> 8) & 0xff,
 		(sin.sin_addr.s_addr >> 16) & 0xff,
@@ -480,18 +467,18 @@ static int inet_connect(struct socket_filp *sfp,
 	return r;
 }
 
-static int inet_bind(struct socket_filp *sfp, void *addr, size_t addrlen)
+static int inet_bind(struct socket_filp *sfp, user_ptr_t addr, user_size_t addrlen)
 {
 	struct sockaddr_in sin;
 	int r;
 	SOCKET s = (SOCKET) sfp->handle;
 
-	dprintf("bind(%p,%p,%d)\n", sfp, addr, addrlen);
+	dprintf("bind(%p,%08x,%d)\n", sfp, addr, addrlen);
 
 	if (addrlen != sizeof sin)
 		return -_L(EINVAL);
 
-	r = current->ops->memcpy_from(&sin, addr, addrlen);
+	r = vm_memcpy_from_process(current, &sin, addr, addrlen);
 	if (r < 0)
 		return r;
 
@@ -503,7 +490,7 @@ static int inet_bind(struct socket_filp *sfp, void *addr, size_t addrlen)
 		return -_L(EAFNOSUPPORT);
 	}
 
-	dprintf("socket %d binding to %ld.%ld.%ld.%ld:%d\n", s,
+	dprintf("socket %p binding to %ld.%ld.%ld.%ld:%d\n", sfp,
 		(sin.sin_addr.s_addr >> 0) & 0xff,
 		(sin.sin_addr.s_addr >> 8) & 0xff,
 		(sin.sin_addr.s_addr >> 16) & 0xff,
@@ -535,13 +522,12 @@ static int inet_listen(struct socket_filp *sfp, int backlog)
 
 static int inet_copy_accept_addr(struct socket_filp *sfp,
 				DWORD recv_len,
-				void *addr, void *addrlen)
+				user_ptr_t addr, user_ptr_t addrlen)
 {
 	LPSOCKADDR local = NULL, remote = NULL;
 	struct sockaddr_in *in_local, *in_remote;
 	size_t len = sizeof (struct sockaddr_in);
 	INT local_len, remote_len;
-	SOCKET s = (SOCKET) sfp->handle;
 	unsigned short port;
 	unsigned int sa;
 	int r;
@@ -560,17 +546,17 @@ static int inet_copy_accept_addr(struct socket_filp *sfp,
 	in_local = (void*) local;
 	in_remote = (void*) remote;
 
-	r = current->ops->memcpy_to(addr, in_remote, len);
+	r = vm_memcpy_to_process(current, addr, in_remote, len);
 	if (r < 0)
 		return r;
 
-	r = current->ops->memcpy_to(addrlen, &len, sizeof len);
+	r = vm_memcpy_to_process(current, addrlen, &len, sizeof len);
 	if (r < 0)
 		return r;
 
 	sa = in_local->sin_addr.s_addr;
 	port = in_local->sin_port;
-	dprintf("accept %d\n", s);
+	dprintf("accept %p\n", sfp);
 	dprintf("local: %d.%d.%d.%d:%d\n",
 		(sa >> 0) & 0xff, (sa >> 8) & 0xff,
 		(sa >> 16) & 0xff, (sa >> 24) & 0xff, ntohs(port));
@@ -585,7 +571,7 @@ static int inet_copy_accept_addr(struct socket_filp *sfp,
 }
 
 static int inet_accept(struct socket_filp *sfp,
-			struct sockaddr *addr, size_t *addrlen,
+			user_ptr_t addr, user_ptr_t addrlen,
 			int block)
 {
 	SOCKET s = (SOCKET) sfp->handle;
@@ -595,9 +581,9 @@ static int inet_accept(struct socket_filp *sfp,
 	size_t sl;
 	int r;
 
-	dprintf("accept(%d,%p,%p)\n", s, addr, addrlen);
+	dprintf("accept(%p,%08x,%08x)\n", sfp, addr, addrlen);
 
-	r = current->ops->memcpy_from(&sl, addrlen, sizeof sl);
+	r = vm_memcpy_from_process(current, &sl, addrlen, sizeof sl);
 	if (r < 0)
 		return r;
 
@@ -683,7 +669,7 @@ accepted:
 	new_sfp->state = ss_connected;
 	new_sfp->async_events |= FD_WRITE;
 
-	return inet_alloc_fd(new_sfp);
+	return inet_alloc_fd(new_sfp, O_RDWR);
 }
 
 static int inet_shutdown(struct socket_filp *sfp, int how)
@@ -691,7 +677,7 @@ static int inet_shutdown(struct socket_filp *sfp, int how)
 	SOCKET s = (SOCKET) sfp->handle;
 	int r;
 
-	dprintf("shutdown(%d,%d)\n", s, how);
+	dprintf("shutdown(%p,%d)\n", sfp, how);
 
 	STATIC_ASSERT(_L(SHUT_RD) == SD_RECEIVE);
 	STATIC_ASSERT(_L(SHUT_WR) == SD_SEND);
@@ -705,7 +691,7 @@ static int inet_shutdown(struct socket_filp *sfp, int how)
 }
 
 static int inet_getpeername(struct socket_filp *sfp,
-			struct sockaddr *addr, size_t *addrlen)
+			user_ptr_t addr, user_ptr_t addrlen)
 {
 	SOCKET s = (SOCKET) sfp->handle;
 	struct sockaddr_in sin;
@@ -713,9 +699,9 @@ static int inet_getpeername(struct socket_filp *sfp,
 	size_t maxlen = 0;
 	int r;
 
-	dprintf("getpeername(%d,%p,%p)\n", s, addr, addrlen);
+	dprintf("getpeername(%p,%08x,%08x)\n", sfp, addr, addrlen);
 
-	r = current->ops->memcpy_from(&maxlen, addrlen, sizeof (size_t));
+	r = vm_memcpy_from_process(current, &maxlen, addrlen, sizeof (size_t));
 	if (r < 0)
 		return r;
 
@@ -726,11 +712,11 @@ static int inet_getpeername(struct socket_filp *sfp,
 	if (len > maxlen)
 		len = maxlen;
 
-	r = current->ops->memcpy_to(addrlen, &len, sizeof (size_t));
+	r = vm_memcpy_to_process(current, addrlen, &len, sizeof (size_t));
 	if (r < 0)
 		return r;
 
-	r = current->ops->memcpy_to(addr, &sin, len);
+	r = vm_memcpy_to_process(current, addr, &sin, len);
 	if (r < 0)
 		return r;
 
@@ -738,7 +724,7 @@ static int inet_getpeername(struct socket_filp *sfp,
 }
 
 static int inet_getsockname(struct socket_filp *sfp,
-			struct sockaddr *addr, size_t *addrlen)
+			user_ptr_t addr, user_ptr_t addrlen)
 {
 	SOCKET s = (SOCKET) sfp->handle;
 	struct sockaddr_in sin;
@@ -746,9 +732,9 @@ static int inet_getsockname(struct socket_filp *sfp,
 	size_t maxlen = 0;
 	int r;
 
-	dprintf("getsockname(%d,%p,%p)\n", s, addr, addrlen);
+	dprintf("getsockname(%p,%08x,%08x)\n", sfp, addr, addrlen);
 
-	r = current->ops->memcpy_from(&maxlen, addrlen, sizeof (size_t));
+	r = vm_memcpy_from_process(current, &maxlen, addrlen, sizeof (size_t));
 	if (r < 0)
 		return r;
 
@@ -759,18 +745,18 @@ static int inet_getsockname(struct socket_filp *sfp,
 	if (len > maxlen)
 		len = maxlen;
 
-	r = current->ops->memcpy_to(addrlen, &len, sizeof (size_t));
+	r = vm_memcpy_to_process(current, addrlen, &len, sizeof (size_t));
 	if (r < 0)
 		return r;
 
-	r = current->ops->memcpy_to(addr, &sin, len);
+	r = vm_memcpy_to_process(current, addr, &sin, len);
 	if (r < 0)
 		return r;
 
 	return 0;
 }
 
-static int inet_fill_wsabuf(struct process *p, const void *ptr, size_t len,
+static int inet_fill_wsabuf(struct process *p, user_ptr_t ptr, user_size_t len,
 				WSABUF *buf, size_t bufcount)
 {
 	int r, n = 0;
@@ -800,7 +786,7 @@ static int inet_fill_wsabuf(struct process *p, const void *ptr, size_t len,
 }
 
 static int inet_send(struct socket_filp *sfp,
-		const void *ptr, size_t len, int flags)
+			user_ptr_t ptr, user_size_t len, int flags)
 {
 	SOCKET s = (SOCKET) sfp->handle;
 	struct process *p = current;
@@ -809,7 +795,7 @@ static int inet_send(struct socket_filp *sfp,
 	ULONG wsaFlags = 0;
 	int r, n;
 
-	dprintf("send(%d,%p,%d,%08x)\n", s, ptr, len, flags);
+	dprintf("send(%p,%08x,%d,%08x)\n", sfp, ptr, len, flags);
 
 	if (flags & _L(MSG_DONTROUTE))
 		wsaFlags |= MSG_DONTROUTE;
@@ -840,20 +826,21 @@ static int inet_send(struct socket_filp *sfp,
 	return bytesSent;
 }
 
-static int inet_recvfrom(struct socket_filp *sfp, void *ptr, size_t len,
-			int flags, struct sockaddr *src_addr, socklen_t *addrlen)
+static int inet_recvfrom(struct socket_filp *sfp, user_ptr_t ptr, user_size_t len,
+			int flags, user_ptr_t src_addr, user_size_t addrlen)
 {
 	SOCKET s = (SOCKET) sfp->handle;
 	struct process *p = current;
 	ULONG wsaFlags = 0;
 	WSABUF buf[10];
 	DWORD bytesRead = 0;
-	void *from = 0;
+	struct sockaddr_in *from;
 	INT fromlen = 0;
 	int n, r;
+	unsigned int sa;
 
-	dprintf("recvfrom(%d,%p,%d,%08x,%p,%p)\n",
-		 s, buf, len, flags, src_addr, addrlen);
+	dprintf("recvfrom(%p,%08x,%d,%08x,%08x,%08x)\n",
+		 sfp, ptr, len, flags, src_addr, addrlen);
 
 	if (flags & _L(MSG_DONTROUTE))
 		wsaFlags |= MSG_DONTROUTE;
@@ -864,14 +851,14 @@ static int inet_recvfrom(struct socket_filp *sfp, void *ptr, size_t len,
 	if (n < 0)
 		return n;
 
-	r = vm_memcpy_from_process(p, &fromlen, addrlen, sizeof *addrlen);
+	r = vm_memcpy_from_process(p, &fromlen, addrlen, sizeof fromlen);
 	if (r < 0)
 		return r;
 
 	from = alloca(fromlen);
 
 	r = WSARecvFrom(s, buf, n, &bytesRead, &wsaFlags,
-			from, &fromlen, &sfp->overlapped, NULL);
+			(void*) from, &fromlen, &sfp->overlapped, NULL);
 	if (r == SOCKET_ERROR)
 	{
 		if (GetLastError() != ERROR_IO_PENDING)
@@ -885,13 +872,76 @@ static int inet_recvfrom(struct socket_filp *sfp, void *ptr, size_t len,
 		if (r < 0)
 			return r;
 	}
+	r = bytesRead;
 
 	vm_memcpy_to_process(p, addrlen, &fromlen, sizeof addrlen);
 	vm_memcpy_to_process(p, src_addr, from, fromlen);
 
-	dprintf("recvfrom(): got %ld bytes\n", bytesRead);
+	sa = from->sin_addr.s_addr;
+	dprintf("recvfrom(): got %ld bytes from %d.%d.%d.%d\n",
+		bytesRead,
+		sa & 0xff, (sa >> 8) & 0xff,
+		(sa >> 16) & 0xff, (sa >> 24) & 0xff);
 
 	return r;
+}
+
+static int inet_recv(struct socket_filp *sfp,
+			user_ptr_t ptr, user_size_t len, int flags)
+{
+	dprintf("recv(%p,%08x,%d,%08x)\n", sfp, ptr, len, flags);
+
+	return -_L(ENOSYS);
+}
+
+static int inet_sendto(struct socket_filp *sfp, user_ptr_t ptr, user_size_t len,
+			int flags, user_ptr_t src_addr, user_size_t addrlen)
+{
+	SOCKET s = (SOCKET) sfp->handle;
+	struct process *p = current;
+	struct sockaddr_in sin;
+	DWORD bytesSent = 0;
+	ULONG wsaFlags = 0;
+	WSABUF buf[10];
+	int n, r;
+
+	dprintf("sendto(%p,%08x,%d,%08x,%08x,%d)\n",
+		 sfp, ptr, len, flags, src_addr, addrlen);
+
+	if (addrlen < sizeof sin)
+		return -_L(EINVAL);
+
+	r = vm_memcpy_from_process(p, &sin, src_addr, sizeof sin);
+	if (r < 0)
+		return r;
+
+	n = inet_fill_wsabuf(p, ptr, len, buf, sizeof buf/sizeof buf[0]);
+	if (n < 0)
+		return n;
+
+	if (flags & _L(MSG_DONTROUTE))
+		wsaFlags |= MSG_DONTROUTE;
+	if (flags & _L(MSG_OOB))
+		wsaFlags |= MSG_OOB;
+
+	r = WSASendTo(s, buf, n, &bytesSent, wsaFlags,
+			(void*) &sin, sizeof sin,
+			&sfp->overlapped, NULL);
+	if (r == SOCKET_ERROR)
+	{
+		if (GetLastError() != ERROR_IO_PENDING)
+		{
+			dprintf("WSASendTo %p failed %d\n",
+				sfp->handle, WSAGetLastError());
+			return -_L(EIO);
+		}
+
+		r = inet_socket_wait_complete(sfp);
+		if (r < 0)
+			return r;
+	}
+
+	return bytesSent;
 }
 
 static int inet_sockcall(int call, struct filp *fp, unsigned long *args, int block)
@@ -902,36 +952,39 @@ static int inet_sockcall(int call, struct filp *fp, unsigned long *args, int blo
 	{
 	case _L(SYS_SETSOCKOPT):
 		return inet_setsockopt(sfp, args[1], args[2],
-					(void*) args[3], args[4]);
+					args[3], args[4]);
 	case _L(SYS_CONNECT):
-		return inet_connect(sfp, (void*) args[1], args[2], block);
+		return inet_connect(sfp, args[1], args[2], block);
 	case _L(SYS_BIND):
-		return inet_bind(sfp, (void*) args[1], args[2]);
+		return inet_bind(sfp, args[1], args[2]);
 	case _L(SYS_LISTEN):
 		return inet_listen(sfp, args[1]);
 	case _L(SYS_ACCEPT):
-		return inet_accept(sfp, (void*) args[1], (void*) args[2], block);
+		return inet_accept(sfp, args[1], args[2], block);
 	case _L(SYS_SHUTDOWN):
 		return inet_shutdown(sfp, args[1]);
 	case _L(SYS_GETPEERNAME):
-		return inet_getpeername(sfp, (void*) args[1], (void*) args[2]);
+		return inet_getpeername(sfp, args[1], args[2]);
 	case _L(SYS_GETSOCKNAME):
-		return inet_getsockname(sfp, (void*) args[1], (void*) args[2]);
+		return inet_getsockname(sfp, args[1], args[2]);
 	case _L(SYS_SEND):
-		return inet_send(sfp, (void*) args[1], args[2], args[3]);
+		return inet_send(sfp, args[1], args[2], args[3]);
 	case _L(SYS_RECVFROM):
-		return inet_recvfrom(sfp, (void*) args[1], args[2], args[3],
-					 (void*) args[4], (void*) args[5]);
+		return inet_recvfrom(sfp, args[1], args[2], args[3],
+					 args[4], args[5]);
 	case _L(SYS_GETSOCKOPT):
 		return inet_getsockopt(sfp, args[1], args[2],
-				 (void*)args[3], (void*) args[4]);
-	case _L(SYS_SOCKETPAIR):
+					args[3], args[4]);
 	case _L(SYS_SENDTO):
+		return inet_sendto(sfp, args[1], args[2], args[3],
+					args[4], args[5]);
 	case _L(SYS_RECV):
+		return inet_recv(sfp, args[1], args[2], args[3]);
+	case _L(SYS_SOCKETPAIR):
 	case _L(SYS_SENDMSG):
 	case _L(SYS_RECVMSG):
-		printf("socketcall(%d) unhandled\n", call);
-		exit(1);
+		dprintf("socketcall(%d) unhandled\n", call);
+		break;
 	default:
 		break;
 	}
@@ -996,6 +1049,51 @@ static int inet_seek(struct filp *fp, int whence,
 	return -_L(ESPIPE);
 }
 
+static int inet_ioctl_nread(struct socket_filp *sfp, user_ptr_t arg)
+{
+	SOCKET s = (SOCKET) sfp->handle;
+	unsigned long count = 0;
+	DWORD bytesRead = 0;
+	int r;
+
+	r = WSAIoctl(s, FIONREAD, NULL, 0, &count, sizeof count,
+			 &bytesRead, &sfp->overlapped, NULL);
+	if (r == SOCKET_ERROR)
+	{
+		if (GetLastError() != ERROR_IO_PENDING)
+		{
+			dprintf("WSARecvFrom %p failed %d\n",
+				sfp->handle, WSAGetLastError());
+			return -_L(EIO);
+		}
+
+		r = inet_socket_wait_complete(sfp);
+		if (r < 0)
+			return r;
+	}
+
+
+	dprintf("FIONREAD -> %ld\n", count);
+
+	return vm_memcpy_to_process(current, arg, &count, sizeof count);
+}
+
+static int inet_ioctl(struct filp *f, int cmd, unsigned long arg)
+{
+	struct socket_filp *sfp = (struct socket_filp*) f;
+
+	dprintf("ioctl(%p,%08x,%ld)\n", sfp, cmd, arg);
+
+	switch (cmd)
+	{
+	case _L(FIONREAD):
+		return inet_ioctl_nread(sfp, arg);
+	default:
+		dprintf("unknown socket ioctl %d\n", cmd);
+		return -_L(EINVAL);
+	}
+}
+
 static const struct filp_ops inet_ops = {
 	.fn_read = &inet_read,
 	.fn_write = &inet_write,
@@ -1006,36 +1104,53 @@ static const struct filp_ops inet_ops = {
 	.fn_poll_del = &inet_poll_del,
 	.fn_stat = &inet_stat,
 	.fn_seek = &inet_seek,
+	.fn_ioctl = &inet_ioctl,
 };
 
 int inet4_socket(int type, int protocol)
 {
 	struct socket_filp *sfp;
 	SOCKET s;
+	int flags = O_RDWR;
 
 	dprintf("socket(%d,%d)\n", type, protocol);
 
 	STATIC_ASSERT(SOCK_STREAM == _L(SOCK_STREAM));
 	STATIC_ASSERT(SOCK_DGRAM == _L(SOCK_DGRAM));
+	STATIC_ASSERT(SOCK_RAW == _L(SOCK_RAW));
+
+	STATIC_ASSERT(IPPROTO_IP == _L(IPPROTO_IP));
+	STATIC_ASSERT(IPPROTO_TCP == _L(IPPROTO_TCP));
+	STATIC_ASSERT(IPPROTO_ICMP == _L(IPPROTO_ICMP));
+
+	if (type & _L(O_NONBLOCK))
+	{
+		flags |= _L(O_NONBLOCK);
+		type &= ~_L(O_NONBLOCK);
+	}
 
 	switch (type)
 	{
 	case SOCK_STREAM:
-		dprintf("SOCK_STREAM\n");
+		dprintf("SOCK_STREAM %s\n", flags ? "non-blocking" : "");
 		if (protocol != _L(IPPROTO_IP) && protocol != _L(IPPROTO_TCP))
 			return -_L(EINVAL);
 		break;
 	case SOCK_DGRAM:
-		dprintf("SOCK_DGRAM\n");
+		dprintf("SOCK_DGRAM %s\n", flags ? "non-blocking" : "");
 		if (protocol != _L(IPPROTO_IP) && protocol != _L(IPPROTO_UDP))
 			return -_L(EINVAL);
 		break;
+	case SOCK_RAW:
+		dprintf("SOCK_RAW %s\n", flags ? "non-blocking" : "");
+		break;
 	default:
+		dprintf("type %d protocol %d unsupported\n", type, protocol);
 		return -_L(EINVAL);
 	}
 
 
-	s = WSASocket(AF_INET, type, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+	s = WSASocket(AF_INET, type, protocol, NULL, 0, WSA_FLAG_OVERLAPPED);
 	if (s == INVALID_SOCKET)
 		return -_L(EINVAL);
 
@@ -1045,7 +1160,7 @@ int inet4_socket(int type, int protocol)
 
 	sfp->type = type;
 
-	return inet_alloc_fd(sfp);
+	return inet_alloc_fd(sfp, flags);
 }
 
 static struct socket_filp *inet_alloc_socket(SOCKET s)
@@ -1083,9 +1198,8 @@ static struct socket_filp *inet_alloc_socket(SOCKET s)
 	return sfp;
 }
 
-static int inet_alloc_fd(struct socket_filp *sfp)
+static int inet_alloc_fd(struct socket_filp *sfp, int flags)
 {
-	SOCKET s = (SOCKET) sfp->handle;
 	int fd;
 
 	fd = alloc_fd();
@@ -1095,10 +1209,10 @@ static int inet_alloc_fd(struct socket_filp *sfp)
 		return -_L(ENOMEM);
 	}
 
-	dprintf("socket %d, fd %d, fp %p\n", s, fd, sfp);
+	dprintf("socket %p, fd %d, fp %p\n", sfp, fd, sfp);
 
 	current->handles[fd].fp = &sfp->fp;
-	current->handles[fd].flags = O_RDWR;
+	current->handles[fd].flags = flags;
 
 	return fd;
 }
@@ -1114,8 +1228,7 @@ void inet4_process_events(void)
 		if (sfp->thread &&
 			HasOverlappedIoCompleted(&sfp->overlapped))
 		{
-			SOCKET s = (SOCKET) sfp->handle;
-			dprintf("socket %d ready\n", s);
+			dprintf("socket %p ready\n", sfp);
 			ready_list_add(sfp->thread);
 		}
 	}
@@ -1178,7 +1291,7 @@ static void inet_on_async_select(WPARAM wParam, LPARAM lParam)
 {
 	struct socket_filp *sfp;
 
-	dprintf("async_select %d %08lx\n", wParam, lParam);
+	dprintf("async_select %d %08x\n", (UINT) wParam, (UINT) lParam);
 
 	LIST_FOR_EACH(&inet_sockets, sfp, item)
 	{
@@ -1199,7 +1312,7 @@ static void inet_on_async_select(WPARAM wParam, LPARAM lParam)
 		}
 	}
 
-	dprintf("socket %d not found\n", wParam);
+	dprintf("socket %d not found\n", (UINT) wParam);
 }
 
 /*
@@ -1246,6 +1359,49 @@ static void inet4_create_message_window(void)
 	dprintf("inet_hwnd = %p\n", inet_hwnd);
 }
 
+/*
+ * Write out /etc/resolve.conf
+ *
+ * Can be improved by making this a file in /proc
+ * and symlinking /etc/resolv.conf -> /proc/atratus/resolv.conf
+ */
+void inet4_write_resolv_conf(void)
+{
+	FIXED_INFO *fi;
+	DWORD r;
+	FILE *f;
+	DWORD len = 0;
+	IP_ADDR_STRING *ips;
+
+	fi = malloc(sizeof *fi);
+	len = sizeof *fi;
+
+	r = GetNetworkParams(fi, &len);
+	if (r != ERROR_SUCCESS)
+		goto error;
+
+	fi = realloc(fi, len);
+	r = GetNetworkParams(fi, &len);
+	if (r != ERROR_SUCCESS)
+		goto error;
+
+	f = fopen("etc/resolv.conf", "wb");
+	if (!f)
+		goto error;
+
+	fprintf(f, "# automatically generated by atratus.exe\n\n");
+
+	for (ips = &fi->DnsServerList; ips; ips = ips->Next)
+		fprintf(f, "nameserver %s\n", ips->IpAddress.String);
+
+	fprintf(f, "search %s\n", fi->DomainName);
+
+	fclose(f);
+
+error:
+	free(fi);
+}
+
 HANDLE inet4_init(void)
 {
 	WSADATA wsaData;
@@ -1255,6 +1411,8 @@ HANDLE inet4_init(void)
 		fprintf(stderr, "WSAStartup failed\n");
 		exit(1);
 	}
+
+	inet4_write_resolv_conf();
 
 	inet4_resolve_functions();
 

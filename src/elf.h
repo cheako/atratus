@@ -22,11 +22,13 @@
 #ifndef ATRATUS_ELF_H__
 #define ATRATUS_ELF_H__
 
+#include "usertypes.h"
+
 struct elf_module;
 
-int elf_alloc_vdso(struct process *proc, void **vdso);
+int elf_alloc_vdso(struct process *proc, user_ptr_t *vdso);
 int elf_stack_setup(struct process *context,
-		void *stack, size_t stack_size,
+		user_ptr_t stack, size_t stack_size,
 		char **argv, char **env,
 		struct elf_module *m,
 		struct elf_module *interp);

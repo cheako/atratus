@@ -28,7 +28,7 @@
 #include "debug.h"
 #include "zero.h"
 
-static int null_read(struct filp *f, void *buf, size_t size, loff_t *off, int block)
+static int null_read(struct filp *f, void *buf, user_size_t size, loff_t *off, int block)
 {
 	memset(buf, 0, size);
 	return size;
