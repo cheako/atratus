@@ -1,10 +1,12 @@
 args
 bsearch
+dir
 getopt
 getopt_long
 hw
 malloc
 string
+stdlib
 stdio
-strtoul
+ttysize
 uname

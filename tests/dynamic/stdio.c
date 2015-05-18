@@ -100,6 +100,22 @@ int test_sprintf(void)
 	if (strcmp("1 2", out))
 		return 1;
 
+	sprintf(out, "fn(): %c\n", 'x');
+	if (strcmp("fn(): x\n", out))
+		return 1;
+
+	sprintf(out, "%%x");
+	if (strcmp("%x", out))
+		return 1;
+
+	sprintf(out, "%*x", 4, 0x123);
+	if (strcmp(" 123", out))
+		return 1;
+
+	sprintf(out, "%*s", 4, "x");
+	if (strcmp("   x", out))
+		return 1;
+
 	return 0;
 }
 
@@ -125,12 +141,54 @@ int test_asprintf(void)
 	return 0;
 }
 
+int test_snprintf(void)
+{
+	char out[0x100];
+	int n;
+
+	n = snprintf(out, 1, "%d", 100);
+	if (strcmp("", out))
+		return 1;
+	if (n != 3)
+		return 1;
+
+	n = snprintf(out, 2, "%d", 100);
+	if (strcmp("1", out))
+		return 1;
+	if (n != 3)
+		return 1;
+
+	n = snprintf(out, 3, "%d", 100);
+	if (strcmp("10", out))
+		return 1;
+	if (n != 3)
+		return 1;
+
+	n = snprintf(out, 4, "%d", 100);
+	if (strcmp("100", out))
+		return 1;
+	if (n != 3)
+		return 1;
+
+	out[0] = 0;
+	n = snprintf(out, 0, "%d", 100);
+	if (out[0] != 0)
+		return 1;
+	if (n != 3)
+		return 1;
+
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	if (test_sprintf())
 		return 1;
 
 	if (test_asprintf())
+		return 1;
+
+	if (test_snprintf())
 		return 1;
 
 	printf("ok\n");

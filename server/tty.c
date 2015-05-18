@@ -27,6 +27,7 @@
 #include "process.h"
 #include "tty.h"
 #include "linux-errno.h"
+#include "linux-defines.h"
 #include "debug.h"
 
 typedef struct _con_filp con_filp;
@@ -41,6 +42,18 @@ struct con_callback {
 
 #define MAX_VT100_PARAMS 3
 
+struct termios
+{
+	unsigned int c_iflag;
+	unsigned int c_oflag;
+	unsigned int c_cflag;
+	unsigned int c_lflag;
+	unsigned char c_line;
+	unsigned char c_cc[8];
+};
+
+#define ICANON 2
+
 struct _con_filp {
 	filp fp;
 	int state;
@@ -50,7 +63,7 @@ struct _con_filp {
 	int bg_color;
 	int brightness;
 	int ready_count;
-	int canonical;
+	struct termios tios;
 	int eof;
 	unsigned char ready_data[20];
 	struct wait_list wl;
@@ -63,12 +76,17 @@ struct _con_filp {
 void con_poll_add(filp *f, struct wait_entry *we);
 void con_poll_del(filp *f, struct wait_entry *we);
 
+static int con_is_canonical(con_filp *con)
+{
+	return con->tios.c_lflag & ICANON;
+}
+
 int con_input_available(con_filp *con)
 {
 	int i;
 	int r = 0;
 
-	if (!con->canonical)
+	if (!con_is_canonical(con))
 		r = (con->ready_count > 0);
 	else
 	{
@@ -87,11 +105,12 @@ int con_read(filp *f, void *buf, size_t size, loff_t *ofs)
 	con_filp *con = (con_filp*) f;
 	int ret = 0;
 	struct wait_entry we;
+	int done = 0;
 
 	we.p = current;
 	con_poll_add(&con->fp, &we);
 
-	while (ret < size && !con->eof)
+	while (ret < size && !con->eof && !done)
 	{
 		BOOL wait = 0;
 
@@ -110,8 +129,6 @@ int con_read(filp *f, void *buf, size_t size, loff_t *ofs)
 			/* eof? */
 			if (ch == 0x04)
 				con->eof = 1;
-			else if (con->canonical && ch == '\r')
-				break;
 			else
 			{
 				int r;
@@ -125,6 +142,8 @@ int con_read(filp *f, void *buf, size_t size, loff_t *ofs)
 				buf = (char*)buf + 1;
 				ret++;
 			}
+			if (con_is_canonical(con) && ch == '\r')
+				done = 1;
 		}
 		else
 		{
@@ -151,7 +170,7 @@ void tty_input_add_char(con_filp *con, char ch)
 {
 	EnterCriticalSection(&con->cs);
 
-	if (con->canonical)
+	if (con_is_canonical(con))
 	{
 		// backspace
 		if (con->ready_count > 0 && ch == 9)
@@ -577,14 +596,60 @@ int con_write(filp *f, const void *buf, size_t size, loff_t *off)
 	return written;
 }
 
-#define TIOCGPGRP 0x540F
-#define TIOCSPGRP 0x5410
+static int con_set_termios(con_filp *con, void *p)
+{
+	dprintf("set termios(%p)\n", p);
+	return current->ops->memcpy_from(&con->tios, p, sizeof con->tios);
+}
+
+static int con_get_termios(con_filp *con, void *p)
+{
+	dprintf("get termios(%p)\n", p);
+	return current->ops->memcpy_to(p, &con->tios, sizeof con->tios);
+}
+
+#define TIOCGPGRP  0x540F
+#define TIOCSPGRP  0x5410
+#define TIOCGWINSZ 0x5413
+
+#define TIOCG     0x5401
+#define TIOCS     0x5402
+
+struct winsize {
+	unsigned short	ws_row;
+	unsigned short	ws_col;
+	unsigned short	ws_xpixel;
+	unsigned short	ws_ypixel;
+};
+
+static int con_get_winsize(void *ptr)
+{
+	CONSOLE_SCREEN_BUFFER_INFO info;
+	HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
+	struct winsize ws;
+	int r;
+
+	GetConsoleScreenBufferInfo(handle, &info);
+
+	ws.ws_col = info.srWindow.Right - info.srWindow.Left + 1;
+	ws.ws_row = info.srWindow.Bottom - info.srWindow.Top + 1;
+	ws.ws_xpixel = 0;
+	ws.ws_ypixel = 0;
+
+	dprintf("winsize -> %d,%d\n", ws.ws_col, ws.ws_row);
+
+	r = current->ops->memcpy_to(ptr, &ws, sizeof ws);
+	if (r < 0)
+		return r;
+
+	return 0;
+}
 
 int con_ioctl(filp *f, int cmd, unsigned long arg)
 {
+	con_filp *con = (con_filp*) f;
 	int *pgrp;
 	int r = 0;
-	dprintf("\n");
 
 	switch (cmd)
 	{
@@ -595,6 +660,12 @@ int con_ioctl(filp *f, int cmd, unsigned long arg)
 	case TIOCSPGRP:
 		f->pgid = arg;
 		break;
+	case TIOCS:
+		return con_set_termios(con, (void*)arg);
+	case TIOCG:
+		return con_get_termios(con, (void*)arg);
+	case TIOCGWINSZ:
+		return con_get_winsize((void*)arg);
 	default:
 		dprintf("unknown tty ioctl(%08x, %08x)\n", cmd, arg);
 		r = -_L(EINVAL);
@@ -688,7 +759,7 @@ static const struct filp_ops con_file_ops = {
 	.fn_poll_del = &con_poll_del,
 };
 
-filp* get_console(void)
+static filp* alloc_console(void)
 {
 	HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
 	DWORD id = 0;
@@ -711,7 +782,7 @@ filp* get_console(void)
 	con->brightness = 0;
 	con->ready_count = 0;
 	con->eof = 0;
-	con->canonical = 1;  /* default to canonical mode */
+	con->tios.c_lflag |= ICANON;
 
 	SetConsoleMode(in, ENABLE_PROCESSED_INPUT);
 
@@ -722,3 +793,11 @@ filp* get_console(void)
 	return &con->fp;
 }
 
+static filp *condev;
+
+filp* get_console(void)
+{
+	if (!condev)
+		condev = alloc_console();
+	return condev;
+}

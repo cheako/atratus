@@ -35,7 +35,7 @@
 
 #define NULL ((void *)0)
 
-static int verbose = 0;
+extern int verbose;
 static struct module_info loader_module;
 static struct module_info main_module;
 char **ld_environment;
@@ -167,7 +167,8 @@ Elf32_Sym *elf_hash_lookup(struct module_info *m,
 	}
 	if (!count)
 	{
-		printf("circular chain in ELF32 hash\n");
+		verbose = 1;
+		dprintf("circular chain in ELF32 hash\n");
 		exit(1);
 	}
 	return 0;
@@ -227,7 +228,7 @@ Elf32_Sym *elf_gnu_hash_lookup(struct module_info *m,
 	}
 
 	if (verbose && !r)
-		printf("symbol %s not found in %s\n",
+		dprintf("symbol %s not found in %s\n",
 			symbol_name, m->name);
 
 	return r;
@@ -273,8 +274,7 @@ static Elf32_Word ld_get_symbol_address_exclude(const char *sym,
 			return (loader_module.delta + r);
 	}
 
-	if (verbose)
-		printf("no symbol = %s\n", sym);
+	dprintf("no symbol = %s\n", sym);
 
 	return 0;
 }
@@ -298,12 +298,12 @@ void *__ld_dynamic_resolve(void *arg, unsigned int entry, void *callee)
 
 	if (verbose)
 	{
-		printf("%s arg=%p plt_entry=%08x callee=%p\n",
+		dprintf("%s arg=%p plt_entry=%08x callee=%p\n",
 			__FUNCTION__, arg, entry, callee);
 	}
 
 	if (m->dt.pltrel != DT_REL)
-		printf("not DT_REL\n");
+		dprintf("not DT_REL\n");
 	rel = (void*) (m->dt.jmprel + entry);
 
 	syminfo = ELF32_R_SYM(rel->r_info);
@@ -313,35 +313,36 @@ void *__ld_dynamic_resolve(void *arg, unsigned int entry, void *callee)
 
 	if (verbose)
 	{
-		printf("dt.symtab = %08x\n", m->dt.symtab);
-		printf("syminfo = %08x\n", syminfo);
+		dprintf("dt.symtab = %08x\n", m->dt.symtab);
+		dprintf("syminfo = %08x\n", syminfo);
 	}
 
 	st = (Elf32_Sym*) m->dt.symtab;
 	st += syminfo;
 
 	if (verbose)
-		printf("st_name = %d offset = %08x\n", st->st_name, rel->r_offset);
+		dprintf("st_name = %d offset = %08x\n", st->st_name, rel->r_offset);
 	symbol_name = (const char*) m->dt.strtab + st->st_name;
 	if (verbose)
-		printf("symbol_name = %s\n", symbol_name);
+		dprintf("symbol_name = %s\n", symbol_name);
 
 	target = ld_get_symbol_address(symbol_name);
 	if (!target)
 	{
 		// FIXME: handle weak symbols
-		printf("no such symbol (%s)\n", symbol_name);
+		verbose = 1;
+		dprintf("no such symbol (%s)\n", symbol_name);
 		exit(1);
 		return 0;
 	}
 
 	if (verbose)
-		printf("dynamic resolve, symbol -> %s\n", symbol_name);
+		dprintf("dynamic resolve, symbol -> %s\n", symbol_name);
 
 	r = (void*) target;
 
 	if (verbose)
-		printf("dynamic resolve: %08x -> %p\n", entry, r);
+		dprintf("dynamic resolve: %08x -> %p\n", entry, r);
 
 	/* patch the correct value into the GOT */
 	got_entry = (void**)((char*)m->delta + rel->r_offset);
@@ -349,7 +350,7 @@ void *__ld_dynamic_resolve(void *arg, unsigned int entry, void *callee)
 	/* patch the resolved address into the GOT */
 	*got_entry = r;
 	if (verbose)
-		printf("patched GOT at %p\n", got_entry);
+		dprintf("patched GOT at %p\n", got_entry);
 
 	return r;
 }
@@ -377,8 +378,8 @@ void patch_got(struct module_info *m)
 	unsigned int *got = (void*) + m->dt.pltgot;
 	if (verbose)
 	{
-		printf("PLTGOT:    %08x\n", m->dt.pltgot);
-		printf("PLTRELSZ:  %08x\n", m->dt.pltrelsz);
+		dprintf("PLTGOT:    %08x\n", m->dt.pltgot);
+		dprintf("PLTRELSZ:  %08x\n", m->dt.pltrelsz);
 	}
 
 	/* skip the first 3 entries, they're special */
@@ -405,7 +406,7 @@ void elf_apply_reloc_glob_dat(struct module_info *m, int offset)
 	syminfo = ELF32_R_SYM(rel[offset].r_info);
 
 	if (verbose)
-		printf("%08x %06x R_386_GLOB_DAT\n",
+		dprintf("%08x %06x R_386_GLOB_DAT\n",
 			rel->r_offset, syminfo);
 
 	st = (Elf32_Sym*) m->dt.symtab;
@@ -421,18 +422,18 @@ void elf_apply_reloc_glob_dat(struct module_info *m, int offset)
 		value = (uint32_t) (m->delta + st->st_value);
 
 		if (verbose)
-			printf("R_386_GLOB_DAT: definition "
+			dprintf("R_386_GLOB_DAT: definition "
 				"of %s (in %s) @%p -> %08x\n",
 				symbol_name, m->name, p, value);
 	}
 	else
 	{
 		if (verbose)
-			printf("%s used in %s\n", symbol_name, m->name);
+			dprintf("%s used in %s\n", symbol_name, m->name);
 		value = ld_get_symbol_address(symbol_name);
 
 		if (verbose)
-			printf("R_386_GLOB_DAT: reference "
+			dprintf("R_386_GLOB_DAT: reference "
 				"to %s (in %s) @%p -> %08x\n",
 				symbol_name, m->name, p, value);
 	}
@@ -455,7 +456,7 @@ void ld_apply_reloc_copy(struct module_info *m, Elf32_Rel *rel)
 	value = ld_get_symbol_address_exclude(symbol_name, m);
 	if (!value)
 	{
-		printf("symbol not found: %s\n", symbol_name);
+		dprintf("symbol not found: %s\n", symbol_name);
 		return;
 	}
 
@@ -466,7 +467,7 @@ void ld_apply_reloc_copy(struct module_info *m, Elf32_Rel *rel)
 
 	if (verbose)
 	{
-		printf("R_386_COPY (%s) %p -> %p\n", symbol_name, src, dest);
+		dprintf("R_386_COPY (%s) %p -> %p\n", symbol_name, src, dest);
 	}
 }
 
@@ -484,14 +485,15 @@ static void ld_apply_reloc_32(struct module_info *m, Elf32_Rel *rel)
 	value = ld_get_symbol_address(symbol_name);
 	if (!value)
 	{
-		printf("symbol '%s' not found\n", symbol_name);
+		verbose = 1;
+		dprintf("symbol '%s' not found\n", symbol_name);
 		exit(1);
 	}
 	value += main_module.delta;
 
 	if (verbose)
 	{
-		printf("R_386_32 reloc applied %s -> %08lx\n",
+		dprintf("R_386_32 reloc applied %s -> %08x\n",
 			symbol_name, value);
 	}
 	dest = (void*)(m->delta + rel->r_offset);
@@ -503,7 +505,7 @@ int ld_apply_relocations(struct module_info *m)
 	int i;
 
 	if (verbose)
-		printf("Applying relocs for %s\n", m->name);
+		dprintf("Applying relocs for %s\n", m->name);
 
 	for (i = 0; i < m->dt.relsz/sizeof (Elf32_Rel); i++)
 	{
@@ -521,7 +523,7 @@ int ld_apply_relocations(struct module_info *m)
 			break;
 		default:
 			/* FIXME */
-			printf("%08x %06x %d (not applied)\n", rel[i].r_offset,
+			dprintf("%08x %06x %d (not applied)\n", rel[i].r_offset,
 				syminfo, symtype);
 		}
 	}
@@ -534,7 +536,7 @@ static int ld_apply_loader_relocations(struct module_info *m)
 	int i;
 
 	if (verbose)
-		printf("Applying relocs for %s\n", m->name);
+		dprintf("Applying relocs for %s\n", m->name);
 
 	for (i = 0; i < m->dt.relsz/sizeof (Elf32_Rel); i++)
 	{
@@ -550,7 +552,8 @@ static int ld_apply_loader_relocations(struct module_info *m)
 			ld_apply_reloc_32(m, &rel[i]);
 			break;
 		default:
-			printf("%08x %06x "
+			verbose = 1;
+			dprintf("%08x %06x "
                                "(symbol type %d not supported)\n",
 				rel[i].r_offset, syminfo, symtype);
 			exit(1);
@@ -597,7 +600,7 @@ void ld_read_dynamic_section(struct module_info *m, Elf32_Word dyn_offset)
 		default:
 			if (0)
 			{
-				printf("[%2d] %08x %08x\n", i,
+				dprintf("[%2d] %08x %08x\n", i,
 					dyn[i].d_tag,
 					dyn[i].d_un.d_val);
 			}
@@ -612,7 +615,7 @@ static const Elf32_Phdr* ld_find_dynamic_phdr(Elf32_Phdr *phdr, unsigned int phn
 
 	if (phdr == NULL || phnum == 0)
 	{
-		printf("no program header?\n");
+		dprintf("no program header?\n");
 		return NULL;
 	}
 
@@ -668,7 +671,7 @@ void *ld_main(int argc, char **argv, char **env, Elf32_Aux *auxv)
 					ehdr->e_phnum);
 	if (!dynamic)
 	{
-		printf("loader has no dynamic program header\n");
+		dprintf("loader has no dynamic program header\n");
 		goto error;
 	}
 	ld_read_dynamic_section(&loader_module, dynamic->p_vaddr);
@@ -677,7 +680,7 @@ void *ld_main(int argc, char **argv, char **env, Elf32_Aux *auxv)
 	dynamic = ld_find_dynamic_phdr(phdr, phnum);
 	if (!dynamic)
 	{
-		printf("target has no dynamic program header\n");
+		dprintf("target has no dynamic program header\n");
 		goto error;
 	}
 
@@ -686,11 +689,11 @@ void *ld_main(int argc, char **argv, char **env, Elf32_Aux *auxv)
 	ld_read_dynamic_section(&main_module, dynamic->p_vaddr);
 
 	if (verbose)
-		printf("patching GOT\n");
+		dprintf("patching GOT\n");
 
 	patch_got(&main_module);
 	if (verbose)
-		printf("done returning to %p\n", entry);
+		dprintf("done returning to %p\n", entry);
 
 	ld_apply_loader_relocations(&loader_module);
 

@@ -6,6 +6,7 @@
 
 #define _l_EPERM 1
 #define _l_ENOENT 2
+#define _l_ESRCH 3
 #define _l_EIO 5
 #define _l_EBADF 9
 #define _l_ECHILD 10
@@ -15,6 +16,7 @@
 #define _l_EFAULT 14
 #define _l_ENOTDIR 20
 #define _l_EINVAL 22
+#define _l_ERANGE 34
 #define _l_ENOSYS 38
 
 #endif

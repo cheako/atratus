@@ -3,3 +3,4 @@ elf
 *.o
 *.so
 elf.exe
+.*.o.d

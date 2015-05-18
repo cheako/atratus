@@ -33,6 +33,8 @@
 #include "string.h"
 #include "stdlib.h"
 #include "time.h"
+#include "linux-errno.h"
+#include "linux-defines.h"
 
 #define NULL ((void *)0)
 
@@ -43,10 +45,12 @@
  * leave as global until we can load an ELF binary
  */
 static int errno;
-static int verbose = 0;
+int verbose = 0;
 extern char **ld_environment;
 
 #define EXPORT __attribute__((visibility("default")))
+
+EXPORT void abort(void);
 
 static inline int set_errno(int r)
 {
@@ -137,6 +141,39 @@ EXPORT int open64(const char *filename, int flags)
 	return open(filename, flags | O_LARGEFILE);
 }
 
+EXPORT off_t lseek(int fd, off_t offset, int whence)
+{
+	int r;
+	__asm__ __volatile__ (
+		"\tpushl %%ebx\n"
+		"\tmovl %%eax, %%ebx\n"
+		"\tmov $19, %%eax\n"
+		"\tint $0x80\n"
+		"\tpopl %%ebx\n"
+	:"=a"(r): "a"(fd), "c"(offset), "d"(whence) : "memory");
+	return set_errno(r);
+}
+
+typedef uint64_t off64_t;
+
+EXPORT off64_t lseek64(int fd, off64_t offset, int whence)
+{
+	int r;
+	unsigned int lo = (unsigned int) offset;
+	unsigned int hi = (offset >> 32);
+	off64_t result = 0;
+	__asm__ __volatile__ (
+		"\tpushl %%ebx\n"
+		"\tmovl %%eax, %%ebx\n"
+		"\tmov $140, %%eax\n"
+		"\tint $0x80\n"
+		"\tpopl %%ebx\n"
+	: "=a"(r)
+	: "a"(fd), "c"(hi), "d"(lo), "S"(&result), "D"(whence)
+	: "memory");
+	return set_errno(r);
+}
+
 EXPORT int close(int fd)
 {
 	int r;
@@ -151,7 +188,20 @@ EXPORT int close(int fd)
 	return set_errno(r);
 }
 
-EXPORT int getcwd(char *buf, size_t size)
+EXPORT int kill(pid_t pid, int signal)
+{
+	int r;
+	__asm__ __volatile__ (
+		"\tpushl %%ebx\n"
+		"\tmovl %%eax, %%ebx\n"
+		"\tmov $37, %%eax\n"
+		"\tint $0x80\n"
+		"\tpopl %%ebx\n"
+	:"=a"(r): "a"(pid), "c"(signal) : "memory");
+	return set_errno(r);
+}
+
+EXPORT char *getcwd(char *buf, size_t size)
 {
 	int r;
 	__asm__ __volatile__ (
@@ -162,6 +212,42 @@ EXPORT int getcwd(char *buf, size_t size)
 		"\tpopl %%ebx\n"
 	:"=a"(r): "a"(buf), "c"(size) : "memory");
 
+	if (r < 0)
+	{
+		set_errno(r);
+		return NULL;
+	}
+
+	return buf;
+}
+
+EXPORT int chdir(const char *path)
+{
+	int r;
+	__asm__ __volatile__ (
+		"\tpushl %%ebx\n"
+		"\tmovl %%eax, %%ebx\n"
+		"\tmov $12, %%eax\n"
+		"\tint $0x80\n"
+		"\tpopl %%ebx\n"
+	: "=a"(r)
+	: "a"(path)
+	: "memory");
+	return set_errno(r);
+}
+
+EXPORT int setuid(uid_t uid)
+{
+	int r;
+	__asm__ __volatile__ (
+		"\tpushl %%ebx\n"
+		"\tmovl %%eax, %%ebx\n"
+		"\tmov $23, %%eax\n"
+		"\tint $0x80\n"
+		"\tpopl %%ebx\n"
+	: "=a"(r)
+	: "a"(uid)
+	: "memory");
 	return set_errno(r);
 }
 
@@ -170,6 +256,51 @@ EXPORT int getuid(void)
 	int r;
 	__asm__ __volatile__ (
 		"\tmov $24, %%eax\n"
+		"\tint $0x80\n"
+	:"=a"(r):: "memory");
+	return set_errno(r);
+}
+
+EXPORT int setgid(gid_t gid)
+{
+	int r;
+	__asm__ __volatile__ (
+		"\tpushl %%ebx\n"
+		"\tmovl %%eax, %%ebx\n"
+		"\tmov $46, %%eax\n"
+		"\tint $0x80\n"
+		"\tpopl %%ebx\n"
+	: "=a"(r)
+	: "a"(gid)
+	: "memory");
+	return set_errno(r);
+}
+
+EXPORT gid_t getgid(void)
+{
+	int r;
+	__asm__ __volatile__ (
+		"\tmov $47, %%eax\n"
+		"\tint $0x80\n"
+	:"=a"(r):: "memory");
+	return set_errno(r);
+}
+
+EXPORT int geteuid(void)
+{
+	int r;
+	__asm__ __volatile__ (
+		"\tmov $49, %%eax\n"
+		"\tint $0x80\n"
+	:"=a"(r):: "memory");
+	return set_errno(r);
+}
+
+EXPORT int getegid(void)
+{
+	int r;
+	__asm__ __volatile__ (
+		"\tmov $50, %%eax\n"
 		"\tint $0x80\n"
 	:"=a"(r):: "memory");
 	return set_errno(r);
@@ -196,7 +327,36 @@ EXPORT pid_t getppid(void)
 	return set_errno(r);
 }
 
+EXPORT int waitpid(int pid, int *status, int options)
+{
+	int r;
+	__asm__ __volatile__ (
+		"\tpushl %%ebx\n"
+		"\tmovl %%eax, %%ebx\n"
+		"\tmov $7, %%eax\n"
+		"\tint $0x80\n"
+		"\tpopl %%ebx\n"
+	: "=a"(r)
+	: "a"(pid), "c"(status), "d"(options)
+	: "memory");
+	return set_errno(r);
+}
+
 struct stat64;
+
+EXPORT int __xstat64(int ver, const char *path, struct stat64 *st)
+{
+	int r;
+
+	__asm__ __volatile__ (
+		"\tpushl %%ebx\n"
+		"\tmovl %%eax, %%ebx\n"
+		"\tmov $195, %%eax\n"
+		"\tint $0x80\n"
+		"\tpopl %%ebx\n"
+	:"=a"(r): "a"(path), "c"(st) : "memory");
+	return set_errno(r);
+}
 
 EXPORT int __lxstat64(int ver, const char *path, struct stat64 *st)
 {
@@ -209,6 +369,20 @@ EXPORT int __lxstat64(int ver, const char *path, struct stat64 *st)
 		"\tint $0x80\n"
 		"\tpopl %%ebx\n"
 	:"=a"(r): "a"(path), "c"(st) : "memory");
+	return set_errno(r);
+}
+
+EXPORT int __fxstat64(int ver, int fd, struct stat64 *st)
+{
+	int r;
+
+	__asm__ __volatile__ (
+		"\tpushl %%ebx\n"
+		"\tmovl %%eax, %%ebx\n"
+		"\tmov $197, %%eax\n"
+		"\tint $0x80\n"
+		"\tpopl %%ebx\n"
+	:"=a"(r): "a"(fd), "c"(st) : "memory");
 	return set_errno(r);
 }
 
@@ -493,14 +667,14 @@ EXPORT FILE *fopen(const char *path, const char *mode)
 	}
 	else
 	{
-		printf("unknown mode %s\n", mode);
+		dprintf("unknown mode %s\n", mode);
 		return NULL;
 	}
 
 	f = malloc(sizeof *f + STDIO_READ_BUFFER_SZ);
 	if (!f)
 	{
-		printf("malloc failed\n");
+		dprintf("malloc failed\n");
 		close(fd);
 		return NULL;
 	}
@@ -521,7 +695,7 @@ EXPORT FILE *fopen64(const char *path, const char *mode)
 
 EXPORT int fflush(FILE *stream)
 {
-	printf("fflush(%p)\n", stream);
+	dprintf("fflush(%p)\n", stream);
 	return 0;
 }
 
@@ -543,7 +717,7 @@ EXPORT size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *f)
 
 EXPORT size_t fread(void *ptr, size_t size, size_t nmemb, FILE *f)
 {
-	printf("fread(%p,%ld,%ld,%p)\n", ptr, size, nmemb, f);
+	dprintf("fread(%p,%zd,%zd,%p)\n", ptr, size, nmemb, f);
 	return 0;
 }
 
@@ -692,6 +866,13 @@ EXPORT struct tm *localtime_r(const time_t *timep, struct tm *result)
 	return gmtime_r(&t, result);
 }
 
+EXPORT struct tm *localtime(const time_t *timep)
+{
+	static struct tm result;
+
+	return localtime_r(timep, &result);
+}
+
 static const char *time_wday[] = {
 	"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
 };
@@ -701,6 +882,12 @@ static const char *time_month[] = {
 	"Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 };
 
+static const char *time_full_month[] = {
+	"January", "Febuary", "March", "April", "May", "June",
+	"July", "August", "September", "October", "November", "December",
+};
+
+EXPORT long __timezone;
 EXPORT long __timezone;
 EXPORT int __daylight;
 
@@ -741,7 +928,7 @@ EXPORT size_t strftime(char *s, size_t max,
 			const char *format,
 			const struct tm *tm)
 {
-	int i, n = 0;
+	int i, n = 0, len;
 	int saw_percent = 0;
 
 	for (i = 0; format[i]; i++)
@@ -768,6 +955,13 @@ EXPORT size_t strftime(char *s, size_t max,
 					return 0;
 				strcpy(&s[n], time_month[tm->tm_mon]);
 				n += 3;
+				break;
+			case 'B':
+				len = strlen(time_full_month[tm->tm_mon]);
+				if ((n + len) > max)
+					return 0;
+				strcpy(&s[n], time_full_month[tm->tm_mon]);
+				n += len;
 				break;
 			case 'e': /* day of month, 2 characters, leading space */
 				if ((n + 2) > max)
@@ -813,7 +1007,7 @@ EXPORT size_t strftime(char *s, size_t max,
 				s[n++] = ((tm->tm_year + 1900) / 1) % 10 + '0';
 				break;
 			default:
-				printf("strftime(): %c unhandled\n", format[i]);
+				dprintf("strftime(): %c unhandled\n", format[i]);
 			}
 			saw_percent = 0;
 		}
@@ -946,9 +1140,17 @@ static void pf_pointer(void *value, struct printf_output *pfo)
 
 static void pf_string(const char *value, struct printf_output *pfo)
 {
+	size_t len;
+	size_t i;
+
 	if (!value)
 		value = "(null)";
-	pfo->fn(pfo, value, strlen(value));
+
+	len = strlen(value);
+	for (i = len; i < pfo->width; i++)
+		pfo->fn(pfo, " ", 1);
+
+	pfo->fn(pfo, value, len);
 }
 
 static void pf_char(char value, struct printf_output *pfo)
@@ -988,7 +1190,12 @@ static int internal_vsprintf(int flags, const char *str, va_list va,
 		}
 		else
 			pfo->pad = ' ';
-		while (*p >= '0' && *p <= '9')
+		if (*p == '*')
+		{
+			pfo->width = va_arg(va, int);
+			p++;
+		}
+		else while (*p >= '0' && *p <= '9')
 		{
 			pfo->width *= 10;
 			pfo->width += (*p - '0');
@@ -1012,6 +1219,7 @@ static int internal_vsprintf(int flags, const char *str, va_list va,
 		{
 		case '%':
 			pfo->fn(pfo, p, 1);
+			p++;
 			break;
 		case 'd':
 			if (lng > 1)
@@ -1062,7 +1270,7 @@ static int internal_vsprintf(int flags, const char *str, va_list va,
 			p++;
 			break;
 		default:
-			printf("%c unhandled\n", *p);
+			dprintf("printf(): %c unhandled\n", *p);
 			return 0;
 		}
 	}
@@ -1076,10 +1284,8 @@ static int printf_chk_pfo(struct printf_output *pfo, const char *str, size_t len
 	return 1;
 }
 
-EXPORT int __printf_chk(int flag, const char *str, ...)
+EXPORT int vprintf(const char *str, va_list va)
 {
-	va_list va;
-	int r;
 	struct printf_output pfo =
 	{
 		.fn = &printf_chk_pfo,
@@ -1088,18 +1294,33 @@ EXPORT int __printf_chk(int flag, const char *str, ...)
 		.max = 0,
 	};
 
+	return internal_vsprintf(0, str, va, &pfo);
+}
+
+EXPORT int __printf_chk(int flag, const char *str, ...)
+{
+	va_list va;
+	int r;
+
 	va_start(va, str);
 
-	r = internal_vsprintf(flag, str, va, &pfo);
+	r = vprintf(str, va);
 
 	va_end(va);
 
 	return r;
 }
 
-static int sprintf_chk_pfo(struct printf_output *pfo, const char *str, size_t len)
+static int snprintf_chk_pfo(struct printf_output *pfo, const char *str, size_t len)
 {
-	memcpy(&pfo->buffer[pfo->out_size], str, len);
+	if (pfo->out_size + len < pfo->max)
+		memcpy(&pfo->buffer[pfo->out_size], str, len);
+	else if (pfo->out_size < pfo->max)
+	{
+		/* partial copy */
+		memcpy(&pfo->buffer[pfo->out_size], str,
+			 pfo->max - pfo->out_size);
+	}
 	pfo->out_size += len;
 	return 1;
 }
@@ -1110,7 +1331,7 @@ EXPORT int __sprintf_chk(char *out, int flag, size_t maxlen, const char *str, ..
 	int r;
 	struct printf_output pfo =
 	{
-		.fn = &sprintf_chk_pfo,
+		.fn = &snprintf_chk_pfo,
 		.out_size = 0,
 		.buffer = out,
 		.max = maxlen,
@@ -1121,6 +1342,43 @@ EXPORT int __sprintf_chk(char *out, int flag, size_t maxlen, const char *str, ..
 	r = internal_vsprintf(flag, str, va, &pfo);
 
 	pfo.buffer[pfo.out_size] = 0;
+
+	va_end(va);
+
+	return r;
+}
+
+EXPORT int __snprintf_chk(char *out, size_t maxlen, int flag,
+			 size_t strlen, const char *str, ...)
+{
+	va_list va;
+	int r;
+	struct printf_output pfo =
+	{
+		.fn = &snprintf_chk_pfo,
+		.out_size = 0,
+		.buffer = out,
+		.max = maxlen ? maxlen - 1 : 0,
+	};
+
+	if (strlen < maxlen)
+	{
+		verbose = 1;
+		dprintf("snprintf overflow\n");
+		abort();
+	}
+
+	va_start(va, str);
+
+	r = internal_vsprintf(flag, str, va, &pfo);
+
+	if (maxlen)
+	{
+		if (pfo.out_size < pfo.max)
+			pfo.buffer[pfo.out_size] = 0;
+		else
+			pfo.buffer[pfo.max] = 0;
+	}
 
 	va_end(va);
 
@@ -1209,61 +1467,107 @@ EXPORT int __asprintf_chk(char **strp, int flags, const char *fmt, ...)
 	return r;
 }
 
+void dprintf(const char *str, ...)
+{
+	va_list va;
+
+	if (!verbose)
+		return;
+	va_start(va, str);
+	vprintf(str, va);
+	va_end(va);
+}
+
+#define STRTOX_IMPL							\
+	int sign = 1;							\
+									\
+	value = 0;							\
+									\
+	while (*nptr == ' ' || *nptr == '\t')				\
+		nptr++;							\
+									\
+	if (*nptr == '-')						\
+	{								\
+		nptr++;							\
+		sign = -1;						\
+	}								\
+	else if (*nptr == '+')						\
+		nptr++;							\
+	else if ((base == 0 || base == 0x10) &&				\
+		nptr[0] == '0' && (nptr[1] == 'x' || nptr[1] == 'X'))	\
+	{								\
+		nptr += 2;						\
+		base = 0x10;						\
+	}								\
+									\
+	/* TODO: handle other bases */					\
+									\
+	while (1)							\
+	{ 								\
+		int ch = *nptr; 					\
+									\
+		if (ch >= '0' && ch <= '9')				\
+			ch -= '0';					\
+		else if (ch >= 'A' && ch <= 'Z')			\
+			ch -= ch - 'A' + 10;				\
+		else if (ch >= 'a' && ch <= 'z')			\
+			ch -= ch - 'a' + 10;				\
+		else							\
+			break;						\
+									\
+		if (ch >= base)						\
+			break;						\
+									\
+		/* TODO: check overflow, set errno and return ULONG_MAX */ \
+									\
+		value *= base;						\
+		value += ch;						\
+		nptr++;							\
+	}								\
+									\
+	value *= sign;							\
+									\
+	if (endptr)							\
+		*endptr = (char*) nptr;					\
+									\
+	return value
+
 EXPORT unsigned long strtoul(const char *nptr, char **endptr, int base)
 {
-	unsigned long value = 0;
-	int sign = 1;
+	unsigned long value;
+	STRTOX_IMPL;
+}
 
-	if (*nptr == '-')
-	{
-		nptr++;
-		sign = -1;
-	}
-	else if (*nptr == '+')
-		nptr++;
-	else if ((base == 0 || base == 0x10) &&
-		nptr[0] == '0' && (nptr[1] == 'x' || nptr[1] == 'X'))
-	{
-		nptr += 2;
-		base = 0x10;
-	}
+EXPORT long long int strtoll(const char *nptr, char **endptr, int base)
+{
+	long long value;
+	STRTOX_IMPL;
+}
 
-	// TODO: handle other bases
+EXPORT long int strtol(const char *nptr, char **endptr, int base)
+{
+	long int value;
+	STRTOX_IMPL;
+}
 
-	while (1)
-	{
-		int ch = *nptr;
+EXPORT unsigned long long int strtoull(const char *nptr, char **endptr, int base)
+{
+	unsigned long long value;
+	STRTOX_IMPL;
+}
 
-		if (ch >= '0' && ch <= '9')
-			ch -= '0';
-		else if (ch >= 'A' && ch <= 'Z')
-			ch -= ch - 'A' + 10;
-		else if (ch >= 'a' && ch <= 'z')
-			ch -= ch - 'a' + 10;
-		else
-			break;
+EXPORT char *strerror(int errno)
+{
+	static char buf[32];
 
-		if (ch >= base)
-			break;
+	__sprintf_chk(buf, 0, sizeof buf, "errno=%u", errno);
 
-		// TODO: check overflow, set errno and return ULONG_MAX
-
-		value *= base;
-		value += ch;
-		nptr++;
-	}
-
-	value *= sign;
-
-	if (endptr)
-		*endptr = (char*) nptr;
-
-	return value;
+	return buf;
 }
 
 EXPORT void abort(void)
 {
-	/* FIXME: send SIGABRT */
+	kill(getpid(), _L(SIGABRT));
 	exit(1);
 }
 
@@ -1272,19 +1576,16 @@ EXPORT int mallopt(int param, int value)
 	switch (param)
 	{
 	case -1:
-		if (verbose)
-			printf("mallopt(M_TRIM_THRESHOLD,%d)\n", value);
+		dprintf("mallopt(M_TRIM_THRESHOLD,%d)\n", value);
 		break;
 	case -2:
-		if (verbose)
-			printf("mallopt(M_TOP_PAD,%d)\n", value);
+		dprintf("mallopt(M_TOP_PAD,%d)\n", value);
 		break;
 	case -3:
-		if (verbose)
-			printf("mallopt(M_MMAP_THRESHOLD,%d)\n", value);
+		dprintf("mallopt(M_MMAP_THRESHOLD,%d)\n", value);
 		break;
 	default:
-		printf("mallopt(%d,%d)\n", param, value);
+		dprintf("mallopt(%d,%d)\n", param, value);
 	}
 	return 0;
 }
@@ -1300,19 +1601,48 @@ struct heap_block
 #define HEAP_MAGIC 0x79a7b3f1
 
 static struct heap_block *first_block;
-static void *heap_brk;
 
 static void heap_split_block(struct heap_block *p, size_t sz)
 {
 	struct heap_block *next = p->next;
-	size_t block_sz = sz + sizeof (*p);
+	size_t block_sz = sz + sizeof *p;
 
-	p->next = (void*) ((char*)(p + 1) + block_sz);
+	/* too small, don't split */
+	if (sz + 3 * sizeof *p > p->sz)
+		return;
+
+	p->next = (void*) (((char*)p) + block_sz);
 	p->next->sz = p->sz - block_sz;
 	p->next->used = 0;
 	p->next->next = next;
 	p->next->magic = HEAP_MAGIC;
-	p->sz = sz;
+	p->sz = block_sz;
+}
+
+static int heap_can_merge_next(struct heap_block *p)
+{
+	char *end = (char*)p + p->sz;
+	return (p->next &&
+		!p->next->used &&
+		end == (char*) p->next);
+}
+
+static void heap_merge_next(struct heap_block *p)
+{
+	struct heap_block *next = p->next;
+
+	dprintf("Merging %p with next %p\n", p, next);
+
+	p->sz += next->sz;
+	p->next = next->next;
+	next->magic = 0x7fffffff;
+	next->next = (void*) 0xffffffff;
+	next->sz = 0;
+}
+
+static size_t heap_block_sz(struct heap_block *p)
+{
+	return p->sz - sizeof *p;
 }
 
 static void heap_compress(void)
@@ -1323,19 +1653,28 @@ static void heap_compress(void)
 	{
 		if (p->magic != HEAP_MAGIC)
 		{
-			printf("heap inconsistent!\n");
-			exit(1);
+			verbose = 1;
+			dprintf("heap magic wrong! %p %08x\n", p, p->magic);
+			abort();
+		}
+		if (p->next && p->next <= p)
+		{
+			verbose = 1;
+			dprintf("heap not linear! %p -> %p\n", p, p->next);
+			abort();
+		}
+		if (p->sz < sizeof (*p))
+		{
+			verbose = 1;
+			dprintf("heap block too small! %p\n", p);
+			abort();
 		}
 		if (!p->used)
 		{
-			char *end = (char*) (p+1) + p->sz;
 			/* merge blocks if they're contiguous */
-			if (p->next &&
-			    !p->next->used &&
-			    end == (char*) p->next)
+			if (heap_can_merge_next(p))
 			{
-				p->sz += p->next->sz;
-				p->next = p->next->next;
+				heap_merge_next(p);
 				continue;
 			}
 		}
@@ -1362,12 +1701,13 @@ EXPORT void *malloc(size_t sz)
 	{
 		if ((*p)->magic != HEAP_MAGIC)
 		{
-			printf("malloc(): corrupt heap %p\n", *p);
-			exit(1);
+			verbose = 1;
+			dprintf("malloc(): corrupt heap %p\n", *p);
+			abort();
 		}
 		if ((*p)->used)
 			continue;
-		if ((*p)->sz >= (sz + sizeof **p))
+		if (heap_block_sz(*p) >= sz)
 			break;
 	}
 
@@ -1376,12 +1716,12 @@ EXPORT void *malloc(size_t sz)
 	{
 		int brk_sz = (sz + sizeof **p + 0xfff) & ~0xfff;
 		void *r;
-		if (!heap_brk)
-			heap_brk = sys_brk(0);
-		r = sys_brk((char*)heap_brk + brk_sz);
+		void *cur_brk;
+
+		cur_brk = sys_brk(0);
+		r = sys_brk((char*)cur_brk + brk_sz);
 		if (!r)
 			return NULL;
-		heap_brk = r;
 
 		*p = (void*)((char*)r - brk_sz);
 		(*p)->magic = HEAP_MAGIC;
@@ -1393,9 +1733,12 @@ EXPORT void *malloc(size_t sz)
 	/* split block (if necessary) */
 	heap_split_block(*p, sz);
 
-	heap_compress();
 	(*p)->used = 1;
 	r = ((*p) + 1);
+
+	heap_compress();
+
+	dprintf("malloc -> %p\n", r);
 
 	return r;
 }
@@ -1403,51 +1746,63 @@ EXPORT void *malloc(size_t sz)
 EXPORT void *realloc(void *ptr, size_t mem)
 {
 	struct heap_block *p = ptr;
-	char *end;
 	void *nb;
+	size_t old_size;
 
 	if (!ptr)
-		return malloc(mem);
+	{
+		nb = malloc(mem);
+		goto out;
+	}
 
 	p--;
 
 	if (p->magic != HEAP_MAGIC)
 	{
-		printf("realloc(): corrupt heap %p\n", ptr);
-		exit(1);
+		verbose = 1;
+		dprintf("realloc(): corrupt heap %p\n", ptr);
+		abort();
 	}
 
 	if (!p->used)
 	{
-		printf("realloc(): memory not allocated %p\n", ptr);
-		exit(1);
+		verbose = 1;
+		dprintf("realloc(): memory not allocated %p\n", ptr);
+		abort();
 	}
 
-	if ((p->sz - sizeof (*p)) >= mem)
-		return (p + 1);
-
-	/* merge with the next block if it's free, adjacent and has enough space */
-	end = (char*) (p + 1) + p->sz;
-	if (p->next &&
-	    !p->next->used &&
-	    end == (char*) p->next &&
-	    ((p->sz + p->next->sz - sizeof *p) >= mem))
+	old_size = heap_block_sz(p);
+	if (old_size >= mem)
 	{
-		printf("Merging %p with next\n", p);
-		p->sz += p->next->sz;
-		p->next = p->next->next;
+		nb = ptr;
+		goto out;
+	}
+
+	/* merge with the next block if it's free */
+	while (heap_can_merge_next(p))
+		heap_merge_next(p);
+
+	if (heap_block_sz(p) >= mem)
+	{
 		heap_split_block(p, mem);
-		return (p + 1);
+		nb = &p[1];
+		goto out;
 	}
 
 	/* allocate a totally new block */
 	nb = malloc(mem);
 	if (!nb)
-		return NULL;
+	{
+		nb = NULL;
+		goto out;
+	}
 
-	memcpy(nb, p + 1, p->sz - sizeof *p);
+	memcpy(nb, &p[1], old_size);
 
 	heap_free_block(p);
+
+out:
+	dprintf("realloc -> %p\n", nb);
 
 	return nb;
 }
@@ -1455,18 +1810,24 @@ EXPORT void *realloc(void *ptr, size_t mem)
 EXPORT void free(void *ptr)
 {
 	struct heap_block *p = ptr;
+
+	if (!ptr)
+		return;
+
 	p--;
 
 	if (p->magic != HEAP_MAGIC)
 	{
-		printf("free(): corrupt heap %p\n", ptr);
-		exit(1);
+		verbose = 1;
+		dprintf("free(): corrupt heap %p\n", ptr);
+		abort();
 	}
 
 	if (!p->used)
 	{
-		printf("realloc(): memory not allocated %p\n", ptr);
-		exit(1);
+		verbose = 1;
+		dprintf("realloc(): memory not allocated %p\n", ptr);
+		abort();
 	}
 
 	heap_free_block(p);
@@ -1521,7 +1882,7 @@ EXPORT int *__errno_location(void)
 
 EXPORT char *strrchr(const char *s, int c)
 {
-	int n = strlen(s);
+	int n = strlen(s) + 1;
 
 	while (n)
 	{
@@ -1541,6 +1902,44 @@ EXPORT char *strchr(const char *s, int c)
 			return (char*) s;
 		s++;
 	}
+	if (!c)
+		return (char*) s;
+	return NULL;
+}
+
+EXPORT void *__rawmemchr(const void *s, int c)
+{
+	unsigned char *uc = (void*) s;
+	size_t i;
+
+	for (i = 0; ; i++)
+		if (uc[i] == c)
+			return &uc[i];
+
+	return NULL;
+}
+
+EXPORT void *memchr(const void *s, int c, size_t n)
+{
+	unsigned char *uc = (void*) s;
+	size_t i;
+
+	for (i = 0; i < n; i++)
+		if (uc[i] == c)
+			return &uc[i];
+
+	return NULL;
+}
+
+EXPORT void *memrchr(const void *s, int c, size_t n)
+{
+	unsigned char *uc = (void*) s;
+	size_t i;
+
+	for (i = n; i > 0; i--)
+		if (uc[i - 1] == c)
+			return &uc[i - 1];
+
 	return NULL;
 }
 
@@ -1563,6 +1962,21 @@ EXPORT char *strcpy(char *dest, const char *s)
 	return dest;
 }
 
+EXPORT char *__strcpy_chk(char *dest, const char *s, size_t destlen)
+{
+	size_t len = strlen(s) + 1;
+
+	if (len > destlen)
+	{
+		verbose = 1;
+		dprintf("strcpy() overrun\n");
+		abort();
+	}
+
+	memcpy(dest, s, len);
+	return dest;
+}
+
 EXPORT char *stpcpy(char *d, const char *s)
 {
 	while ((*d++ = *s++))
@@ -1573,6 +1987,131 @@ EXPORT char *stpcpy(char *d, const char *s)
 EXPORT char *strcat(char *dest, const char *src)
 {
 	return strcpy(dest + strlen(dest), src);
+}
+
+EXPORT char *__strcat_chk(char *dest, const char *src, size_t destlen)
+{
+	size_t sl = strlen(src);
+	size_t dl = strlen(dest);
+	if (sl + dl >= destlen)
+	{
+		verbose = 1;
+		dprintf("strcat(): overrun\n");
+		abort();
+	}
+	memcpy(&dest[dl], src, sl + 1);
+	return dest;
+}
+
+EXPORT char *__strncat_chk(char *dest, const char *src,
+			 size_t n, size_t destlen)
+{
+	size_t sl;
+	size_t dl = strlen(dest);
+	const char *end = memchr(src, '\0', n);
+
+	if (end)
+		sl = end - src;
+	else
+		sl = n;
+
+	if (sl + dl >= destlen)
+	{
+		verbose = 1;
+		dprintf("strcat(): overrun\n");
+		abort();
+	}
+	memcpy(&dest[dl], src, sl);
+	dest[dl + sl] = 0;
+	return dest;
+}
+
+EXPORT char *strdup(const char *str)
+{
+	size_t len = strlen(str) + 1;
+	char *r = malloc(len);
+	if (r)
+		memcpy(r, str, len);
+	return r;
+}
+
+EXPORT size_t strspn(const char *str, const char *accept)
+{
+	unsigned char ok[256] = {0};
+	int i, r;
+
+	for (i = 0; accept[i]; i++)
+		ok[(unsigned char)accept[i]] = 1;
+
+	r = 0;
+	while (1)
+	{
+		unsigned char ch = (unsigned char)str[r];
+		if (!ch)
+			break;
+		if (!ok[ch])
+			break;
+		r++;
+	}
+
+	return r;
+}
+
+EXPORT size_t strcspn(const char *str, const char *reject)
+{
+	unsigned char nak[256] = {0};
+	int i, r;
+
+	for (i = 0; reject[i]; i++)
+		nak[(unsigned char)reject[i]] = 1;
+
+	r = 0;
+	while (1)
+	{
+		unsigned char ch = (unsigned char)str[r];
+		if (!ch)
+			break;
+		if (nak[ch])
+			break;
+		r++;
+	}
+
+	return r;
+}
+
+typedef int regoff_t;
+
+typedef struct
+{
+} regex_t;
+
+typedef struct
+{
+	regoff_t rm_so;
+	regoff_t rm_eo;
+} regmatch_t;
+
+#define REG_NOMATCH 1
+
+EXPORT int regcomp(regex_t *preg, const char *regex, int cflags)
+{
+	dprintf("regcomp(%p,%s,%08x)\n", preg, regex, cflags);
+	return 0;
+}
+
+EXPORT int regexec(const regex_t *preg, const char *string, size_t nmatch,
+			regmatch_t *matches, int eflags)
+{
+	int i;
+
+	dprintf("regexec(%p,...)\n", preg);
+
+	for (i = 0; i < nmatch; i++)
+	{
+		matches[i].rm_so = -1;
+		matches[i].rm_eo = -1;
+	}
+	return REG_NOMATCH;
 }
 
 EXPORT void *bsearch(const void *key, const void *base,
@@ -1623,12 +2162,12 @@ EXPORT char *getenv(const char *name)
 		if (!x)
 			return NULL;
 
-		n = *p - x;
+		n = x - *p;
 		if (n != len)
 			continue;
 
-		if (!memcmp(name, *p, n))
-			return *p;
+		if (!strncmp(name, *p, n))
+			return *p + n + 1;
 	}
 
 	return NULL;
@@ -1643,13 +2182,15 @@ struct option
 };
 
 EXPORT int optind = 1;
-EXPORT int opterr;
+EXPORT int opterr = 1;
 EXPORT int optopt = '?';
 EXPORT char *optarg;
 static int nextchar;
+static int opt_first_arg;
 
-const struct option *getopt_find_longopt(const struct option *opt,
-					 const char *str)
+static const struct option *
+getopt_find_longopt(const struct option *opt,
+		 const char *str)
 {
 	while (opt->name)
 	{
@@ -1660,68 +2201,139 @@ const struct option *getopt_find_longopt(const struct option *opt,
 	return NULL;
 }
 
+void print_av(const char *prefix, const char **av)
+{
+	dprintf("%s: ", prefix);
+	while (*av)
+		dprintf("%s ", *av++);
+	dprintf("\n");
+}
+
+/*
+ *  Accumulate non-options at the end of the argv list
+ *    tail foo -f bar
+ *         ^      ^
+ *         |      +-- pos   (4)
+ *         |
+ *         +--- optind      (2)
+ *              group_count (1)
+ */
+static void opt_shuffle(const char **av, int pos, int group_count)
+{
+	const char *tmp;
+
+	while (optind < (pos - group_count))
+	{
+		tmp = av[pos - 1];
+		memmove(&av[optind + 1], &av[optind],
+			 (pos - 2 + group_count - optind) *
+				sizeof (const char *));
+		av[optind] = tmp;
+		optind++;
+	}
+
+	optind = pos;
+	opt_first_arg = pos;
+}
+
 EXPORT int getopt_long(int argc, const char **argv,
 		const char *optstring,
 		const struct option *longopts, int *longindex)
 {
+	unsigned char opts[0x100] = {0};
 	int stop = 0;
 	int i = 0;
+	unsigned char ch;
+	int pos;
+	int group_count = 0;
 
-	optarg = NULL;
-
-	if (optind == 0)
-	{
-		while (optind < argc && argv[optind][0] != '-')
-			optind++;
-
-		/* no options? go back to the start */
-		if (optind == argc)
-		{
-			optind = 1;
-			return -1;
-		}
-	}
-
-	if (optind >= argc)
-		return -1;
-
+	/*
+	 * store options by index
+	 *  0  no option
+	 *  1  option
+	 *  2  option with arg
+	 */
 	if (optstring[i] == '+')
 	{
 		stop = 1;
 		i++;
 	}
 
+	while (1)
+	{
+		ch = (unsigned char) optstring[i];
+		if (ch == 0)
+			break;
+		opts[ch] = 1;
+		i++;
+		if (optstring[i] == ':')
+		{
+			opts[ch] = 2;
+			i++;
+		}
+	}
+
+	optarg = NULL;
+
+	/* skip busybox style subprogram name */
+	if (optind == 0)
+		optind++;
+
+	/* reset to the start */
+	if (optind == 1)
+		opt_first_arg = 1;
+	pos = optind;
+
+	if (optind >= argc)
+	{
+		optind = opt_first_arg;
+		return -1;
+	}
+
 	if (nextchar == 0)
 	{
-		if (argv[optind][0] != '-')
+		/*
+		 * At the end, go back to the first non-option
+		 * Incorrectly include an option args as a non-option.
+		 */
+		while (1)
 		{
-			if (!stop)
-				optind++;
-			return -1;
+			if (pos >= argc)
+			{
+				optind = opt_first_arg;
+				return -1;
+			}
+
+			if (argv[pos][0] == '-')
+				break;
+			pos++;
 		}
 		nextchar++;
+		group_count++;
 
 		/* long option */
-		if (longopts && argv[optind][1] == '-')
+		if (longopts && argv[pos][1] == '-')
 		{
 			const struct option *o;
 
-			o = getopt_find_longopt(longopts, &argv[optind][2]);
+			o = getopt_find_longopt(longopts, &argv[pos][2]);
 			if (o)
 			{
 				nextchar = 0;
-				optind++;
+				pos++;
 				if (o->flag)
 					*(o->flag) = o->val;
 				if (o->has_arg)
 				{
-					if (optind >= argc)
+					if (pos >= argc)
 						return -1;
-					optarg = (char*) argv[optind++];
+					optarg = (char*) argv[pos++];
+					group_count++;
 					optopt = 0;
 				}
 				else
 					optopt = o->val;
+				opt_shuffle(argv, pos, group_count);
 				return optopt;
 			}
 			else
@@ -1732,54 +2344,59 @@ EXPORT int getopt_long(int argc, const char **argv,
 		}
 	}
 
-	optopt = argv[optind][nextchar];
-
+	optopt = argv[pos][nextchar];
 	if (optopt == '-' || optopt == 0)
+		goto error;
+
+	ch = (unsigned char) optopt;
+	if (opts[ch] == 0)
 	{
-		if (!stop)
-		{
-			optind++;
-			nextchar = 0;
-		}
-		return -1;
+		optopt = '?';
+		nextchar = 0;
+		pos++;
+		opt_shuffle(argv, pos, group_count);
+		return optopt;
 	}
 
-	for ( ; ; i++)
+	/* got an option, proceed to the next character */
+	nextchar++;
+	if (argv[pos][nextchar] == 0)
 	{
-		if (optstring[i] == 0)
+		pos++;
+		nextchar = 0;
+	}
+
+	/* handle option with an arg */
+	if (opts[ch] == 2)
+	{
+		if (pos >= argc)
 		{
 			optopt = '?';
-			nextchar = 0;
-			optind++;
-			break;
+			if (opterr)
+				dprintf("%s: option requires an argument -- '%c'\n",
+					argv[0], optstring[i]);
+			return -1;
 		}
-		if (optopt == optstring[i])
+		else
 		{
-			nextchar++;
-			if (argv[optind][nextchar] == 0)
-			{
-				optind++;
-				nextchar = 0;
-			}
-			if (optstring[i+1] == ':')
-			{
-				if (optind >= argc)
-				{
-					optopt = '?';
-					printf("%s: option requires an argument -- '%c'\n",
-						argv[0], optstring[i]);
-				}
-				else
-				{
-					optarg = (char*) &argv[optind][nextchar];
-					optind++;
-					nextchar = 0;
-				}
-			}
-			break;
+			optarg = (char*) &argv[pos][nextchar];
+			pos++;
+			group_count++;
+			nextchar = 0;
 		}
 	}
 
+	opt_shuffle(argv, pos, group_count);
+
+	return optopt;
+
+error:
+	if (!stop)
+	{
+		optind++;
+		nextchar = 0;
+		optopt = -1;
+	}
 	return optopt;
 }
 
@@ -1789,12 +2406,6 @@ EXPORT int getopt(int argc, const char **argv,
 	return getopt_long(argc, argv, optstring, NULL, NULL);
 }
 
-EXPORT int isatty(int fd)
-{
-	printf("isatty()\n");
-	return 1;
-}
-
 struct termios
 {
 	unsigned int c_iflag;
@@ -1802,21 +2413,66 @@ struct termios
 	unsigned int c_cflag;
 	unsigned int c_lflag;
 	unsigned char c_line;
-	unsigned char c_cc[32];
-	int c_ispeed;
-	int c_ospeed;
+	unsigned char c_cc[8];
 };
+
+#define TCGETS 0x5401
+#define TCSETS 0x5402
 
 EXPORT int tcgetattr(int fd, struct termios *tios)
 {
-	printf("tcgetattr()\n");
-	memset(&tios, 0, sizeof *tios);
-	return 0;
+	return ioctl(fd, TCGETS, (int) tios);
 }
 
 EXPORT int tcsetattr(int fd, struct termios *tios)
 {
-	printf("tcsetattr()\n");
+	return ioctl(fd, TCSETS, (int) tios);
+}
+
+EXPORT pid_t tcgetpgrp(int fd)
+{
+	dprintf("tcgetpgrp(%d)\n", fd);
+	return getpid();
+}
+
+EXPORT int tcsetpgrp(int fd, pid_t pgrp)
+{
+	dprintf("tcsetpgrp(%d, %d)\n", fd, pgrp);
+	return 0;
+}
+
+EXPORT pid_t getpgrp(void)
+{
+	dprintf("getpgrp()\n");
+	return getpid();
+}
+
+EXPORT int setpgid(pid_t pid, pid_t pgid)
+{
+	dprintf("setpgid(%d,%d)\n", pid, pgid);
+	return 0;
+}
+
+EXPORT int isatty(int fd)
+{
+	struct termios tios;
+
+	if (0 == tcgetattr(fd, &tios))
+		return 1;
+	return 0;
+}
+
+EXPORT int ttyname_r(int fd, char *buf, size_t buflen)
+{
+	const char name[] = "/dev/tty";
+	if (!isatty(fd))
+		return -1;
+
+	if (buflen < sizeof name)
+		return _L(ERANGE);
+
+	strcpy(buf, name);
+
 	return 0;
 }
 
@@ -1825,7 +2481,7 @@ struct jmp_buf {
 
 EXPORT int _setjmp(struct jmp_buf *buf)
 {
-	printf("setjmp(%p)\n", buf);
+	dprintf("setjmp(%p)\n", buf);
 	return 0;
 }
 
@@ -1845,44 +2501,52 @@ struct sigaction
 EXPORT int sigaction(int num, const struct sigaction *act,
 			 struct sigaction *oldact)
 {
-	printf("sigaction(%d,%p,%p)\n", num, act, oldact);
+	dprintf("sigaction(%d,%p,%p)\n", num, act, oldact);
 	return 0;
 }
 
 EXPORT int sigfillset(sigset_t *set)
 {
-	printf("sigsetfill(%p)\n", set);
+	dprintf("sigsetfill(%p)\n", set);
 	return 0;
 }
 
 EXPORT int sigemptyset(sigset_t *set)
 {
-	printf("sigemptyset(%p)\n", set);
+	dprintf("sigemptyset(%p)\n", set);
 	return 0;
 }
 
 EXPORT int sigaddset(sigset_t *set, int num)
 {
-	printf("sigaddset(%p)\n", set);
+	dprintf("sigaddset(%p)\n", set);
 	return 0;
 }
 
 EXPORT int sigdelset(sigset_t *set, int num)
 {
-	printf("sigaddset(%p)\n", set);
+	dprintf("sigaddset(%p)\n", set);
 	return 0;
 }
 
 EXPORT int sigismember(const sigset_t *set, int num)
 {
-	printf("sigaddset(%p)\n", set);
+	dprintf("sigaddset(%p)\n", set);
 	return 0;
 }
 
 EXPORT int signal(int num, void *handler)
 {
-	printf("signal(%d,%p)\n", num, handler);
+	dprintf("signal(%d,%p)\n", num, handler);
 	return SIG_DFL;
+}
+
+typedef void *sigjmp_buf;
+
+EXPORT int __sigsetjmp(sigjmp_buf env, int savemask)
+{
+	dprintf("sigsetjmp(%p,%d)\n", env, savemask);
+	return 0;
 }
 
 typedef int (*fn_main)(int, char * *, char * *);
@@ -1896,24 +2560,19 @@ EXPORT int __libc_start_main(fn_main pmain,
 			fn_rtld_fini prtld_fini,
 			void (* stack_end))
 {
-	if (verbose)
-	{
-		printf("%s called\n", __FUNCTION__);
-		printf("main   %p\n", pmain);
-		printf("argc   %d\n", argc);
-		printf("ubp_av %p\n", ubp_av);
-		printf("init   %p\n", pinit);
-		printf("fini   %p\n", pfini);
-		printf("stkend %p\n", stack_end);
-	}
+	dprintf("%s called\n", __FUNCTION__);
+	dprintf("main   %p\n", pmain);
+	dprintf("argc   %d\n", argc);
+	dprintf("ubp_av %p\n", ubp_av);
+	dprintf("init   %p\n", pinit);
+	dprintf("fini   %p\n", pfini);
+	dprintf("stkend %p\n", stack_end);
 
 	pinit();
 
-	if (verbose)
-		printf("init() done\n");
+	dprintf("init() done\n");
 
 	pmain(argc, ubp_av, NULL);
-	if (verbose)
-		printf("main() done\n");
+	dprintf("main() done\n");
 	exit(0);
 }

@@ -30,6 +30,8 @@ typedef enum {
 	thread_terminated,
 } thread_state;
 
+#define FD_CLOSE_ON_EXEC 1
+
 struct process
 {
 	struct process_ops		*ops;
@@ -46,6 +48,7 @@ struct process
 	unsigned int			vtls_entries;
 	struct user_desc		vtls[MAX_VTLS_ENTRIES];
 	filp				*handles[MAX_FDS];
+	uint8_t				fd_flags[MAX_FDS];
 	struct process                  *next_process;
 	struct process                  *parent;
 	struct process                  *child;
@@ -57,6 +60,7 @@ struct process
 	unsigned int                    umask;
 	int				exit_code;
 	PVOID				fiber;
+	char				*cwd;
 };
 
 extern struct process *current;

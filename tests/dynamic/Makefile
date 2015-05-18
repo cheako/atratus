@@ -4,13 +4,15 @@ CC = gcc
 TARGETS = \
 	args \
 	bsearch \
+	dir \
 	getopt \
 	getopt_long \
 	hw \
 	malloc \
 	stdio \
+	stdlib \
 	string \
-	strtoul \
+	ttysize \
 	uname
 
 all: $(TARGETS)

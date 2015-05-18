@@ -30,6 +30,7 @@
 #define alloca(sz) __builtin_alloca(sz)
 
 #include "linux-errno.h"
+#include "linux-defines.h"
 #include "filp.h"
 #include "tty.h"
 #include "pipe.h"
@@ -38,28 +39,6 @@
 #include "elf-av.h"
 
 #include "process.h"
-
-/* _l_ prefix is for Linux kernel ABI stuff */
-#define _l_MAP_FAILED ((void*)-1)
-
-#define _l_MAP_SHARED       1
-#define _l_MAP_PRIVATE      2
-#define _l_MAP_FIXED     0x10
-#define _l_MAP_ANONYMOUS 0x20
-
-#define _l_PROT_READ  1
-#define _l_PROT_WRITE 2
-#define _l_PROT_EXEC  4
-#define _l_PROT_NONE  0
-
-#define _l_O_RDONLY 0
-#define _l_O_WRONLY 1
-#define _l_O_RDWR 2
-#define _l_O_CREAT 0x100
-
-#define _l_WNOHANG (1)
-
-#define _l_SIGCHLD (17)
 
 struct _l_pollfd {
 	int fd;
@@ -267,6 +246,7 @@ static void dump_line(void *p, unsigned int len)
 	unsigned int i;
 	char line[0x11];
 
+	line[0x10] = 0;
 	for (i = 0; i < 16; i++)
 	{
 		if (i < len)
@@ -1128,11 +1108,11 @@ filp* filp_from_fd(int fd)
 	return current->handles[fd];
 }
 
-int alloc_fd(void)
+int alloc_fd_above(int start)
 {
 	int newfd;
 
-	for (newfd = 0; newfd < MAX_FDS; newfd++)
+	for (newfd = start; newfd < MAX_FDS; newfd++)
 	{
 		if (!current->handles[newfd])
 			break;
@@ -1144,6 +1124,11 @@ int alloc_fd(void)
 	return newfd;
 }
 
+int alloc_fd(void)
+{
+	return alloc_fd_above(0);
+}
+
 int sys_fork(void)
 {
 	HANDLE parent = NULL;
@@ -1151,6 +1136,7 @@ int sys_fork(void)
 	struct process *context;
 	OBJECT_ATTRIBUTES oa;
 	NTSTATUS r;
+	int i;
 
 	dprintf("fork()\n");
 
@@ -1198,7 +1184,13 @@ int sys_fork(void)
 	 */
 
 	/* copy fd set */
-	memcpy(context->handles, current->handles, sizeof current->handles);
+	for (i = 0; i < MAX_FDS; i++)
+	{
+		if (!(current->fd_flags[i] & FD_CLOSE_ON_EXEC))
+			context->handles[i] = current->handles[i];
+		else
+			context->handles[i] = NULL;
+	}
 
 	/* copy the parent thread's context into this one's */
 	context->regs = current->regs;
@@ -1238,6 +1230,8 @@ int sys_fork(void)
 		goto out;
 	}
 
+	context->cwd = strdup(current->cwd);
+
 	/* set the process parent */
 	context->parent = current;
 
@@ -1263,7 +1257,7 @@ int sys_exit(int exit_code)
 	current->exit_code = exit_code;
 	current->state = thread_terminated;
 
-	process_signal(current->parent, _l_SIGCHLD);
+	process_signal(current->parent, _L(SIGCHLD));
 
 	unlink_process(current);
 
@@ -1306,272 +1300,62 @@ int sys_write(int fd, void *addr, size_t length)
 	return fp->ops->fn_write(fp, addr, length, &fp->offset);
 }
 
-char rootdir[MAX_PATH + 1];
+void winfs_init(void);
+void devfs_init(void);
 
-char *unix2dos_path(const char *unixpath)
+struct fs *fs_first;
+
+void fs_add(struct fs *fs)
 {
-	char *ret;
-	int n, i;
-
-	ret = malloc(strlen(rootdir) + strlen(unixpath) + 2);
-	if (ret)
-	{
-		strcpy(ret, rootdir);
-		n = strlen(ret);
-
-		/* append \ if necessary */
-		if (n && ret[n - 1] != '\\')
-		{
-			ret[n++] = '\\';
-			ret[n++] = 0;
-		}
-
-		/* append unix path, changing / to \ */
-		for (i = 0; unixpath[i]; i++)
-		{
-			if (unixpath[i] == '/')
-			{
-				if (i != 0)
-					ret[n++] = '\\';
-			}
-			else
-				ret[n++] = unixpath[i];
-		}
-		ret[n] = 0;
-	}
-
-	dprintf("%s -> %s\n", unixpath, ret);
-
-	return ret;
+	fs->next = fs_first;
+	fs_first = fs;
 }
 
-/*
- * It would be nice if there was a function to do this in one go in Windows
- * Other ways to achieve better performance:
- *  - issue an APC in the windows client (Wine style)
- *  - do this in the NT kernel in a driver
- */
-NTSTATUS file_read_to_userland(HANDLE handle, void *buf,
-				size_t size, loff_t *ofs)
+static char *get_path(const char *file)
 {
-	uint8_t buffer[0x1000];
-	NTSTATUS r;
-	DWORD bytesRead;
-	int bytesCopied = 0;
+	char *path;
 
-	while (size)
-	{
-		LARGE_INTEGER pos;
-		LARGE_INTEGER out;
-		DWORD sz;
+	if (file[0] == '/')
+		return strdup(file);
 
-		pos.QuadPart = *ofs;
+	path = malloc(strlen(file) + strlen(current->cwd) + 1);
 
-		r = SetFilePointerEx(handle, pos, &out, FILE_BEGIN);
-		if (!r)
-			break;
+	strcpy(path, current->cwd);
+	strcat(path, "/");
+	strcat(path, file);
 
-		if (size > sizeof buffer)
-			sz = sizeof buffer;
-		else
-			sz = size;
+	/*
+	 * FIXME: tidy path, remove:
+	 *   .. . //
+	 */
 
-		bytesRead = 0;
-		r = ReadFile(handle, buffer, sz, &bytesRead, NULL);
-		if (!r)
-		{
-			dprintf("ReadFile failed %ld\n", GetLastError());
-			return -_L(EIO);
-		}
-
-		if (bytesRead == 0)
-			break;
-
-		r = NtWriteVirtualMemory(current->process, buf,
-					 buffer, bytesRead, &sz);
-		if (r != STATUS_SUCCESS)
-		{
-			if (bytesCopied)
-				break;
-			return -_L(EFAULT);
-		}
-		bytesCopied += bytesRead;
-		buf = (char*) buf + bytesRead;
-		size -= bytesRead;
-		(*ofs) += bytesRead;
-	}
-	return bytesCopied;
+	return path;
 }
 
-int file_read(filp *f, void *buf, size_t size, loff_t *off)
+static int do_open(const char *file, int flags, int mode)
 {
-	return file_read_to_userland(f->handle, buf, size, off);
-}
-
-/* read client file handle into "kernel" memory */
-int kread(int fd, void *buf, size_t size, off_t off)
-{
-	LARGE_INTEGER pos;
-	LARGE_INTEGER out;
-	DWORD bytesRead = 1;
-	BOOL r;
-	filp *fp;
-
-	fp = filp_from_fd(fd);
-	if (!fp)
-		return -_L(EBADF);
-
-	pos.QuadPart = off;
-
-	r = SetFilePointerEx(fp->handle, pos, &out, FILE_BEGIN);
-	if (!r)
-		return -_L(EIO);
-
-	r = ReadFile(fp->handle, buf, size, &bytesRead, NULL);
-	if (!r)
-		return -_L(EIO);
-
-	return bytesRead;
-}
-
-int file_write(filp *f, const void *buf, size_t size, loff_t *off)
-{
-	uint8_t buffer[0x1000];
-	DWORD bytesCopied = 0;
-
-	while (size)
-	{
-		ULONG sz = size;
-		DWORD bytesWritten;
-		ULONG bytesRead = 0;
-		NTSTATUS r;
-
-		if (sz > sizeof buffer)
-			sz = sizeof buffer;
-
-		r = NtReadVirtualMemory(current->process, buf,
-				 buffer, sz, &bytesRead);
-		if (r != STATUS_SUCCESS)
-			return -_L(EFAULT);
-
-		bytesWritten = 0;
-		r = WriteFile(f->handle, buf, bytesRead, &bytesWritten, NULL);
-		if (!r)
-		{
-			fprintf(stderr, "ReadFile %p failed %ld\n",
-				f->handle, GetLastError());
-			return -_L(EIO);
-		}
-
-		/* move along */
-		bytesCopied += bytesWritten;
-		sz -= bytesWritten;
-		buf = (char*) buf + bytesWritten;
-		(*off) += bytesWritten;
-	}
-
-	return bytesCopied;
-}
-
-#define SECSPERDAY 86400
-#define SECS_1601_TO_1970 ((369 * 365 + 89) * (ULONGLONG)SECSPERDAY)
-
-int longlong_to_unixtime(ULONGLONG seconds, unsigned int *ns)
-{
-	if (ns)
-		*ns = (seconds%10000000LL)*100LL;
-	seconds /= 10000000LL;
-	seconds -= SECS_1601_TO_1970;
-	return seconds;
-}
-
-int file_stat(filp *f, struct stat64 *statbuf)
-{
-	IO_STATUS_BLOCK iosb;
-	FILE_DIRECTORY_INFORMATION info;
-	NTSTATUS r;
-
-	r = NtQueryInformationFile(f->handle, &iosb, &info,
-				 sizeof info, FileDirectoryInformation);
-	if (r != STATUS_SUCCESS)
-		return _L(EPERM);
-
-	memset(statbuf, 0, sizeof *statbuf);
-	statbuf->st_mode = 0755;
-
-	if (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-		statbuf->st_mode |= 040000;
-	else
-		statbuf->st_mode |= 0100000;
-	statbuf->ctime = longlong_to_unixtime(info.ChangeTime.QuadPart,
-				&statbuf->ctime_nsec);
-	statbuf->mtime = longlong_to_unixtime(info.LastWriteTime.QuadPart,
-				&statbuf->mtime_nsec);
-	statbuf->atime = longlong_to_unixtime(info.LastAccessTime.QuadPart,
-				&statbuf->atime_nsec);
-	statbuf->st_size = info.AllocationSize.QuadPart;
-	statbuf->st_blksize = 0x1000;
-
-	return 0;
-}
-
-int file_getdents(filp *fp, void *de, unsigned int count, fn_add_dirent add_de)
-{
-	int ofs = 0;
+	struct fs *fs;
+	char *path;
 	int r;
-	unsigned char *p = (unsigned char*) de;
-	NTSTATUS ret;
-	IO_STATUS_BLOCK iosb;
-	BYTE buffer[0x1000];
-	BOOL first = TRUE;
-	FILE_DIRECTORY_INFORMATION *info;
-	WCHAR star[] = { '*', '.', '*', 0 };
-	UNICODE_STRING mask;
-	struct linux_dirent *prev_de = NULL;
-	ULONG EntryOffset;
+	size_t len;
 
-	mask.Length = sizeof star/sizeof (WCHAR);
-	mask.MaximumLength = 0;
-	mask.Buffer = star;
+	path = get_path(file);
 
-	if (count < sizeof *de)
-		return -_L(EINVAL);
-
-	while (1)
+	for (fs = fs_first; fs; fs = fs->next)
 	{
-		memset(buffer, 0, sizeof buffer);
-		ret = NtQueryDirectoryFile(fp->handle, NULL, NULL, NULL, &iosb,
-			buffer, sizeof buffer,
-			FileDirectoryInformation, first, NULL /*&mask*/, 0);
-		dprintf("NtQueryDirectoryFile -> %08lx\n", ret);
-		if (ret != STATUS_SUCCESS)
+		len = strlen(fs->root);
+		if (!strncmp(fs->root, path, len))
 			break;
-		first = FALSE;
-
-		EntryOffset = 0;
-		do {
-			info = (FILE_DIRECTORY_INFORMATION*) &buffer[EntryOffset];
-
-			if (prev_de)
-			{
-				r = current->ops->memcpy_to(&prev_de->d_off, &ofs, sizeof ofs);
-				if (r < 0)
-					break;
-			}
-			de = (struct linux_dirent*)&p[ofs];
-			r = add_de(de, info->FileName, info->FileNameLength/2, count - ofs);
-			if (r < 0)
-				break;
-			ofs += r;
-
-			prev_de = de;
-			EntryOffset += info->NextEntryOffset;
-		} while (info->NextEntryOffset);
 	}
 
-	dprintf("%d bytes added\n", ofs);
+	if (fs)
+		r = fs->open(fs, &path[len], flags, mode);
+	else
+		r = _L(ENOENT);
 
-	return ofs;
+	free(path);
+
+	return r;
 }
 
 int add_dirent(void *ptr, WCHAR* entry, USHORT entrylen, int avail)
@@ -1653,93 +1437,30 @@ int sys_getdents64(int fd, struct linux_dirent *de, unsigned int count)
 	return fp->ops->fn_getdents(fp, de, count, &add_dirent64);
 }
 
-static const struct filp_ops disk_file_ops = {
-	.fn_read = &file_read,
-	.fn_write = &file_write,
-	.fn_stat = &file_stat,
-	.fn_getdents = &file_getdents,
-};
-
-int do_open(const char *file, int flags, int mode)
+/* read client file handle into "kernel" memory */
+int kread(int fd, void *buf, size_t size, off_t off)
 {
-	char *dospath;
-	DWORD access;
-	DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-	DWORD create = 0;
-	HANDLE handle;
+	LARGE_INTEGER pos;
+	LARGE_INTEGER out;
+	DWORD bytesRead = 1;
+	BOOL r;
 	filp *fp;
-	int fd;
 
-	dprintf("open(\"%s\",%08x,%08x)\n", file, flags, mode);
-
-	switch (flags & 3)
-	{
-	case _l_O_RDONLY:
-		access = GENERIC_READ;
-		break;
-	case _l_O_WRONLY:
-		access = GENERIC_WRITE;
-		break;
-	case _l_O_RDWR:
-		access = GENERIC_READ | GENERIC_WRITE;
-		break;
-	default:
-		fprintf(stderr, "bad open flags %08x\n", flags);
-		return -_L(EINVAL);
-	}
-
-	if (flags & O_CREAT)
-		create = CREATE_NEW;
-	else
-		create = OPEN_EXISTING;
-
-	dospath = unix2dos_path(file);
-	dprintf("CreateFile(%s,%08lx,%08lx,NULL,%08lx,...)\n",
-		dospath, access, share, create);
-
-	/* use FILE_FLAG_BACKUP_SEMANTICS for opening directories */
-	handle = CreateFile(dospath, access, share, NULL,
-			    create,
-			    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
-			    NULL);
-
-	if (handle == INVALID_HANDLE_VALUE)
-	{
-		dprintf("failed to open %s (%ld)\n",
-			dospath, GetLastError());
-		free(dospath);
-		return -_L(ENOENT);
-	}
-
-	free(dospath);
-
-	fp = malloc(sizeof (*fp));
+	fp = filp_from_fd(fd);
 	if (!fp)
-	{
-		CloseHandle(handle);
-		return -_L(ENOMEM);
-	}
+		return -_L(EBADF);
 
-	memset(fp, 0, sizeof *fp);
-	fp->ops = &disk_file_ops;
-	fp->pgid = 0;
-	fp->handle = handle;
-	fp->offset = 0;
+	pos.QuadPart = off;
 
-	fd = alloc_fd();
-	if (fd < 0)
-	{
-		free(fp);
-		CloseHandle(handle);
-		return -_L(ENOMEM);
-	}
+	r = SetFilePointerEx(fp->handle, pos, &out, FILE_BEGIN);
+	if (!r)
+		return -_L(EIO);
 
-	dprintf("handle -> %p\n", handle);
-	dprintf("fd -> %d\n", fd);
+	r = ReadFile(fp->handle, buf, size, &bytesRead, NULL);
+	if (!r)
+		return -_L(EIO);
 
-	current->handles[fd] = fp;
-
-	return fd;
+	return bytesRead;
 }
 
 // TODO: make this efficient... share memory with client?
@@ -1849,6 +1570,8 @@ int sys_open(const char *ptr, int flags, int mode)
 		return r;
 	}
 
+	dprintf("open(%s,%08x,%08x)\n", filename, flags, mode);
+
 	r = do_open(filename, flags, mode);
 
 	free(filename);
@@ -1879,7 +1602,7 @@ int sys_llseek(unsigned int fd, unsigned long offset_high,
 	LARGE_INTEGER out;
 	BOOL r;
 
-	printf("llseek(%d,%lu,%lu,%p,%lu)\n", fd,
+	dprintf("llseek(%d,%lu,%lu,%p,%u)\n", fd,
 		offset_high, offset_low, result, whence);
 
 	fp = filp_from_fd(fd);
@@ -1896,10 +1619,12 @@ int sys_llseek(unsigned int fd, unsigned long offset_high,
 	if (!r)
 		return -_L(EIO);
 
-	*result = out.QuadPart;
-
-	return 0;
+	return current->ops->memcpy_to(result, &out.QuadPart,
+					sizeof out.QuadPart);
 }
+
+#define SECSPERDAY 86400
+#define SECS_1601_TO_1970 ((369 * 365 + 89) * (ULONGLONG)SECSPERDAY)
 
 int sys_time(time_t *tloc)
 {
@@ -1991,30 +1716,66 @@ int sys_umask(int umask)
 
 int sys_kill(int pid, int sig)
 {
+	struct process *p;
+
 	dprintf("kill(%d,%d)\n", pid, sig);
-	exit(sig);
+
+	for (p = first_process; p; p = p->next_process)
+		if ((pid_t)p->id.UniqueProcess == pid)
+			break;
+
+	if (!p)
+		return -_L(ESRCH);
+
+	process_signal(p, sig);
+	if (p == current)
+	{
+		printf("signal %d\n", sig);
+		dump_regs(current);
+		dump_stack(current);
+		backtrace(current);
+		exit(1);
+	}
 	return 0;
 }
 
 int sys_getcwd(char *buf, unsigned long size)
 {
-	const char *dir = "/";
-	ULONG sz = 0;
+	const char *dir = current->cwd;
 	size_t len;
-	NTSTATUS r;
 
-	printf("getcwd(%p,%u)\n", buf, size);
-	len = strlen(dir);
+	dprintf("getcwd(%p,%lu)\n", buf, size);
+	len = strlen(dir) + 1;
 	if (len > size)
-		len = size;
-	r = NtWriteVirtualMemory(current->process, buf, dir, len, &sz);
-	if (r != STATUS_SUCCESS)
-	{
-		printf("failed to write memory\n");
-		return -_L(EFAULT);
-	}
+		return -_L(ERANGE);
+	return current->ops->memcpy_to(buf, dir, len);
+}
 
-	return len;
+int do_chdir(const char *dir)
+{
+	if (strcmp(dir, "/"))
+		return -_L(ENOENT);
+	return 0;
+}
+
+int sys_chdir(const void *ptr)
+{
+	int r;
+	char *dirname = NULL;
+
+	r = read_string(ptr, &dirname);
+	if (r < 0)
+	{
+		printf("chdir(%p=<invalid>)\n", ptr);
+		return r;
+	}
+	dprintf("chdir(%s)\n", dirname);
+
+	r = do_chdir(dirname);
+
+	free(dirname);
+
+	return r;
 }
 
 static int get_protection(int prot)
@@ -2265,57 +2026,68 @@ void* sys_brk(void *addr)
 	return (void*) current->brk;
 }
 
+int sys_setuid(int uid)
+{
+	dprintf("setuid(%d)\n", uid);
+	return 0;
+}
+
 int sys_getuid(void)
 {
-	dprintf("getuid()\n");
+	dprintf("getuid() -> %d\n", current->uid);
 	return current->uid;
 }
 
 int sys_geteuid(void)
 {
-	dprintf("geteuid()\n");
+	dprintf("geteuid() -> %d\n", current->euid);
 	return current->euid;
 }
 
-static int filetime_to_unixtime(FILETIME *ft, unsigned int *ns)
+int sys_setgid(int gid)
 {
-	ULONGLONG seconds;
-
-	seconds = (((ULONGLONG)ft->dwHighDateTime) << 32) + ft->dwLowDateTime;
-	return longlong_to_unixtime(seconds, ns);
+	dprintf("setgid(%d)\n", gid);
+	return 0;
 }
 
-int do_stat64(const char *path, struct stat64 *statbuf, BOOL follow_links)
+int sys_getgid(void)
 {
-	WIN32_FILE_ATTRIBUTE_DATA info;
-	char *dospath;
-	BOOL r;
+	dprintf("getgid()\n");
+	return current->gid;
+}
 
-	dprintf("stat64(\"%s\",%p)\n", path, statbuf);
+int sys_getegid(void)
+{
+	dprintf("getegid()\n");
+	return current->egid;
+}
 
-	dospath = unix2dos_path(path);
-	r = GetFileAttributesEx(dospath, GetFileExInfoStandard, &info);
-	free(dospath);
-	if (!r)
-		return -_L(ENOENT);
+static int do_stat64(const char *file, struct stat64 *statbuf, BOOL follow_links)
+{
+	struct fs *fs;
+	char *path;
+	int r;
+	size_t len;
 
-	memset(statbuf, 0, sizeof *statbuf);
-	statbuf->st_mode = 0755;
-	if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-		statbuf->st_mode |= 040000;
+	dprintf("stat64(\"%s\",%p)\n", file, statbuf);
+
+	path = get_path(file);
+
+	for (fs = fs_first; fs; fs = fs->next)
+	{
+		len = strlen(fs->root);
+		if (!strncmp(fs->root, path, len))
+			break;
+	}
+
+	if (fs)
+		r = fs->stat64(fs, &path[len], statbuf, follow_links);
 	else
-		statbuf->st_mode |= 0100000;
-	statbuf->ctime = filetime_to_unixtime(&info.ftCreationTime,
-				&statbuf->ctime_nsec);
-	statbuf->mtime = filetime_to_unixtime(&info.ftLastWriteTime,
-				&statbuf->mtime_nsec);
-	statbuf->atime = filetime_to_unixtime(&info.ftLastAccessTime,
-				&statbuf->atime_nsec);
-	statbuf->st_size = info.nFileSizeLow;
-	//statbuf->st_size += info.nFileSizeHigh * 0x100000000LL;
-	statbuf->st_blksize = 0x1000;
+		r = _L(ENOENT);
 
-	return 0;
+	free(path);
+
+	return r;
 }
 
 int sys_stat64(const char *ptr, struct stat64 *statbuf)
@@ -2363,6 +2135,28 @@ int sys_lstat64(const char *ptr, struct stat64 *statbuf)
 		r = current->ops->memcpy_to(statbuf, &st, sizeof st);
 
 	free(path);
+
+	return r;
+}
+
+int sys_fstat64(int fd, struct stat64 *statbuf)
+{
+	struct stat64 st;
+	filp* fp;
+	int r;
+
+	dprintf("fstat64(%d,%p)\n", fd, statbuf);
+
+	fp = filp_from_fd(fd);
+	if (!fp)
+		return -_L(EBADF);
+
+	if (!fp->ops->fn_stat)
+		return -_L(ENOENT);
+
+	r = fp->ops->fn_stat(fp, statbuf);
+	if (r == 0)
+		r = current->ops->memcpy_to(statbuf, &st, sizeof st);
 
 	return r;
 }
@@ -2450,20 +2244,58 @@ int sys_ioctl(int fd, unsigned int cmd, unsigned long arg)
 
 	fp = filp_from_fd(fd);
 	if (!fp)
-		return -_l_EBADF;
+		return -_L(EBADF);
 
-	if (fp->ops->fn_ioctl)
-		return -_l_EINVAL;
+	if (!fp->ops->fn_ioctl)
+		return -_L(EINVAL);
 
 	r = fp->ops->fn_ioctl(fp, cmd, arg);
 
 	return r;
 }
 
+/* allocate a new fd greater than 'start' */
+static int sys_fcntl_fdup(filp *fp, int fd, int start)
+{
+	int newfd = alloc_fd_above(start);
+
+	if (newfd < 0)
+		return newfd;
+
+	current->handles[newfd] = fp;
+	return newfd;
+}
+
 int sys_fcntl(int fd, int cmd, long arg)
 {
+	filp* fp;
+	int r;
+
 	dprintf("fcntl(%d,%08x,%lx)\n", fd, cmd, arg);
-	return -_l_ENOSYS;
+
+	fp = filp_from_fd(fd);
+	if (!fp)
+		return -_L(EBADF);
+
+	switch (cmd)
+	{
+	case _L(F_DUPFD):
+		r = sys_fcntl_fdup(fp, fd, arg);
+		break;
+	case _L(F_SETFD):
+		current->fd_flags[fd] |= FD_CLOSE_ON_EXEC;
+		r = 0;
+		break;
+	case _L(F_GETFD):
+		r = !!(current->fd_flags[fd] & FD_CLOSE_ON_EXEC);
+		break;
+	default:
+		dprintf("unknown fcntl(%d, %08x, %08lx)\n",
+			fd, cmd, arg);
+		r = -_L(EINVAL);
+	}
+
+	return r;
 }
 
 int sys_pipe(int *ptr)
@@ -2510,9 +2342,11 @@ static int process_reap_zombie(struct process *p)
 
 int sys_waitpid(int pid, int *stat_addr, int options)
 {
-	struct process *p;
-	int r = -_l_ECHILD;
+	struct process *p = NULL;
+	int r = -_L(ECHILD);
 	int exit_code = 0;
+
+	dprintf("waitpid(%d,%p,%08x)\n", pid, stat_addr, options);
 
 	do {
 		struct signal_waiter sw;
@@ -2521,12 +2355,15 @@ int sys_waitpid(int pid, int *stat_addr, int options)
 		if (p)
 			break;
 
-		if (options & _l_WNOHANG)
+		if (options & _L(WNOHANG))
+		{
+			r = 0;
 			break;
+		}
 
 		sw.we.p = current;
 
-		signal_waiter_add(&sw, _l_SIGCHLD);
+		signal_waiter_add(&sw, _L(SIGCHLD));
 		current->state = thread_stopped;
 		yield();
 		current->state = thread_running;
@@ -2540,6 +2377,8 @@ int sys_waitpid(int pid, int *stat_addr, int options)
 		r = current->ops->memcpy_to(stat_addr, &exit_code,
 					 sizeof exit_code);
 	}
+
+	dprintf("waitpid() -> %d\n", r);
 
 	return r;
 }
@@ -2629,7 +2468,7 @@ static int poll_check(filp **fps, struct _l_pollfd *fds, int nfds)
 		}
 		else
 		{
-			fds[i].revents = _l_POLLERR;
+			fds[i].revents = _L(POLLERR);
 			ready++;
 		}
 	}
@@ -2765,11 +2604,17 @@ int do_syscall(int n, int a1, int a2, int a3, int a4, int a5, int a6)
 	case 11:
 		r = sys_exec(ptr(a1), ptr(a2), ptr(a3));
 		break;
+	case 12:
+		r = sys_chdir(ptr(a1));
+		break;
 	case 13:
 		r = sys_time(ptr(a1));
 		break;
 	case 20:
 		r = sys_getpid();
+		break;
+	case 23:
+		r = sys_setuid(a1);
 		break;
 	case 24:
 		r = sys_getuid();
@@ -2790,6 +2635,18 @@ int do_syscall(int n, int a1, int a2, int a3, int a4, int a5, int a6)
 		break;
 	case 45:
 		r = (int)sys_brk(ptr(a1));
+		break;
+	case 46:
+		r = sys_setgid(a1);
+		break;
+	case 47:
+		r = sys_getgid();
+		break;
+	case 49:
+		r = sys_geteuid();
+		break;
+	case 50:
+		r = sys_getegid();
 		break;
 	case 54:
 		r = sys_ioctl(a1, a2, a3);
@@ -2860,11 +2717,9 @@ int do_syscall(int n, int a1, int a2, int a3, int a4, int a5, int a6)
 	case 196:
 		r = sys_lstat64(ptr(a1), ptr(a2));
 		break;
-#if 0
 	case 197:
 		r = sys_fstat64(a1, ptr(a2));
 		break;
-#endif
 	case 199:
 		r = sys_getuid();
 		break;
@@ -2894,6 +2749,9 @@ int do_syscall(int n, int a1, int a2, int a3, int a4, int a5, int a6)
 		printf("unknown/invalid system call %d (%08x)\n", n, n);
 		exit(1);
 	}
+
+	if (r < 0)
+		dprintf("syscall %d returned %d\n", n, r);
 
 	return r;
 }
@@ -3593,18 +3451,13 @@ static NTSTATUS ReadDebugPort(HANDLE debugObject)
 	timeout.QuadPart = 0;
 	r = pDbgUiWaitStateChange(&event, &timeout);
 	if (r == STATUS_TIMEOUT)
-	{
-		dprintf("DbgUiWaitStateChange() timeout\n");
 		return STATUS_SUCCESS;
-	}
 
 	if (r != STATUS_SUCCESS)
 	{
 		fprintf(stderr, "DbgUiWaitStateChange() r=%08lx\n", r);
 		return r;
 	}
-
-	dprintf("NewState: %s\n", debug_state_to_string(event.NewState));
 
 	if (event.NewState > sizeof handlers/sizeof handlers[0])
 		return STATUS_UNSUCCESSFUL;
@@ -4008,9 +3861,16 @@ int main(int argc, char **argv)
 	filp *tty = NULL;
 	int n = 1;
 
+	context->cwd = strdup("/");
+	context->uid = 1000;
+	context->gid = 1000;
+	context->euid = 1000;
+	context->egid = 1000;
+
 	InitializeCriticalSection(&ready_list_lock);
 
-	GetCurrentDirectory(sizeof rootdir, rootdir);
+	winfs_init();
+	devfs_init();
 
 	loop_event = CreateEvent(NULL, 0, 0, NULL);
 

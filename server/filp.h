@@ -1,9 +1,7 @@
 #ifndef __FILP_H__
 #define __FILP_H__
 
-#define _l_POLLIN 1
-#define _l_POLLOUT 4
-#define _l_POLLERR 8
+#include <stdint.h>
 
 typedef int64_t loff_t;
 
@@ -79,5 +77,17 @@ struct _poll_list {
 	fn_wake fn;
 	void *arg;
 };
+
+struct fs
+{
+	char *root;
+	struct fs *next;
+	int (*open)(struct fs *fs, const char *subpath, int flags, int mode);
+	int (*stat64)(struct fs *fs, const char *path,
+			 struct stat64 *statbuf, BOOL follow_links);
+};
+
+extern int alloc_fd(void);
+extern void fs_add(struct fs *fs);
 
 #endif /* __FILP_H__ */

@@ -1,5 +1,11 @@
 Announcement & Release notes
 
+Sun Nov 18 08:22:23 EST 2012
+0.3 - November release
+
+ - make more busybox utils (cal, expr, head, tail) work
+ - busybox vi starts to do something vaguely sensible
+
 Tue Oct 16 06:50:47 EST 2012
 0.2 - October release
 
