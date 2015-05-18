@@ -2,51 +2,17 @@
 #define __FILP_H__
 
 #include <stdint.h>
+#include <stdbool.h>
+
+#include "linux-defines.h"
 
 typedef int64_t loff_t;
 
 typedef struct _filp filp;
 typedef struct _poll_list poll_list;
 
-struct stat64 {
-	unsigned long long st_dev;
-	unsigned long long st_ino;
-	unsigned int st_mode;
-	unsigned int st_nlink;
-	unsigned int st_uid;
-	unsigned int st_gid;
-	unsigned long long st_rdev;
-	unsigned long long __pad1;
-	long long st_size;
-	int st_blksize;
-	int __pad2;
-	long long st_blocks;
-	int atime;
-	unsigned int atime_nsec;
-	int mtime;
-	unsigned int mtime_nsec;
-	int ctime;
-	unsigned int ctime_nsec;
-	unsigned int __unused1;
-	unsigned int __unused2;
-};
-
-struct linux_dirent {
-	unsigned long  d_ino;
-	unsigned long  d_off;
-	unsigned short d_reclen;
-	char           d_name[];
-};
-
-struct linux_dirent64 {
-	unsigned long long d_ino;
-	long long d_off;
-	unsigned short d_reclen;
-	unsigned char d_type;
-	char d_name[];
-};
-
-typedef int (*fn_add_dirent)(void *, WCHAR* entry, USHORT entrylen, int avail);
+typedef int (*fn_add_dirent)(void *, const char* entry, size_t entrylen,
+			 int avail, unsigned long dirofs, char type);
 typedef void (*fn_wake)(filp *f, void *arg);
 
 struct wait_entry;
@@ -60,6 +26,7 @@ struct filp_ops {
 	int (*fn_poll)(filp *f);
 	void (*fn_poll_add)(filp *f, struct wait_entry *we);
 	void (*fn_poll_del)(filp *f, struct wait_entry *we);
+	void (*fn_close)(filp *f);
 };
 
 struct _filp {
@@ -84,7 +51,7 @@ struct fs
 	struct fs *next;
 	int (*open)(struct fs *fs, const char *subpath, int flags, int mode);
 	int (*stat64)(struct fs *fs, const char *path,
-			 struct stat64 *statbuf, BOOL follow_links);
+			 struct stat64 *statbuf, bool follow_links);
 };
 
 extern int alloc_fd(void);

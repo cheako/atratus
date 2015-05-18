@@ -61,6 +61,7 @@ struct process
 	int				exit_code;
 	PVOID				fiber;
 	char				*cwd;
+	filp				*tty;
 };
 
 extern struct process *current;
@@ -138,9 +139,11 @@ struct timeout
 };
 
 extern void timeout_add(struct timeout *t);
+extern void tv_from_ms(struct timeval *t, int ms);
 extern void timeout_add_ms(struct timeout *t, int ms);
 extern void timeout_add_tv(struct timeout *t, struct timeval *ts);
 extern void timeout_remove(struct timeout *t);
+extern void timeout_now(struct timeval *tv);
 
 struct signal_waiter
 {

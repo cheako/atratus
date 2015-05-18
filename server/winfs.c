@@ -6,6 +6,7 @@
 #include "linux-defines.h"
 #include "debug.h"
 #include "process.h"
+#include <limits.h>
 
 #define SECSPERDAY 86400
 #define SECS_1601_TO_1970 ((369 * 365 + 89) * (ULONGLONG)SECSPERDAY)
@@ -67,7 +68,7 @@ static char *unix2dos_path(const char *unixpath)
 }
 
 static int winfs_stat64(struct fs *fs, const char *path,
-			struct stat64 *statbuf, BOOL follow_links)
+			struct stat64 *statbuf, bool follow_links)
 {
 	WIN32_FILE_ATTRIBUTE_DATA info;
 	BOOL r;
@@ -81,16 +82,18 @@ static int winfs_stat64(struct fs *fs, const char *path,
 
 	memset(statbuf, 0, sizeof *statbuf);
 	statbuf->st_mode = 0755;
+	statbuf->st_uid = current->uid;
+	statbuf->st_gid = current->gid;
 	if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
 		statbuf->st_mode |= 040000;
 	else
 		statbuf->st_mode |= 0100000;
-	statbuf->ctime = filetime_to_unixtime(&info.ftCreationTime,
-				&statbuf->ctime_nsec);
-	statbuf->mtime = filetime_to_unixtime(&info.ftLastWriteTime,
-				&statbuf->mtime_nsec);
-	statbuf->atime = filetime_to_unixtime(&info.ftLastAccessTime,
-				&statbuf->atime_nsec);
+	statbuf->st_ctime = filetime_to_unixtime(&info.ftCreationTime,
+				&statbuf->st_ctime_nsec);
+	statbuf->st_mtime = filetime_to_unixtime(&info.ftLastWriteTime,
+				&statbuf->st_mtime_nsec);
+	statbuf->st_atime = filetime_to_unixtime(&info.ftLastAccessTime,
+				&statbuf->st_atime_nsec);
 	statbuf->st_size = info.nFileSizeLow;
 	//statbuf->st_size += info.nFileSizeHigh * 0x100000000LL;
 	statbuf->st_blksize = 0x1000;
@@ -116,12 +119,12 @@ static int file_stat(filp *f, struct stat64 *statbuf)
 		statbuf->st_mode |= 040000;
 	else
 		statbuf->st_mode |= 0100000;
-	statbuf->ctime = longlong_to_unixtime(info.ChangeTime.QuadPart,
-				&statbuf->ctime_nsec);
-	statbuf->mtime = longlong_to_unixtime(info.LastWriteTime.QuadPart,
-				&statbuf->mtime_nsec);
-	statbuf->atime = longlong_to_unixtime(info.LastAccessTime.QuadPart,
-				&statbuf->atime_nsec);
+	statbuf->st_ctime = longlong_to_unixtime(info.ChangeTime.QuadPart,
+				&statbuf->st_ctime_nsec);
+	statbuf->st_mtime = longlong_to_unixtime(info.LastWriteTime.QuadPart,
+				&statbuf->st_mtime_nsec);
+	statbuf->st_atime = longlong_to_unixtime(info.LastAccessTime.QuadPart,
+				&statbuf->st_atime_nsec);
 	statbuf->st_size = info.AllocationSize.QuadPart;
 	statbuf->st_blksize = 0x1000;
 
@@ -140,7 +143,6 @@ static int file_getdents(filp *fp, void *de, unsigned int count, fn_add_dirent a
 	FILE_DIRECTORY_INFORMATION *info;
 	WCHAR star[] = { '*', '.', '*', 0 };
 	UNICODE_STRING mask;
-	struct linux_dirent *prev_de = NULL;
 	ULONG EntryOffset;
 
 	mask.Length = sizeof star/sizeof (WCHAR);
@@ -159,27 +161,40 @@ static int file_getdents(filp *fp, void *de, unsigned int count, fn_add_dirent a
 		dprintf("NtQueryDirectoryFile -> %08lx\n", ret);
 		if (ret != STATUS_SUCCESS)
 			break;
-		first = FALSE;
 
 		EntryOffset = 0;
 		do {
-			info = (FILE_DIRECTORY_INFORMATION*) &buffer[EntryOffset];
+			size_t len;
 
-			if (prev_de)
-			{
-				r = current->ops->memcpy_to(&prev_de->d_off, &ofs, sizeof ofs);
-				if (r < 0)
-					break;
-			}
+			info = (FILE_DIRECTORY_INFORMATION*) &buffer[EntryOffset];
+			EntryOffset += info->NextEntryOffset;
+
+			len = WideCharToMultiByte(CP_UTF8, 0,
+						info->FileName,
+						info->FileNameLength/sizeof (WCHAR),
+						NULL, 0, NULL, NULL);
+			char type;
+			if (info->FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+				type = _L(DT_DIR);
+			else
+				type = _L(DT_REG);
+
+			char name[len + 1];
+			WideCharToMultiByte(CP_UTF8, 0,
+					info->FileName,
+					info->FileNameLength/sizeof (WCHAR),
+					name, len + 1, NULL, NULL);
+
 			de = (struct linux_dirent*)&p[ofs];
-			r = add_de(de, info->FileName, info->FileNameLength/2, count - ofs);
+			r = add_de(de, name, len, count - ofs,
+				(first || info->NextEntryOffset) ? EntryOffset : INT_MAX,
+				type);
 			if (r < 0)
 				break;
 			ofs += r;
 
-			prev_de = de;
-			EntryOffset += info->NextEntryOffset;
 		} while (info->NextEntryOffset);
+		first = FALSE;
 	}
 
 	dprintf("%d bytes added\n", ofs);
@@ -274,7 +289,7 @@ static int file_write(filp *f, const void *buf, size_t size, loff_t *off)
 		r = WriteFile(f->handle, buf, bytesRead, &bytesWritten, NULL);
 		if (!r)
 		{
-			fprintf(stderr, "ReadFile %p failed %ld\n",
+			fprintf(stderr, "WriteFile %p failed %ld\n",
 				f->handle, GetLastError());
 			return -_L(EIO);
 		}
@@ -289,11 +304,18 @@ static int file_write(filp *f, const void *buf, size_t size, loff_t *off)
 	return bytesCopied;
 }
 
+static void winfs_close(filp *fp)
+{
+	if (fp->handle)
+		CloseHandle(fp->handle);
+}
+
 static const struct filp_ops disk_file_ops = {
 	.fn_read = &file_read,
 	.fn_write = &file_write,
 	.fn_stat = &file_stat,
 	.fn_getdents = &file_getdents,
+	.fn_close = &winfs_close,
 };
 
 static int winfs_open(struct fs *fs, const char *file, int flags, int mode)
@@ -325,7 +347,7 @@ static int winfs_open(struct fs *fs, const char *file, int flags, int mode)
 	}
 
 	if (flags & _L(O_CREAT))
-		create = CREATE_NEW;
+		create = CREATE_ALWAYS;
 	else
 		create = OPEN_EXISTING;
 

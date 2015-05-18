@@ -51,8 +51,19 @@ int test_memcpy(void)
 	char dest[10];
 
 	memset(dest, 'x', sizeof dest);
-	memcpy(dest, src, 6);
+	OK(dest == memcpy(dest, src, 6));
+	OK(strcmp(dest, src) == 0);
 
+	return 1;
+}
+
+int test_mempcpy(void)
+{
+	const char *src = "hello";
+	char dest[10];
+
+	memset(dest, 'x', sizeof dest);
+	OK(&dest[6] == mempcpy(dest, src, 6));
 	OK(strcmp(dest, src) == 0);
 
 	return 1;
@@ -83,6 +94,33 @@ int test_strcpy(void)
 
 	OK(dest == strcpy(dest, ""));
 	OK(dest[0] == 0);
+
+	return 1;
+}
+
+int test_strncpy(void)
+{
+	char dest[10];
+
+	dest[5] = 'x';
+	dest[6] = 'x';
+	dest[7] = 0;
+	OK(dest == strncpy(dest, "hello", 5));
+	OK(!strcmp(dest, "helloxx"));
+
+	OK(dest == strncpy(dest, "hello", 6));
+	OK(!strcmp(dest, "hello"));
+	OK(dest[6] == 'x');
+
+	OK(dest == strncpy(dest, "hello", 7));
+	OK(!strcmp(dest, "hello"));
+	OK(dest[6] == 0);
+
+	OK(dest == strncpy(dest, "", 0));
+	OK(!strcmp(dest, "hello"));
+
+	OK(dest == strncpy(dest, "", 1));
+	OK(!strcmp(dest, ""));
 
 	return 1;
 }
@@ -197,6 +235,19 @@ int test_strcspn(void)
 	return 1;
 }
 
+int test_strpbrk(void)
+{
+	char x1[] = "test";
+
+	OK(strpbrk("", "") == NULL);
+	OK(strpbrk(x1, "") == NULL);
+	OK(strpbrk(x1, "x") == NULL);
+	OK(strpbrk(x1, "t") == x1);
+	OK(strpbrk(x1, "xyze") == x1+1);
+
+	return 1;
+}
+
 int main(int argc, char **argv)
 {
 	if (!test_strlen())
@@ -211,6 +262,9 @@ int main(int argc, char **argv)
 	if (!test_memcpy())
 		return 1;
 
+	if (!test_mempcpy())
+		return 1;
+
 	if (!test_memmove())
 		return 1;
 
@@ -218,6 +272,9 @@ int main(int argc, char **argv)
 		return 1;
 
 	if (!test_strcpy())
+		return 1;
+
+	if (!test_strncpy())
 		return 1;
 
 	if (!test_strcat_chk())
@@ -242,6 +299,9 @@ int main(int argc, char **argv)
 		return 1;
 
 	if (!test_strcspn())
+		return 1;
+
+	if (!test_strpbrk())
 		return 1;
 
 	puts("OK");

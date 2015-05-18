@@ -13,6 +13,8 @@ LDFLAGS += -fpic -g
 
 TARGET = ld-linux.so.2
 
+all: $(TARGET)
+
 OBJECTS = \
 	c.o \
 	loader.o \

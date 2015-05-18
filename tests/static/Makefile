@@ -11,12 +11,16 @@ TARGETS = \
 	exec \
 	exit \
 	fork \
+	gettimeofday \
 	gs \
 	hw \
 	mmap \
 	pipe \
+	select \
 	sleep \
 	stack \
+	stat \
+	stat64 \
 	uname
 
 all: $(TARGETS)

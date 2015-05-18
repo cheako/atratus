@@ -4,16 +4,24 @@ CC = gcc
 TARGETS = \
 	args \
 	bsearch \
+	ctype \
 	dir \
+	fork \
 	getopt \
 	getopt_long \
 	hw \
+	jmpbuf \
 	malloc \
+	pipe \
+	qsort \
+	read \
+	stat \
 	stdio \
 	stdlib \
 	string \
 	ttysize \
-	uname
+	uname \
+	vtplay
 
 all: $(TARGETS)
 

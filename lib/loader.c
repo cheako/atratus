@@ -35,10 +35,9 @@
 
 #define NULL ((void *)0)
 
-extern int verbose;
 static struct module_info loader_module;
 static struct module_info main_module;
-char **ld_environment;
+extern char **environ;
 
 /*
  * errno should be per thread,
@@ -166,11 +165,8 @@ Elf32_Sym *elf_hash_lookup(struct module_info *m,
 		count--;
 	}
 	if (!count)
-	{
-		verbose = 1;
-		dprintf("circular chain in ELF32 hash\n");
-		exit(1);
-	}
+		die("circular chain in ELF32 hash\n");
+
 	return 0;
 }
 
@@ -227,7 +223,7 @@ Elf32_Sym *elf_gnu_hash_lookup(struct module_info *m,
 		index++;
 	}
 
-	if (verbose && !r)
+	if (!r)
 		dprintf("symbol %s not found in %s\n",
 			symbol_name, m->name);
 
@@ -296,11 +292,8 @@ void *__ld_dynamic_resolve(void *arg, unsigned int entry, void *callee)
 	Elf32_Sym *st;
 	void **got_entry;
 
-	if (verbose)
-	{
-		dprintf("%s arg=%p plt_entry=%08x callee=%p\n",
-			__FUNCTION__, arg, entry, callee);
-	}
+	dprintf("%s arg=%p plt_entry=%08x callee=%p\n",
+		__FUNCTION__, arg, entry, callee);
 
 	if (m->dt.pltrel != DT_REL)
 		dprintf("not DT_REL\n");
@@ -311,46 +304,33 @@ void *__ld_dynamic_resolve(void *arg, unsigned int entry, void *callee)
 	if (symtype != R_386_JMP_SLOT)
 		return 0;
 
-	if (verbose)
-	{
-		dprintf("dt.symtab = %08x\n", m->dt.symtab);
-		dprintf("syminfo = %08x\n", syminfo);
-	}
+	dprintf("dt.symtab = %08x\n", m->dt.symtab);
+	dprintf("syminfo = %08x\n", syminfo);
 
 	st = (Elf32_Sym*) m->dt.symtab;
 	st += syminfo;
 
-	if (verbose)
-		dprintf("st_name = %d offset = %08x\n", st->st_name, rel->r_offset);
+	dprintf("st_name = %d offset = %08x\n", st->st_name, rel->r_offset);
 	symbol_name = (const char*) m->dt.strtab + st->st_name;
-	if (verbose)
-		dprintf("symbol_name = %s\n", symbol_name);
+	dprintf("symbol_name = %s\n", symbol_name);
 
 	target = ld_get_symbol_address(symbol_name);
 	if (!target)
 	{
 		// FIXME: handle weak symbols
-		verbose = 1;
-		dprintf("no such symbol (%s)\n", symbol_name);
-		exit(1);
-		return 0;
+		die("no such symbol (%s)\n", symbol_name);
 	}
-
-	if (verbose)
-		dprintf("dynamic resolve, symbol -> %s\n", symbol_name);
 
 	r = (void*) target;
 
-	if (verbose)
-		dprintf("dynamic resolve: %08x -> %p\n", entry, r);
+	dprintf("dynamic resolve: %08x -> %p\n", entry, r);
 
 	/* patch the correct value into the GOT */
 	got_entry = (void**)((char*)m->delta + rel->r_offset);
 
 	/* patch the resolved address into the GOT */
 	*got_entry = r;
-	if (verbose)
-		dprintf("patched GOT at %p\n", got_entry);
+	dprintf("patched GOT at %p\n", got_entry);
 
 	return r;
 }
@@ -376,11 +356,8 @@ void patch_got(struct module_info *m)
 	/* TODO: apply delta between actual and intended load address */
 
 	unsigned int *got = (void*) + m->dt.pltgot;
-	if (verbose)
-	{
-		dprintf("PLTGOT:    %08x\n", m->dt.pltgot);
-		dprintf("PLTRELSZ:  %08x\n", m->dt.pltrelsz);
-	}
+	dprintf("PLTGOT:    %08x\n", m->dt.pltgot);
+	dprintf("PLTRELSZ:  %08x\n", m->dt.pltrelsz);
 
 	/* skip the first 3 entries, they're special */
 	i = 1;
@@ -405,9 +382,7 @@ void elf_apply_reloc_glob_dat(struct module_info *m, int offset)
 
 	syminfo = ELF32_R_SYM(rel[offset].r_info);
 
-	if (verbose)
-		dprintf("%08x %06x R_386_GLOB_DAT\n",
-			rel->r_offset, syminfo);
+	dprintf("%08x %06x R_386_GLOB_DAT\n", rel->r_offset, syminfo);
 
 	st = (Elf32_Sym*) m->dt.symtab;
 	st += syminfo;
@@ -421,21 +396,18 @@ void elf_apply_reloc_glob_dat(struct module_info *m, int offset)
 		/* has a value and size, so is defined */
 		value = (uint32_t) (m->delta + st->st_value);
 
-		if (verbose)
-			dprintf("R_386_GLOB_DAT: definition "
-				"of %s (in %s) @%p -> %08x\n",
-				symbol_name, m->name, p, value);
+		dprintf("R_386_GLOB_DAT: definition "
+			"of %s (in %s) @%p -> %08x\n",
+			symbol_name, m->name, p, value);
 	}
 	else
 	{
-		if (verbose)
-			dprintf("%s used in %s\n", symbol_name, m->name);
+		dprintf("%s used in %s\n", symbol_name, m->name);
 		value = ld_get_symbol_address(symbol_name);
 
-		if (verbose)
-			dprintf("R_386_GLOB_DAT: reference "
-				"to %s (in %s) @%p -> %08x\n",
-				symbol_name, m->name, p, value);
+		dprintf("R_386_GLOB_DAT: reference "
+			"to %s (in %s) @%p -> %08x\n",
+			symbol_name, m->name, p, value);
 	}
 
 	*p = (uint32_t) value;
@@ -465,10 +437,7 @@ void ld_apply_reloc_copy(struct module_info *m, Elf32_Rel *rel)
 
 	memcpy(dest, (void*)src, st->st_size);
 
-	if (verbose)
-	{
-		dprintf("R_386_COPY (%s) %p -> %p\n", symbol_name, src, dest);
-	}
+	dprintf("R_386_COPY (%s) %p -> %p\n", symbol_name, src, dest);
 }
 
 static void ld_apply_reloc_32(struct module_info *m, Elf32_Rel *rel)
@@ -484,18 +453,13 @@ static void ld_apply_reloc_32(struct module_info *m, Elf32_Rel *rel)
 
 	value = ld_get_symbol_address(symbol_name);
 	if (!value)
-	{
-		verbose = 1;
-		dprintf("symbol '%s' not found\n", symbol_name);
-		exit(1);
-	}
+		die("symbol '%s' not found\n", symbol_name);
+
 	value += main_module.delta;
 
-	if (verbose)
-	{
-		dprintf("R_386_32 reloc applied %s -> %08x\n",
-			symbol_name, value);
-	}
+	dprintf("R_386_32 reloc applied %s -> %08x\n",
+		symbol_name, value);
+
 	dest = (void*)(m->delta + rel->r_offset);
 	*dest = value;
 }
@@ -504,8 +468,7 @@ int ld_apply_relocations(struct module_info *m)
 {
 	int i;
 
-	if (verbose)
-		dprintf("Applying relocs for %s\n", m->name);
+	dprintf("Applying relocs for %s\n", m->name);
 
 	for (i = 0; i < m->dt.relsz/sizeof (Elf32_Rel); i++)
 	{
@@ -535,8 +498,7 @@ static int ld_apply_loader_relocations(struct module_info *m)
 {
 	int i;
 
-	if (verbose)
-		dprintf("Applying relocs for %s\n", m->name);
+	dprintf("Applying relocs for %s\n", m->name);
 
 	for (i = 0; i < m->dt.relsz/sizeof (Elf32_Rel); i++)
 	{
@@ -552,11 +514,9 @@ static int ld_apply_loader_relocations(struct module_info *m)
 			ld_apply_reloc_32(m, &rel[i]);
 			break;
 		default:
-			verbose = 1;
-			dprintf("%08x %06x "
+			die("%08x %06x "
                                "(symbol type %d not supported)\n",
 				rel[i].r_offset, syminfo, symtype);
-			exit(1);
 		}
 	}
 
@@ -659,8 +619,6 @@ void *ld_main(int argc, char **argv, char **env, Elf32_Aux *auxv)
 
 	ld_setup_gs();
 
-	ld_environment = env;
-
 	/* read the loader's dynamic section */
 	loader_module.name = "ld.so";
 
@@ -688,16 +646,16 @@ void *ld_main(int argc, char **argv, char **env, Elf32_Aux *auxv)
 
 	ld_read_dynamic_section(&main_module, dynamic->p_vaddr);
 
-	if (verbose)
-		dprintf("patching GOT\n");
+	dprintf("patching GOT\n");
 
 	patch_got(&main_module);
-	if (verbose)
-		dprintf("done returning to %p\n", entry);
+	dprintf("done returning to %p\n", entry);
 
 	ld_apply_loader_relocations(&loader_module);
 
 	ld_apply_relocations(&main_module);
+
+	environ = env;
 
 	return entry;
 error:

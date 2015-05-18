@@ -9,7 +9,7 @@
 #include "tty.h"
 
 static int dev_stat64(struct fs *fs, const char *path,
-			struct stat64 *statbuf, BOOL follow_links)
+			struct stat64 *statbuf, bool follow_links)
 {
 	return -_L(ENOENT);
 }
@@ -25,7 +25,10 @@ static int dev_open(struct fs *fs, const char *file, int flags, int mode)
 		file++;
 
 	if (!strcmp(file, "tty"))
-		fp = get_console();
+		fp = current->tty;
+
+	if (!fp)
+		return -_L(ENOENT);
 
 	fd = alloc_fd();
 	if (fd < 0)

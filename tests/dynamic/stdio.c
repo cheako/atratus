@@ -116,6 +116,30 @@ int test_sprintf(void)
 	if (strcmp("   x", out))
 		return 1;
 
+	sprintf(out, "%.1s", "xyz");
+	if (strcmp("x", out))
+		return 1;
+
+	sprintf(out, "%.*s", 2, "xyz");
+	if (strcmp("xy", out))
+		return 1;
+
+	sprintf(out, "%-s", "xyz");
+	if (strcmp("xyz", out))
+		return 1;
+
+	sprintf(out, "%-3s", "xyz");
+	if (strcmp("xyz", out))
+		return 1;
+
+	sprintf(out, "%-4s", "xyz");
+	if (strcmp("xyz ", out))
+		return 1;
+
+	sprintf(out, "%-4d", 1);
+	if (strcmp("1   ", out))
+		return 1;
+
 	return 0;
 }
 

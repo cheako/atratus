@@ -1,5 +1,5 @@
 /*
- * dir - Basic directory listing
+ * stat - test the stat syscall
  *
  * Copyright (C)  2006-2012 Mike McCormack
  *
@@ -16,18 +16,14 @@
  *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <stdio.h>
 #include <sys/types.h>
-#include <sys/stat.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdbool.h>
 
-#define O_RDONLY 0
-
-struct linux_dirent {
-    long d_ino;
-    unsigned long d_off;
-    unsigned short d_reclen;
-    char d_name[];
-};
+void __stack_chk_fail(void)
+{
+}
 
 /*
  * minwgcc and gcc have different definitions of __thread
@@ -57,17 +53,15 @@ void exit(int status)
 	}
 }
 
-ssize_t read(int fd, void *buffer, size_t length)
+size_t strlen(const char *str)
 {
-	int r;
-	__asm__ __volatile__ (
-		"\tmov $3, %%eax\n"
-		"\tint $0x80\n"
-	:"=a"(r): "b"(fd), "c"(buffer), "d"(length) : "memory");
-	return set_errno(r);
+	size_t n = 0;
+	while (str[n])
+		n++;
+	return n;
 }
 
-ssize_t write(int fd, const void *buffer, size_t length)
+ssize_t write(int fd, const char *buffer, size_t length)
 {
 	int r;
 	__asm__ __volatile__ (
@@ -76,46 +70,6 @@ ssize_t write(int fd, const void *buffer, size_t length)
 	:"=a"(r): "b"(fd), "c"(buffer), "d"(length) : "memory");
 
 	return set_errno(r);
-}
-
-int open(const char *filename, int flags, ...)
-{
-	int r;
-	__asm__ __volatile__ (
-		"\tint $0x80\n"
-	:"=a"(r): "a"(5), "b"(filename), "c"(flags) : "memory");
-
-	return set_errno(r);
-}
-
-int close(int fd)
-{
-	int r;
-	__asm__ __volatile__ (
-		"\tint $0x80\n"
-	:"=a"(r): "a"(6), "b"(fd) : "memory");
-
-	return set_errno(r);
-}
-
-
-static inline int getdents(int fd, struct linux_dirent *de, int len)
-{
-	int r;
-	__asm__ __volatile__(
-		"\tint $0x80\n"
-		:"=a"(r)
-		: "a"(141), "b"(fd), "c"(de), "d"(len)
-		: "memory");
-	return r;
-}
-
-size_t strlen(const char *str)
-{
-	size_t n = 0;
-	while (str[n])
-		n++;
-	return n;
 }
 
 static void write_int(unsigned int x)
@@ -133,57 +87,52 @@ static void write_int(unsigned int x)
 	write(1, ch, 8);
 }
 
+struct stat {
+	unsigned long st_dev;
+	unsigned long st_ino;
+	unsigned short st_mode;
+	unsigned short st_nlink;
+	unsigned short st_uid;
+	unsigned short st_gid;
+	unsigned long st_rdev;
+	unsigned long st_size;
+	unsigned long st_blksize;
+	unsigned long st_blocks;
+	unsigned long st_atime;
+	unsigned long st_atime_nsec;
+	unsigned long st_mtime;
+	unsigned long st_mtime_nsec;
+	unsigned long st_ctime;
+	unsigned long st_ctime_nsec;
+	unsigned long __unused1;
+	unsigned long __unused2;
+};
+
+int stat(const char *path, struct stat *st)
+{
+	int r;
+	__asm__ __volatile__ (
+		"\tint $0x80\n"
+	:"=a"(r): "a"(106), "b"(path), "c"(st) : "memory");
+
+	return set_errno(r);
+}
+
 int main(int argc, char **argv)
 {
-	unsigned char buf[0x1000];
-	int fd;
-	int r;
-	int n = 0;
+	int i;
+	struct stat st;
 
-	fd = open(".", O_RDONLY);
-	if (fd < 0)
+	for (i = 1; i < argc; i++)
 	{
-		char msg[] = "failed to open directory";
-		write(2, msg, sizeof msg - 1);
-		exit(1);
-	}
-
-	r = getdents(fd, (void*)buf, sizeof buf);
-
-	while (n < r)
-	{
-		struct linux_dirent *de = (void*) &buf[n];
-
-		write_int(de->d_reclen);
+		stat(argv[i], &st);
+		write_int(st.st_mode);
 		write(1, " ", 1);
-		write_int(de->d_off);
+		write_int(st.st_size);
 		write(1, " ", 1);
-		char t = ((char*)de)[de->d_reclen - 1];
-		switch (t)
-		{
-		case 10: /* link */
-			write(1, "l", 1);
-			break;
-		case 8:	/* file */
-			write(1, " ", 1);
-			break;
-		case 4: /* dir */
-			write(1, "d", 1);
-			break;
-		default:
-			write_int(t);
-		}
-		write(1, " ", 1);
-		write(1, de->d_name, strlen(de->d_name));
+		write(1, argv[i], strlen(argv[i]));
 		write(1, "\n", 1);
-		//printf("%s %08lx %d\n", de->d_name, de->d_off, de->d_reclen);
-		if (de->d_reclen < sizeof *de)
-			break;
-		n += de->d_reclen;
 	}
-
-	close(fd);
-
 	return 0;
 }
 

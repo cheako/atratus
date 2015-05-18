@@ -1,5 +1,13 @@
 Announcement & Release notes
 
+Fri Dec 14 09:27:28 EST 2012
+0.4 - December release
+
+ - vitetris gameplay works
+ - busybox's vi editing work
+ - busybox's ash can start commands
+ - dash shows prompt
+
 Sun Nov 18 08:22:23 EST 2012
 0.3 - November release
 

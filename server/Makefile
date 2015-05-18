@@ -16,6 +16,7 @@ ATRATUS_SRCS = \
 	dev.c \
 	pipe.c \
 	tty.c \
+	vt100.c \
 	winfs.c
 
 STUB_SRCS = \

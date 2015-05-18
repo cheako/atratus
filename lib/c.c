@@ -28,6 +28,7 @@
 #include <stdbool.h>
 #include <sys/elf32.h>
 #include <sys/elf_extra.h>
+#include <limits.h>
 
 #include "loader.h"
 #include "string.h"
@@ -38,17 +39,16 @@
 
 #define NULL ((void *)0)
 
-#define O_RDONLY 0
-
 /*
  * errno should be per thread,
  * leave as global until we can load an ELF binary
  */
 static int errno;
 int verbose = 0;
-extern char **ld_environment;
 
 #define EXPORT __attribute__((visibility("default")))
+
+EXPORT char **environ;
 
 EXPORT void abort(void);
 
@@ -62,17 +62,58 @@ static inline int set_errno(int r)
 	return r;
 }
 
-EXPORT void exit(int status)
+EXPORT void _exit(int status)
 {
 	while (1)
 	{
 		__asm__ __volatile__ (
 			"\tpushl %%ebx\n"
+			"\tmovl %%eax, %%ebx\n"
 			"\tmov $1, %%eax\n"
 			"\tint $0x80\n"
 			"\tpopl %%ebx\n"
 		:: "a"(status) : "memory");
 	}
+}
+
+struct exit_fn
+{
+	void (*func) (void *);
+	void *arg;
+	void *dso_handle;
+	struct exit_fn *next;
+};
+
+static struct exit_fn *first_exit_fn;
+
+EXPORT void __cxa_atexit(void (*func) (void *), void * arg, void *dso_handle)
+{
+	struct exit_fn *efn;
+
+	efn = malloc(sizeof *efn);
+	if (!efn)
+		abort();
+	efn->func = func;
+	efn->arg = arg;
+	efn->dso_handle = dso_handle;
+
+	efn->next = first_exit_fn;
+	first_exit_fn = efn;
+}
+
+EXPORT void exit(int status)
+{
+	struct exit_fn *efn;
+
+	/* call atexit functions */
+	while ((efn = first_exit_fn))
+	{
+		efn->func(efn->arg);
+		first_exit_fn = efn->next;
+		free(efn);
+	}
+
+	_exit(status);
 }
 
 EXPORT int ioctl(int fd, int request, int value)
@@ -120,7 +161,7 @@ EXPORT int write(int fd, const void *buffer, size_t length)
 	return dl_write(fd, buffer, length);
 }
 
-EXPORT int open(const char *filename, int flags)
+EXPORT int open(const char *filename, int flags, int mode)
 {
 	int r;
 	__asm__ __volatile__ (
@@ -129,7 +170,8 @@ EXPORT int open(const char *filename, int flags)
 		"\tmov $5, %%eax\n"
 		"\tint $0x80\n"
 		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(filename), "c"(flags) : "memory");
+	:"=a"(r): "a"(filename), "c"(flags), "d"(mode)
+	: "memory");
 
 	return set_errno(r);
 }
@@ -138,7 +180,7 @@ EXPORT int open(const char *filename, int flags)
 
 EXPORT int open64(const char *filename, int flags)
 {
-	return open(filename, flags | O_LARGEFILE);
+	return open(filename, flags | O_LARGEFILE, 0);
 }
 
 EXPORT off_t lseek(int fd, off_t offset, int whence)
@@ -188,6 +230,35 @@ EXPORT int close(int fd)
 	return set_errno(r);
 }
 
+EXPORT int fork(void)
+{
+	int r;
+	__asm__ __volatile__ (
+		"\tint $0x80\n"
+	: "=a"(r)
+	: "a"(2)
+	: "memory");
+	return set_errno(r);
+}
+
+EXPORT int execve(const char *filename,
+	char **argv,
+	char **env)
+{
+	int r;
+	__asm__ __volatile__ (
+		"\tpushl %%ebx\n"
+		"\tmovl %%eax, %%ebx\n"
+		"\tmov $11, %%eax\n"
+		"\tint $0x80\n"
+		"\tpopl %%ebx\n"
+	: "=a"(r)
+	: "a"(filename), "c"(argv), "d"(env)
+	: "memory");
+
+	return set_errno(r);
+}
+
 EXPORT int kill(pid_t pid, int signal)
 {
 	int r;
@@ -201,7 +272,7 @@ EXPORT int kill(pid_t pid, int signal)
 	return set_errno(r);
 }
 
-EXPORT char *getcwd(char *buf, size_t size)
+static int sys_getcwd(char *buf, size_t size)
 {
 	int r;
 	__asm__ __volatile__ (
@@ -212,10 +283,57 @@ EXPORT char *getcwd(char *buf, size_t size)
 		"\tpopl %%ebx\n"
 	:"=a"(r): "a"(buf), "c"(size) : "memory");
 
-	if (r < 0)
+	return set_errno(r);
+}
+
+EXPORT char *getcwd(char *buf, size_t size)
+{
+	int r;
+	if (buf)
 	{
-		set_errno(r);
+		r = sys_getcwd(buf, size);
+		if (r < 0)
+		{
+			set_errno(r);
+			return NULL;
+		}
+		return buf;
+	}
+
+	if (size)
+	{
+		set_errno(-_L(EINVAL));
 		return NULL;
+	}
+
+	size = 0x1000;
+	buf = malloc(size);
+	if (!buf)
+		return NULL;
+	while (1)
+	{
+		char *p;
+		r = sys_getcwd(buf, size);
+		if (r >= 0)
+			break;
+
+		if (r != -_L(ERANGE))
+		{
+			free(buf);
+			buf = NULL;
+			break;
+		}
+
+		size *= 2;
+		p = realloc(buf, size);
+		if (!p)
+		{
+			free(buf);
+			buf = NULL;
+			break;
+		}
+
+		buf = p;
 	}
 
 	return buf;
@@ -234,6 +352,36 @@ EXPORT int chdir(const char *path)
 	: "a"(path)
 	: "memory");
 	return set_errno(r);
+}
+
+EXPORT int getdents(int fd, void *de, int len)
+{
+	int r;
+	__asm__ __volatile__(
+		"\tpushl %%ebx\n"
+		"\tmovl %%eax, %%ebx\n"
+		"\tmov $141, %%eax\n"
+		"\tint $0x80\n"
+		"\tpopl %%ebx\n"
+		:"=a"(r)
+		: "a"(fd), "c"(de), "d"(len)
+		: "memory");
+	return r;
+}
+
+EXPORT int getdents64(int fd, void *de, int len)
+{
+	int r;
+	__asm__ __volatile__(
+		"\tpushl %%ebx\n"
+		"\tmovl %%eax, %%ebx\n"
+		"\tmov $220, %%eax\n"
+		"\tint $0x80\n"
+		"\tpopl %%ebx\n"
+		:"=a"(r)
+		: "a"(fd), "c"(de), "d"(len)
+		: "memory");
+	return r;
 }
 
 EXPORT int setuid(uid_t uid)
@@ -327,6 +475,51 @@ EXPORT pid_t getppid(void)
 	return set_errno(r);
 }
 
+EXPORT int setreuid(int uid, int euid)
+{
+	int r;
+	__asm__ __volatile__ (
+		"\tpushl %%ebx\n"
+		"\tmovl %%eax, %%ebx\n"
+		"\tmov $70, %%eax\n"
+		"\tint $0x80\n"
+		"\tpopl %%ebx\n"
+	: "=a"(r)
+	: "a"(uid), "c"(euid)
+	: "memory");
+	return set_errno(r);
+}
+
+EXPORT int setregid(int gid, int egid)
+{
+	int r;
+	__asm__ __volatile__ (
+		"\tpushl %%ebx\n"
+		"\tmovl %%eax, %%ebx\n"
+		"\tmov $71, %%eax\n"
+		"\tint $0x80\n"
+		"\tpopl %%ebx\n"
+	: "=a"(r)
+	: "a"(gid), "c"(egid)
+	: "memory");
+	return set_errno(r);
+}
+
+EXPORT int pipe(int *fds)
+{
+	int r;
+	__asm__ __volatile__ (
+		"\tpushl %%ebx\n"
+		"\tmovl %%eax, %%ebx\n"
+		"\tmov $42, %%eax\n"
+		"\tint $0x80\n"
+		"\tpopl %%ebx\n"
+	: "=a"(r)
+	: "a"(fds)
+	: "memory");
+	return set_errno(r);
+}
+
 EXPORT int waitpid(int pid, int *status, int options)
 {
 	int r;
@@ -339,6 +532,31 @@ EXPORT int waitpid(int pid, int *status, int options)
 	: "=a"(r)
 	: "a"(pid), "c"(status), "d"(options)
 	: "memory");
+	return set_errno(r);
+}
+
+struct rusage;
+
+EXPORT int wait3(int *status, int options, struct rusage *rusage)
+{
+	if (rusage)
+		warn("wait3(): non-zero rusage\n");
+	return waitpid(-1, status, options);
+}
+
+struct stat;
+
+EXPORT int __xstat(int ver, const char *path, struct stat *st)
+{
+	int r;
+
+	__asm__ __volatile__ (
+		"\tpushl %%ebx\n"
+		"\tmovl %%eax, %%ebx\n"
+		"\tmov $106, %%eax\n"
+		"\tint $0x80\n"
+		"\tpopl %%ebx\n"
+	:"=a"(r): "a"(path), "c"(st) : "memory");
 	return set_errno(r);
 }
 
@@ -413,6 +631,25 @@ EXPORT time_t time(time_t *t)
 	return r;
 }
 
+struct timezone
+{
+	int tz_minuteswest;
+	int tz_dsttime;
+};
+
+EXPORT int gettimeofday(struct timeval *tv, struct timezone *tz)
+{
+	int r;
+	__asm__ __volatile__ (
+		"\tpushl %%ebx\n"
+		"\tmov %%eax, %%ebx\n"
+		"\tmov $78, %%eax\n"
+		"\tint $0x80\n"
+		"\tpopl %%ebx\n"
+	:"=a"(r): "a"(tv), "c"(tz) : "memory");
+	return r;
+}
+
 void* sys_brk(void *addr)
 {
 	int r;
@@ -480,6 +717,33 @@ EXPORT int poll(struct pollfd *pfds, int nfds, int timeout)
 	return set_errno(r);
 }
 
+int sys_select(void *args)
+{
+	int r;
+	__asm__ __volatile__ (
+		"\tmov %%eax, %%ebx\n"
+		"\tmov $82, %%eax\n"
+		"\tint $0x80\n"
+	: "=a"(r)
+	: "a"(args)
+	: "memory");
+
+	return set_errno(r);
+}
+
+EXPORT int select(int nfds, fd_set *readfds, fd_set *writefds,
+		fd_set *exceptfds, struct timeval *timeout)
+{
+	struct {
+		int nfds;
+		fd_set *rfds;
+		fd_set *wfds;
+		fd_set *efds;
+		struct timeval *tv;
+	} args = { nfds, readfds, writefds, exceptfds, timeout };
+	return sys_select(&args);
+}
+
 struct utsname {
 	char sysname[65];
 	char nodename[65];
@@ -519,6 +783,140 @@ EXPORT int nanosleep(const struct timespec *req, struct timespec *rem)
 	return set_errno(r);
 }
 
+EXPORT int usleep(unsigned int usec)
+{
+	struct timeval tv;
+
+	tv.tv_sec = usec / 1000000;
+	tv.tv_usec = usec % 1000000;
+
+	return select(0, NULL, NULL, NULL, &tv);
+}
+
+#define CTYPE_UPPER   (1 << 8)
+#define CTYPE_LOWER   (1 << 9)
+#define CTYPE_ALPHA   (1 << 10)
+#define CTYPE_NUMERIC (1 << 11)
+#define CTYPE_HEX     (1 << 12)
+#define CTYPE_SPACE   (1 << 13)
+#define CTYPE_PRINT   (1 << 14)
+#define CTYPE_GRAPH   (1 << 15)
+#define CTYPE_BLANK   (1 << 0)
+#define CTYPE_CONTROL (1 << 1)
+#define CTYPE_PUNCT   (1 << 2)
+#define CTYPE_ALNUM   (1 << 3)
+
+EXPORT int32_t ** __ctype_toupper_loc(void)
+{
+	static int a[128 + 256];
+	static int *pa;
+
+	if (!pa)
+	{
+		int i;
+		pa = &a[128];
+		for (i = 0; i < 256; i++)
+		{
+			int val = i;
+			if (val >= 'a' && val <= 'z')
+				val &= ~0x20;
+			a[128 + i] = val;
+			if (i >= 128)
+				a[256 - i] = val;
+		}
+	}
+	return &pa;
+}
+
+EXPORT int32_t ** __ctype_tolower_loc(void)
+{
+	static int a[128 + 256];
+	static int *pa;
+
+	if (!pa)
+	{
+		int i;
+		pa = &a[128];
+		for (i = 0; i < 256; i++)
+		{
+			int val = i;
+			if (val >= 'a' && val <= 'z')
+				val |= 0x20;
+			a[128 + i] = val;
+			if (i >= 128)
+				a[256 - i] = val;
+		}
+	}
+	return &pa;
+}
+
+EXPORT unsigned short ** __ctype_b_loc(void)
+{
+	static unsigned short a[128 + 256];
+	static unsigned short *pa;
+
+	if (!pa)
+	{
+		int i;
+		pa = &a[128];
+		for (i = 0; i < 256; i++)
+		{
+			unsigned short val = 0;
+			if (i >= 'A' && i <= 'Z')
+				val |= (CTYPE_UPPER | CTYPE_ALPHA | CTYPE_ALNUM);
+			if (i >= 'a' && i <= 'z')
+				val |= (CTYPE_LOWER | CTYPE_ALPHA | CTYPE_ALNUM);
+			if (i >= '0' && i <= '9')
+				val |= (CTYPE_NUMERIC | CTYPE_ALNUM);
+			if ((i >= '0' && i <= '9') ||
+			    (i >= 'a' && i <= 'f') ||
+			    (i >= 'A' && i <= 'F'))
+				val |= CTYPE_HEX;
+			if (i == ' ' || i == '\t' || i == '\r' || i == '\n')
+				val |= CTYPE_SPACE;
+			if (i >= 0x20 && i <= 0x7f)
+				val |= CTYPE_SPACE;
+
+			a[128 + i] = val;
+			if (i >= 128)
+				a[256 - i] = val;
+		}
+	}
+
+	return &pa;
+}
+
+unsigned int random_value;
+
+EXPORT void srand(unsigned int seed)
+{
+	random_value = seed;
+}
+
+EXPORT int rand_r(unsigned int *seed)
+{
+	*seed ^= 0x0f00baa0;
+	*seed += 0xfeedface;
+	*seed = (*seed << 13) | (*seed >> 19);
+	return *seed % INT_MAX;
+}
+
+EXPORT int rand(void)
+{
+	return rand_r(&random_value);
+}
+
+/* TODO: srandom/random use a better PRNG */
+EXPORT void srandom(unsigned int seed)
+{
+	srand(seed);
+}
+
+EXPORT long int random()
+{
+	return rand();
+}
+
 EXPORT size_t strlen(const char *x)
 {
 	size_t n = 0;
@@ -543,6 +941,11 @@ EXPORT int strcmp(const char *a, const char *b)
 			return 1;
 	}
 	return 0;
+}
+
+EXPORT int strcoll(const char *a, const char *b)
+{
+	return strcmp(a, b);
 }
 
 EXPORT int strncmp(const char *a, const char *b, size_t n)
@@ -638,6 +1041,12 @@ EXPORT FILE *stdin = &__stdin_file;
 EXPORT FILE *stdout = &__stdout_file;
 EXPORT FILE *stderr = &__stderr_file;
 
+/* checks an fd is within the maximum fd set size */
+EXPORT unsigned long int __fdelt_chk(unsigned long int fd)
+{
+	return fd;
+}
+
 EXPORT int fputs_unlocked(const char *str, FILE *stream)
 {
 	/* FIXME: use stream */
@@ -645,8 +1054,43 @@ EXPORT int fputs_unlocked(const char *str, FILE *stream)
 	size_t len = strlen(str);
 	if (len != dl_write(fd, str, len))
 		return EOF;
-	dl_write(1, "\n", 1);
 	return len;
+}
+
+EXPORT char *fgets_unlocked(char *s, int n, FILE *stream)
+{
+	int count = 0;
+
+	if (n <= 0)
+		return NULL;
+
+	while (count < (n - 1))
+	{
+		if (stream->read_avail == 0 && !stdio_read_to_buffer(stream))
+			break;
+
+		if (!stream->read_avail)
+			break;
+
+		s[count] = stream->read_buffer[stream->read_start];
+		stream->read_start++;
+		stream->read_avail--;
+		if (s[count] == '\n')
+			break;
+		count++;
+	}
+
+	if (count == 0)
+		return NULL;
+
+	s[count] = 0;
+
+	return s;
+}
+
+EXPORT char *fgets(char *s, int n, FILE *stream)
+{
+	return fgets_unlocked(s, n, stream);
 }
 
 EXPORT int fputs(const char *str, FILE *stream)
@@ -661,13 +1105,19 @@ EXPORT FILE *fopen(const char *path, const char *mode)
 
 	if (mode[0] == 'r' && mode[1] != '+')
 	{
-		fd = open(path, O_RDONLY);
+		fd = open(path, _L(O_RDONLY), 0);
+		if (fd < 0)
+			return NULL;
+	}
+	else if (mode[0] == 'w')
+	{
+		fd = open(path, _L(O_RDWR) | _L(O_CREAT), 0666);
 		if (fd < 0)
 			return NULL;
 	}
 	else
 	{
-		dprintf("unknown mode %s\n", mode);
+		warn("unknown mode: fopen(%s)\n", mode);
 		return NULL;
 	}
 
@@ -721,11 +1171,6 @@ EXPORT size_t fread(void *ptr, size_t size, size_t nmemb, FILE *f)
 	return 0;
 }
 
-EXPORT int puts(const char *str)
-{
-	return fputs(str, stdout);
-}
-
 EXPORT int fputc(int c, FILE *stream)
 {
 	char ch = c;
@@ -742,6 +1187,13 @@ EXPORT int putc_unlocked(int c, FILE *stream)
 	return c;
 }
 
+EXPORT int puts(const char *str)
+{
+	int r = fputs_unlocked(str, stdout);
+	putc_unlocked('\n', stdout);
+	return r + 1;
+}
+
 EXPORT int putchar_unlocked(int c)
 {
 	return putc_unlocked(c, stdout);
@@ -750,6 +1202,11 @@ EXPORT int putchar_unlocked(int c)
 EXPORT int putchar(int c)
 {
 	return fputc(c, stdout);
+}
+
+EXPORT int _IO_putc(int c, FILE *stream)
+{
+	return fputc(c, stream);
 }
 
 EXPORT int getc_unlocked(FILE *stream)
@@ -775,6 +1232,21 @@ EXPORT int getc_unlocked(FILE *stream)
 	return ch;
 }
 
+EXPORT int getc(FILE *stream)
+{
+	return getc_unlocked(stream);
+}
+
+EXPORT int getchar(void)
+{
+	return getc(stdin);
+}
+
+EXPORT void clearerr(FILE *f)
+{
+	f->flags &= ~(STDIO_READ_ERROR | STDIO_READ_EOF);
+}
+
 EXPORT int ferror(FILE *f)
 {
 	return f->flags & STDIO_READ_ERROR;
@@ -797,6 +1269,119 @@ EXPORT int fclose(FILE *f)
 		return 0;
 	}
 	return -1;
+}
+
+#define DIR_MAGIC 0xd1aad1ab
+
+typedef struct
+{
+	int magic;
+	int fd;
+	int available;
+	int used;
+	unsigned char buffer[0x1000];
+} DIR;
+
+EXPORT DIR *opendir(const char *name)
+{
+	int fd;
+	DIR *dir;
+
+	fd = open(name, _L(O_RDONLY), 0);
+	if (fd < 0)
+		return NULL;
+
+	dir = malloc(sizeof *dir);
+	if (dir)
+	{
+		dir->magic = DIR_MAGIC;
+		dir->fd = fd;
+		dir->available = 0;
+		dir->used = 0;
+	}
+	else
+		close(fd);
+
+	return dir;
+}
+
+EXPORT struct dirent *readdir(DIR *dir)
+{
+	warn("readdir()\n");
+	return NULL;
+}
+
+EXPORT struct linux_dirent64 *readdir64(DIR *dir)
+{
+	struct linux_dirent64 *de;
+	int r;
+
+	if (!dir || dir->magic != DIR_MAGIC)
+		return NULL;
+
+	if (dir->available == dir->used)
+	{
+		r = getdents64(dir->fd, dir->buffer, sizeof dir->buffer);
+		if (r <= 0)
+			return NULL;
+
+		dir->available = r;
+		dir->used = 0;
+
+		de = (void*) dir->buffer;
+	}
+	else
+	{
+		de = (void*) (&dir->buffer[dir->used]);
+		dir->used += de->d_reclen;
+		de = (void*) (&dir->buffer[dir->used]);
+	}
+
+	return de;
+}
+
+EXPORT int closedir(DIR *dir)
+{
+	if (!dir || dir->magic != DIR_MAGIC)
+		return -1;
+
+	close(dir->fd);
+	dir->magic = 0;
+	free(dir);
+
+	return 0;
+}
+
+EXPORT void perror(const char *s)
+{
+	__printf_chk(0, "%s: errno=%d\n", s, errno);
+}
+
+EXPORT char* setlocale(int category, const char *locale)
+{
+	warn("setlocale(%d,%s)\n", category, locale);
+	return "en_US.UTF-8";
+}
+
+EXPORT char *bindtextdomain(const char *domain,
+				 const char *dirname)
+{
+	warn("bindtextdomain(%s,%s)\n", domain, dirname);
+	return NULL;
+}
+
+EXPORT char *textdomain(const char *domain)
+{
+	warn("textdomain(%s)\n", domain);
+	return NULL;
+}
+
+EXPORT char *dcgettext(const char *domain,
+			const char *msgid,
+			int category)
+{
+	/* TODO: implement properly */
+	return (char*) msgid;
 }
 
 /* ignore leap seconds... */
@@ -924,6 +1509,17 @@ EXPORT char *asctime_r(const struct tm *tm, char *out)
 	return out;
 }
 
+EXPORT char *asctime(struct tm *tm)
+{
+	static char out[64];
+	return asctime_r(tm, out);
+}
+
+EXPORT char *ctime(const time_t *timep)
+{
+	return asctime(localtime(timep));
+}
+
 EXPORT size_t strftime(char *s, size_t max,
 			const char *format,
 			const struct tm *tm)
@@ -1025,12 +1621,31 @@ struct printf_output
 {
 	int (*fn)(struct printf_output *pfo, const char *str, size_t len);
 	int width;
+	int maxwidth;
+	int left_justify;
 	char pad;
 	char *buffer;
 	size_t max;
 	size_t out_size;
 	FILE *f;
 };
+
+static void pf_output(struct printf_output *pfo,
+		 const char *buf, size_t len)
+{
+	int i;
+
+	/* add characters for left or right justification */
+	if (!pfo->left_justify)
+		for (i = 0; (i + len) < pfo->width; i++)
+			pfo->fn(pfo, &pfo->pad, 1);
+
+	pfo->fn(pfo, buf, len);
+
+	if (pfo->left_justify)
+		for (i = 0; (i + len) < pfo->width; i++)
+			pfo->fn(pfo, &pfo->pad, 1);
+}
 
 static void pf_decimal(int value, struct printf_output *pfo)
 {
@@ -1051,10 +1666,8 @@ static void pf_decimal(int value, struct printf_output *pfo)
 		buf[--n] = '0';
 	if (sign < 0)
 		buf[--n] = '-';
-	while (sizeof buf > n && sizeof buf - n < pfo->width)
-		buf[--n] = pfo->pad;
 
-	pfo->fn(pfo, &buf[n], sizeof buf - n);
+	pf_output(pfo, &buf[n], sizeof buf - n);
 }
 
 static void pf_unsigned(unsigned int value, struct printf_output *pfo)
@@ -1070,10 +1683,8 @@ static void pf_unsigned(unsigned int value, struct printf_output *pfo)
 
 	if (n == sizeof buf)
 		buf[--n] = '0';
-	while (sizeof buf > n && sizeof buf - n < pfo->width)
-		buf[--n] = pfo->pad;
 
-	pfo->fn(pfo, &buf[n], sizeof buf - n);
+	pf_output(pfo, &buf[n], sizeof buf - n);
 }
 
 static void pf_octal(int value, struct printf_output *pfo)
@@ -1089,10 +1700,8 @@ static void pf_octal(int value, struct printf_output *pfo)
 
 	if (n == sizeof buf)
 		buf[--n] = '0';
-	while (sizeof buf > n && sizeof buf - n < pfo->width)
-		buf[--n] = pfo->pad;
 
-	pfo->fn(pfo, &buf[n], sizeof buf - n);
+	pf_output(pfo, &buf[n], sizeof buf - n);
 }
 
 static char to_hex(int value)
@@ -1115,12 +1724,7 @@ static void pf_hex(unsigned int value, struct printf_output *pfo)
 		value /= 16;
 	}
 
-	if (n == sizeof buf)
-		buf[--n] = '0';
-	while (sizeof buf > n && sizeof buf - n < pfo->width)
-		buf[--n] = pfo->pad;
-
-	pfo->fn(pfo, &buf[n], sizeof buf - n);
+	pf_output(pfo, &buf[n], sizeof buf - n);
 }
 
 static void pf_pointer(void *value, struct printf_output *pfo)
@@ -1135,27 +1739,26 @@ static void pf_pointer(void *value, struct printf_output *pfo)
 	for (i = 0; i < 8; i++)
 		buf[2 + i] = to_hex((x >> (28 - i * 4)) & 0x0f);
 
-	pfo->fn(pfo, buf, sizeof buf);
+	pf_output(pfo, buf, sizeof buf);
 }
 
 static void pf_string(const char *value, struct printf_output *pfo)
 {
 	size_t len;
-	size_t i;
 
 	if (!value)
 		value = "(null)";
 
 	len = strlen(value);
-	for (i = len; i < pfo->width; i++)
-		pfo->fn(pfo, " ", 1);
+	if (len > pfo->maxwidth)
+		len = pfo->maxwidth;
 
-	pfo->fn(pfo, value, len);
+	pf_output(pfo, value, len);
 }
 
 static void pf_char(char value, struct printf_output *pfo)
 {
-	pfo->fn(pfo, &value, 1);
+	pf_output(pfo, &value, 1);
 }
 
 static int internal_vsprintf(int flags, const char *str, va_list va,
@@ -1183,6 +1786,14 @@ static int internal_vsprintf(int flags, const char *str, va_list va,
 		p++;
 
 		pfo->width = 0;
+		if (*p == '-')
+		{
+			pfo->left_justify = 1;
+			p++;
+		}
+		else
+			pfo->left_justify = 0;
+
 		if (*p == '0')
 		{
 			pfo->pad = '0';
@@ -1201,6 +1812,25 @@ static int internal_vsprintf(int flags, const char *str, va_list va,
 			pfo->width += (*p - '0');
 			p++;
 		}
+
+		if (*p == '.')
+		{
+			pfo->maxwidth = 0;
+			p++;
+			if (*p == '*')
+			{
+				pfo->maxwidth = va_arg(va, int);
+				p++;
+			}
+			while (*p >= '0' && *p <= '9')
+			{
+				pfo->maxwidth *= 10;
+				pfo->maxwidth += (*p - '0');
+				p++;
+			}
+		}
+		else
+			pfo->maxwidth = INT_MAX;
 
 		/* long */
 		lng = 0;
@@ -1270,7 +1900,7 @@ static int internal_vsprintf(int flags, const char *str, va_list va,
 			p++;
 			break;
 		default:
-			dprintf("printf(): %c unhandled\n", *p);
+			warn("printf(): %c unhandled\n", *p);
 			return 0;
 		}
 	}
@@ -1297,6 +1927,11 @@ EXPORT int vprintf(const char *str, va_list va)
 	return internal_vsprintf(0, str, va, &pfo);
 }
 
+EXPORT int __vprintf_chk(int flag, const char *str, va_list va)
+{
+	return vprintf(str, va);
+}
+
 EXPORT int __printf_chk(int flag, const char *str, ...)
 {
 	va_list va;
@@ -1304,7 +1939,7 @@ EXPORT int __printf_chk(int flag, const char *str, ...)
 
 	va_start(va, str);
 
-	r = vprintf(str, va);
+	r = __vprintf_chk(flag, str, va);
 
 	va_end(va);
 
@@ -1325,9 +1960,8 @@ static int snprintf_chk_pfo(struct printf_output *pfo, const char *str, size_t l
 	return 1;
 }
 
-EXPORT int __sprintf_chk(char *out, int flag, size_t maxlen, const char *str, ...)
+EXPORT int __vsprintf_chk(char *out, int flag, size_t maxlen, const char *str, va_list va)
 {
-	va_list va;
 	int r;
 	struct printf_output pfo =
 	{
@@ -1337,21 +1971,28 @@ EXPORT int __sprintf_chk(char *out, int flag, size_t maxlen, const char *str, ..
 		.max = maxlen,
 	};
 
-	va_start(va, str);
-
 	r = internal_vsprintf(flag, str, va, &pfo);
 
 	pfo.buffer[pfo.out_size] = 0;
 
+	return r;
+}
+
+EXPORT int __sprintf_chk(char *out, int flag, size_t maxlen, const char *str, ...)
+{
+	va_list va;
+	int r;
+
+	va_start(va, str);
+	r = __vsprintf_chk(out, flag, maxlen, str, va);
 	va_end(va);
 
 	return r;
 }
 
-EXPORT int __snprintf_chk(char *out, size_t maxlen, int flag,
-			 size_t strlen, const char *str, ...)
+EXPORT int __vsnprintf_chk(char *out, size_t maxlen, int flag,
+			 size_t slen, const char *str, va_list va)
 {
-	va_list va;
 	int r;
 	struct printf_output pfo =
 	{
@@ -1361,14 +2002,8 @@ EXPORT int __snprintf_chk(char *out, size_t maxlen, int flag,
 		.max = maxlen ? maxlen - 1 : 0,
 	};
 
-	if (strlen < maxlen)
-	{
-		verbose = 1;
-		dprintf("snprintf overflow\n");
-		abort();
-	}
-
-	va_start(va, str);
+	if (slen < maxlen)
+		die("snprintf overflow\n");
 
 	r = internal_vsprintf(flag, str, va, &pfo);
 
@@ -1380,6 +2015,23 @@ EXPORT int __snprintf_chk(char *out, size_t maxlen, int flag,
 			pfo.buffer[pfo.max] = 0;
 	}
 
+	return r;
+}
+
+EXPORT int vsnprintf(char *out, size_t maxlen,
+			const char *str, va_list va)
+{
+	return __vsnprintf_chk(out, maxlen, 0, INT_MAX, str, va);
+}
+
+EXPORT int __snprintf_chk(char *out, size_t maxlen, int flag,
+			 size_t slen, const char *str, ...)
+{
+	va_list va;
+	int r;
+
+	va_start(va, str);
+	r = __vsnprintf_chk(out, maxlen, flag, slen, str, va);
 	va_end(va);
 
 	return r;
@@ -1467,6 +2119,15 @@ EXPORT int __asprintf_chk(char **strp, int flags, const char *fmt, ...)
 	return r;
 }
 
+void warn(const char *str, ...)
+{
+	va_list va;
+
+	va_start(va, str);
+	vprintf(str, va);
+	va_end(va);
+}
+
 void dprintf(const char *str, ...)
 {
 	va_list va;
@@ -1477,6 +2138,18 @@ void dprintf(const char *str, ...)
 	vprintf(str, va);
 	va_end(va);
 }
+
+void die(const char *str, ...)
+{
+	va_list va;
+
+	va_start(va, str);
+	vprintf(str, va);
+	va_end(va);
+
+	abort();
+}
+
 
 #define STRTOX_IMPL							\
 	int sign = 1;							\
@@ -1653,21 +2326,15 @@ static void heap_compress(void)
 	{
 		if (p->magic != HEAP_MAGIC)
 		{
-			verbose = 1;
-			dprintf("heap magic wrong! %p %08x\n", p, p->magic);
-			abort();
+			die("heap magic wrong! %p %08x\n", p, p->magic);
 		}
 		if (p->next && p->next <= p)
 		{
-			verbose = 1;
-			dprintf("heap not linear! %p -> %p\n", p, p->next);
-			abort();
+			die("heap not linear! %p -> %p\n", p, p->next);
 		}
 		if (p->sz < sizeof (*p))
 		{
-			verbose = 1;
-			dprintf("heap block too small! %p\n", p);
-			abort();
+			die("heap block too small! %p\n", p);
 		}
 		if (!p->used)
 		{
@@ -1700,11 +2367,7 @@ EXPORT void *malloc(size_t sz)
 	for (p = &first_block; *p; p = &((*p)->next))
 	{
 		if ((*p)->magic != HEAP_MAGIC)
-		{
-			verbose = 1;
-			dprintf("malloc(): corrupt heap %p\n", *p);
-			abort();
-		}
+			die("malloc(): corrupt heap %p\n", *p);
 		if ((*p)->used)
 			continue;
 		if (heap_block_sz(*p) >= sz)
@@ -1758,18 +2421,10 @@ EXPORT void *realloc(void *ptr, size_t mem)
 	p--;
 
 	if (p->magic != HEAP_MAGIC)
-	{
-		verbose = 1;
-		dprintf("realloc(): corrupt heap %p\n", ptr);
-		abort();
-	}
+		die("realloc(): corrupt heap %p\n", ptr);
 
 	if (!p->used)
-	{
-		verbose = 1;
-		dprintf("realloc(): memory not allocated %p\n", ptr);
-		abort();
-	}
+		die("realloc(): memory not allocated %p\n", ptr);
 
 	old_size = heap_block_sz(p);
 	if (old_size >= mem)
@@ -1817,18 +2472,10 @@ EXPORT void free(void *ptr)
 	p--;
 
 	if (p->magic != HEAP_MAGIC)
-	{
-		verbose = 1;
-		dprintf("free(): corrupt heap %p\n", ptr);
-		abort();
-	}
+		die("free(): corrupt heap %p\n", ptr);
 
 	if (!p->used)
-	{
-		verbose = 1;
-		dprintf("realloc(): memory not allocated %p\n", ptr);
-		abort();
-	}
+		die("realloc(): memory not allocated %p\n", ptr);
 
 	heap_free_block(p);
 }
@@ -1853,6 +2500,19 @@ EXPORT void *memcpy(void *dest, const void *src, size_t n)
 		dc[i] = sc[i];
 
 	return dest;
+}
+
+EXPORT void *mempcpy(void *dest, const void *src, size_t n)
+{
+	memcpy(dest, src, n);
+	return (char*) dest + n;
+}
+
+EXPORT void *__memcpy_chk(void *dest, const void *src, size_t n, size_t destsize)
+{
+	if (destsize < n)
+		die("bad memcpy");
+	return memcpy(dest, src, n);
 }
 
 EXPORT void *memmove(void *dest, const void *src, size_t n)
@@ -1962,16 +2622,22 @@ EXPORT char *strcpy(char *dest, const char *s)
 	return dest;
 }
 
+EXPORT char *strncpy(char *dest, const char *s, size_t n)
+{
+	size_t i;
+	for (i = 0; i < n && s[n]; i++)
+		dest[n] = s[n];
+	for ( ; i < n; i++)
+		dest[n] = 0;
+	return dest;
+}
+
 EXPORT char *__strcpy_chk(char *dest, const char *s, size_t destlen)
 {
 	size_t len = strlen(s) + 1;
 
 	if (len > destlen)
-	{
-		verbose = 1;
-		dprintf("strcpy() overrun\n");
-		abort();
-	}
+		die("strcpy() overrun\n");
 
 	memcpy(dest, s, len);
 	return dest;
@@ -1986,7 +2652,8 @@ EXPORT char *stpcpy(char *d, const char *s)
 
 EXPORT char *strcat(char *dest, const char *src)
 {
-	return strcpy(dest + strlen(dest), src);
+	strcpy(dest + strlen(dest), src);
+	return dest;
 }
 
 EXPORT char *__strcat_chk(char *dest, const char *src, size_t destlen)
@@ -1994,11 +2661,8 @@ EXPORT char *__strcat_chk(char *dest, const char *src, size_t destlen)
 	size_t sl = strlen(src);
 	size_t dl = strlen(dest);
 	if (sl + dl >= destlen)
-	{
-		verbose = 1;
-		dprintf("strcat(): overrun\n");
-		abort();
-	}
+		die("strcat(): overrun\n");
+
 	memcpy(&dest[dl], src, sl + 1);
 	return dest;
 }
@@ -2016,11 +2680,8 @@ EXPORT char *__strncat_chk(char *dest, const char *src,
 		sl = n;
 
 	if (sl + dl >= destlen)
-	{
-		verbose = 1;
-		dprintf("strcat(): overrun\n");
-		abort();
-	}
+		die("strcat(): overrun\n");
+
 	memcpy(&dest[dl], src, sl);
 	dest[dl + sl] = 0;
 	return dest;
@@ -2079,6 +2740,21 @@ EXPORT size_t strcspn(const char *str, const char *reject)
 	return r;
 }
 
+EXPORT char *strpbrk(const char *s, const char *accept)
+{
+	unsigned char ok[256] = {0};
+	int i;
+
+	for (i = 0; accept[i]; i++)
+		ok[(unsigned char)accept[i]] = 1;
+
+	for (i = 0; s[i]; i++)
+		if (ok[(unsigned char)s[i]])
+			return (char*) &s[i];
+
+	return NULL;
+}
+
 typedef int regoff_t;
 
 typedef struct
@@ -2095,7 +2771,7 @@ typedef struct
 
 EXPORT int regcomp(regex_t *preg, const char *regex, int cflags)
 {
-	dprintf("regcomp(%p,%s,%08x)\n", preg, regex, cflags);
+	warn("regcomp(%p,%s,%08x)\n", preg, regex, cflags);
 	return 0;
 }
 
@@ -2104,7 +2780,7 @@ EXPORT int regexec(const regex_t *preg, const char *string, size_t nmatch,
 {
 	int i;
 
-	dprintf("regexec(%p,...)\n", preg);
+	warn("regexec(%p,...)\n", preg);
 
 	for (i = 0; i < nmatch; i++)
 	{
@@ -2147,13 +2823,54 @@ EXPORT void *bsearch(const void *key, const void *base,
 	}
 }
 
+/* not quicksort, but anyway */
+typedef int (*fn_compare)(const void *, const void *);
+EXPORT void qsort(void *base, size_t nmemb, size_t size, fn_compare fn)
+{
+	size_t mid;
+	unsigned char *a1, *a2, *end;
+
+	if (nmemb <= 1)
+		return;
+
+	mid = nmemb/2;
+	a1 = (unsigned char *)base;
+	a2 = base + size * mid;
+	end = base + size * nmemb;
+
+	/* sort halves */
+	if (size > 2)
+	{
+		qsort(a1, mid, size, fn);
+		qsort(a2, nmemb - mid, size, fn);
+	}
+
+	while (a1 < a2 && a2 < end)
+	{
+		int r = fn(a1, a2);
+		if (r < 0)
+		{
+			a1 += size;
+		}
+		else
+		{
+			unsigned char tmp[size];
+			memcpy(tmp, a2, size);
+			memmove(a1 + size, a1, a2 - a1);
+			memcpy(a1, tmp, size);
+			a1 += size;
+			a2 += size;
+		}
+	}
+}
+
 EXPORT char **__environ;
 
 EXPORT char *getenv(const char *name)
 {
 	char **p;
 	size_t len = strlen(name);
-	for (p = ld_environment;
+	for (p = environ;
 		*p;
 		p++)
 	{
@@ -2406,27 +3123,57 @@ EXPORT int getopt(int argc, const char **argv,
 	return getopt_long(argc, argv, optstring, NULL, NULL);
 }
 
-struct termios
+struct passwd
 {
-	unsigned int c_iflag;
-	unsigned int c_oflag;
-	unsigned int c_cflag;
-	unsigned int c_lflag;
-	unsigned char c_line;
-	unsigned char c_cc[8];
+	char *pw_name;
+	char *pw_passwd;
+	uid_t pw_uid;
+	gid_t pw_gid;
+	char *pw_gecos;
+	char *pw_dir;
+	char *pw_shell;
 };
 
-#define TCGETS 0x5401
-#define TCSETS 0x5402
+EXPORT struct passwd *getpwuid(uid_t uid)
+{
+	struct passwd *pw;
+	const char str[] = "atratus\0*\0Atratus\0/\0/bin/sh";
+
+	/* FIXME: read from /etc/passwd when ready */
+	pw = malloc(sizeof *pw + sizeof str);
+	memcpy(&pw[1], str, sizeof str);
+	pw->pw_name = (char*) (&pw[1]);
+	pw->pw_passwd = pw->pw_name + strlen(pw->pw_name) + 1;
+	pw->pw_uid = uid;
+	pw->pw_gid = uid;
+	pw->pw_gecos = pw->pw_passwd + strlen(pw->pw_passwd) + 1;
+	pw->pw_dir = pw->pw_gecos + strlen(pw->pw_gecos) + 1;
+	pw->pw_shell = pw->pw_dir + strlen(pw->pw_dir) + 1;
+
+	return pw;
+}
+
+/*typedef uint64_t dev_t;*/
+
+EXPORT unsigned int gnu_dev_major(dev_t devid)
+{
+	return (devid >> 16);
+}
+
+EXPORT unsigned int gnu_dev_minor(dev_t devid)
+{
+	return (devid & 0xffff);
+}
 
 EXPORT int tcgetattr(int fd, struct termios *tios)
 {
-	return ioctl(fd, TCGETS, (int) tios);
+	return ioctl(fd, TIOCG, (int) tios);
 }
 
-EXPORT int tcsetattr(int fd, struct termios *tios)
+EXPORT int tcsetattr(int fd, int optional_actions, struct termios *tios)
 {
-	return ioctl(fd, TCSETS, (int) tios);
+	/* TODO: do something with optional_actions */
+	return ioctl(fd, TIOCS, (int) tios);
 }
 
 EXPORT pid_t tcgetpgrp(int fd)
@@ -2476,14 +3223,89 @@ EXPORT int ttyname_r(int fd, char *buf, size_t buflen)
 	return 0;
 }
 
-struct jmp_buf {
-};
-
-EXPORT int _setjmp(struct jmp_buf *buf)
+EXPORT char *ttyname(int fd)
 {
-	dprintf("setjmp(%p)\n", buf);
-	return 0;
+	static char buf[0x1000];
+	int r;
+	r = ttyname_r(fd, buf, sizeof buf - 1);
+	if (r < 0)
+		return NULL;
+	return buf;
 }
+
+/* jmpbuf is 156 bytes in size */
+struct jmp_buf;
+
+EXPORT int _setjmp(struct jmp_buf *buf);
+__asm__ (
+	"\n"
+".text\n"
+".globl _setjmp\n"
+".type	_setjmp, @function\n"
+"_setjmp:\n"
+	"\tpush %ebx\n"
+	"\tmovl 8(%esp), %eax\n"	/* jmpbuf */
+	"\tmovl %ebx, (%eax)\n"
+	"\tmovl %ecx, 4(%eax)\n"
+	"\tmovl %edx, 8(%eax)\n"
+	"\tmovl %esi, 12(%eax)\n"
+	"\tmovl %edi, 16(%eax)\n"
+	"\tmovl %ebp, 20(%eax)\n"
+	"\tmovl %esp, 24(%eax)\n"
+	"\tmovl 4(%esp), %ebx\n"		/* save the return address */
+	"\tmovl %ebx, 28(%eax)\n"
+	/* TODO: save floating point, debug registers, etc */
+	"\txor %eax, %eax\n"		/* return 0 */
+	"\tpopl %ebx\n"
+	"\tret\n"
+	"\t.size	_setjmp, .-_setjmp\n"
+);
+
+EXPORT void __longjmp_chk(struct jmp_buf *buf, int val);
+__asm__ (
+	"\n"
+".text\n"
+".globl __longjmp_chk\n"
+".type	__longjmp_chk, @function\n"
+"__longjmp_chk:\n"
+	"\tmov 4(%esp), %eax\n"		/* eax hold pointer to jmpbuf */
+
+	/* fetch old EIP, save it on the return stack */
+	"\tmov 28(%eax), %ebx\n"	/* ebx the return EIP */
+	"\tmov 24(%eax), %ecx\n"	/* ecx holds pointer to return stack */
+	"\tmov %ebx, 4(%ecx)\n"		/* save return address on the return stack */
+
+	/* fetch return value, save it on the "return" stack */
+	"\tmov 8(%esp), %ebx\n"		/* val */
+	"\tcmp $1, %ebx\n"		/* change 0 to 1 */
+	"\tadc $0, %ebx\n"
+	"\tmov %ebx, (%ecx)\n"		/* save the return value on the return stack */
+
+	/* restore registers */
+	"\tmov (%eax), %ebx\n"
+	"\tmov 4(%eax), %ecx\n"
+	"\tmov 8(%eax), %edx\n"
+	"\tmov 12(%eax), %esi\n"
+	"\tmov 16(%eax), %edi\n"
+	"\tmov 20(%eax), %ebp\n"
+	"\tmov 24(%eax), %esp\n"
+
+	/* restore EAX and EIP */
+	"\tpop %eax\n"
+	"\tret\n"
+	"\t.size	__longjmp_chk, .-__longjmp_chk\n"
+);
+
+EXPORT void longjmp(struct jmp_buf *buf, int val);
+__asm__ (
+	"\n"
+".text\n"
+".globl longjmp\n"
+".type	longjmp, @function\n"
+"longjmp:\n"
+	"\tjmp __longjmp_chk\n"
+	"\t.size	longjmp, .-longjmp\n"
+);
 
 #define SIG_DFL 0
 #define SIG_IGN 1
@@ -2560,6 +3382,8 @@ EXPORT int __libc_start_main(fn_main pmain,
 			fn_rtld_fini prtld_fini,
 			void (* stack_end))
 {
+	int r;
+
 	dprintf("%s called\n", __FUNCTION__);
 	dprintf("main   %p\n", pmain);
 	dprintf("argc   %d\n", argc);
@@ -2572,7 +3396,7 @@ EXPORT int __libc_start_main(fn_main pmain,
 
 	dprintf("init() done\n");
 
-	pmain(argc, ubp_av, NULL);
-	dprintf("main() done\n");
-	exit(0);
+	r = pmain(argc, ubp_av, environ);
+	dprintf("main() returned %d\n", r);
+	exit(r);
 }

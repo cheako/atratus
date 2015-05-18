@@ -1,7 +1,8 @@
-#include <stdio.h>
+#define _GNU_SOURCE
+
 #include <string.h>
+#include <stdio.h>
 #include <unistd.h>
-#include <stdlib.h>
 
 #define OK(expr) \
 	do { \
@@ -13,28 +14,23 @@
 		} \
 	} while (0)
 
-int test_getcwd(void)
+int test_create_pipe(void)
 {
-	char buf[100], *d;
+	int fds[2] = {-1, -1};
 
-	OK(0 == chdir("/"));
-	OK(buf == getcwd(buf, sizeof buf));
-	OK(!strcmp(buf, "/"));
-
-	d = getcwd(NULL, 0);
-	OK(NULL != d);
-	OK(!strcmp(d, "/"));
-	free(d);
+	OK(0 == pipe(fds));
+	OK(0 == close(fds[0]));
+	OK(0 == close(fds[1]));
 
 	return 1;
 }
 
 int main(int argc, char **argv)
 {
-	if (!test_getcwd())
+	if (!test_create_pipe())
 		return 1;
 
-	puts("OK");
+	printf("OK\n");
 
 	return 0;
 }
