@@ -1,0 +1,75 @@
+
+    atratus v0.1
+
+Run Linux binaries on Windows!
+
+WHAT IS IT?
+
+Atratus is a binary compatibility layer that can run Linux binaries
+on Windows.  Atratus will load an ELF format executable created with
+gcc under Linux run it.
+
+QUICK SETUP
+
+* apt-get install gcc-mingw32 build-essential
+
+* run "make" in the top level directory
+
+* map z:\ as ~/atratus in a VirtualBox running Windows XP
+   - On VirtualBox "Devices" menu, choose "Shared folder...",
+     click on the "+" icon, and add the atratus directory.
+   - In Windows XP's explorer, open "My Computer", choose
+     "Map Network drive", and map the atratus folder to Z:
+
+* open a windows command prompt, and type "Z:" to select
+  Z drive. Then type "server\atratus.exe" as follows:
+
+   Z:\>server\atratus.exe
+   usage: server\atratus prog ...
+
+   Z:\>server\atratus.exe tests\static\hw
+   hello world
+
+   Z:>
+
+LIMITATIONS?
+
+* This code has been tested with Windows XP an Intel x86 processor.
+  It may not work correctly on Windows 7 or Windows 8, and will
+  definitely not work on Windows 2000 in its current state.
+
+* v0.1 is a proof of concept to show that fork() and exec(), which
+  have been a stubling block of previous Linux-binary-on-Windows
+  projects can work.
+
+* programs statically linked with glibc will not work
+
+WHAT WORKS?
+
+* A bunch of test programs in tests/ should work.
+  Feedback is welcome!
+
+DIRTY TECHNICAL DETAILS?
+
+* glibc can not be made to work due to its use of negative offsets 
+  with the %gs segment register, however TLS as described by ELF
+  appears to be possible, as it uses %gs:[0].  %gs will be set
+  to %fs selector, and %gs:[0] can be setup to point to valid memory.
+
+  Specifically, the set_thread_selector() system call cannot be
+  made to work correctly without a device driver as there appears
+  to be no way to allocate a thread selector from Windows userland
+
+* fork() is implemented using NtCreateProcess() which is an NT system
+  call not exposed to Win32 userland
+
+* Linux system calls are caught using the NT debugger interface,
+  although they could be caught by an exception handler "in process"
+  to improve efficiency.
+
+* the "kernel" is using co-operative multi-tasking (i.e. yield())
+  to keep things simple and reliable for the moment.
+
+WHO?
+
+Mike McCormack

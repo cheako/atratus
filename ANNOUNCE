@@ -1,0 +1,9 @@
+Announcement & Release notes
+
+Sat Sep 15 12:10:11 EST 2012
+0.1 - Initial release
+
+ - rudimentary fork and exec work correctly
+ - accesses to %gs offsets emitted by gcc for stack smashing protection work
+ - rudimentary shared object loader works
+
