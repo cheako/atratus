@@ -1,7 +1,7 @@
 /*
- * fork() and wait test
+ * null device
  *
- * Copyright (C)  2012 - 2013 Mike McCormack
+ * Copyright (C) 2012 - 2013 Mike McCormack
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -19,32 +19,9 @@
  *
  */
 
-#include <stdlib.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <stdio.h>
+#ifndef __ATRATUS_SERVER_NULL_H__
+#define __ATRATUS_SERVER_NULL_H__
 
-int main(int argc, char **argv)
-{
-	int r;
+filp *null_fp_get(void);
 
-	r = fork();
-	if (r == 0)
-	{
-		_exit(0x123);
-	}
-	else
-	{
-		int child = r;
-		int status = 0;
-		r = waitpid(-1, &status, 0);
-		if (r != child)
-			return 1;
-
-		if (status != 0x2300)
-			return 1;
-	}
-	printf("ok\n");
-	return 0;
-}
+#endif /* __ATRATUS_SERVER_NULL_H__ */

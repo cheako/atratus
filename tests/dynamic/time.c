@@ -1,5 +1,5 @@
 /*
- * fork() and wait test
+ * time functions test
  *
  * Copyright (C)  2012 - 2013 Mike McCormack
  *
@@ -19,32 +19,59 @@
  *
  */
 
-#include <stdlib.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/wait.h>
+#define _GNU_SOURCE
 #include <stdio.h>
+#include <time.h>
+#include <string.h>
+#include <stdlib.h>
+#include "ok.h"
+
+int test_mktime(void)
+{
+	struct tm tm =
+ 	{
+		.tm_year = 112,
+		.tm_mon = 11,
+		.tm_mday = 16,
+		.tm_hour = 21,
+		.tm_min = 42,
+		.tm_sec = 1,
+		.tm_wday = 10,
+		.tm_yday = 10,
+	};
+	struct tm tm2;
+	time_t t;
+
+	t = mktime(&tm);
+	OK(t == 1355694121);
+	OK(tm.tm_wday == 0);
+	OK(tm.tm_yday == 350);
+
+	OK(&tm2 == gmtime_r(&t, &tm2));
+
+	OK(tm2.tm_year == 112);
+	OK(tm2.tm_mon == 11);
+	OK(tm2.tm_mday == 16);
+	OK(tm2.tm_hour == 21);
+
+	tm.tm_year = 0;
+	OK(-1 == mktime(&tm));
+
+	tm.tm_year = 2012;
+	OK(-1 == mktime(&tm));
+
+	return 1;
+}
 
 int main(int argc, char **argv)
 {
-	int r;
+	setenv("TZ", "", 1);
+	tzset();
 
-	r = fork();
-	if (r == 0)
-	{
-		_exit(0x123);
-	}
-	else
-	{
-		int child = r;
-		int status = 0;
-		r = waitpid(-1, &status, 0);
-		if (r != child)
-			return 1;
+	if (!test_mktime())
+		return 1;
 
-		if (status != 0x2300)
-			return 1;
-	}
-	printf("ok\n");
+	printf("OK\n");
+
 	return 0;
 }

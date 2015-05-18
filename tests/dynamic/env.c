@@ -1,5 +1,5 @@
 /*
- * fork() and wait test
+ * Environment test
  *
  * Copyright (C)  2012 - 2013 Mike McCormack
  *
@@ -19,32 +19,44 @@
  *
  */
 
-#include <stdlib.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/wait.h>
+#define _GNU_SOURCE
 #include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "ok.h"
+
+int test_setenv(void)
+{
+	unsetenv("X");
+	OK(NULL == getenv("X"));
+
+	OK(0 == setenv("X", "foo", 0));
+	OK(!strcmp(getenv("X"), "foo"));
+
+	OK(0 == setenv("X", "bar", 0));
+	OK(!strcmp(getenv("X"), "foo"));
+
+	OK(0 == setenv("X", "bar", 1));
+	OK(!strcmp(getenv("X"), "bar"));
+
+	OK(0 == unsetenv("X"));
+	OK(NULL == getenv("X"));
+
+	OK(0 == setenv("X", "bar", 1));
+	OK(!strcmp(getenv("X"), "bar"));
+
+	OK(0 == clearenv());
+	OK(NULL == getenv("X"));
+
+	return 1;
+}
 
 int main(int argc, char **argv)
 {
-	int r;
+	if (!test_setenv())
+		return 1;
 
-	r = fork();
-	if (r == 0)
-	{
-		_exit(0x123);
-	}
-	else
-	{
-		int child = r;
-		int status = 0;
-		r = waitpid(-1, &status, 0);
-		if (r != child)
-			return 1;
+	printf("OK\n");
 
-		if (status != 0x2300)
-			return 1;
-	}
-	printf("ok\n");
 	return 0;
 }

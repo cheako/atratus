@@ -1,19 +1,21 @@
 /*
  * atratus - Linux binary emulation for Windows
  *
- * Copyright (C)  2006-2012 Mike McCormack
+ * Copyright (C) 2011 - 2013 Mike McCormack
  *
- *  This program is free software: you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation, version 3.
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
  *
- *  You should have received a copy of the GNU General Public License
- *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  *
  */
 
@@ -40,6 +42,9 @@
 #include "process.h"
 #include "tty.h"
 #include "vt100.h"
+#include "inet.h"
+
+#include "debug.h"
 
 struct _l_pollfd {
 	int fd;
@@ -119,6 +124,7 @@ struct process *context_from_client_id(CLIENT_ID *id)
 
 extern void KiUserApcDispatcher(void);
 
+static FILE *debug_stream;
 int verbose = 0;
 
 int dprintf(const char *fmt, ...) __attribute__((format(printf,1,2)));
@@ -130,8 +136,9 @@ int dprintf(const char *fmt, ...)
 	if (!verbose)
 		return 0;
 	va_start(va, fmt);
-	n = vprintf(fmt, va);
+	n = vfprintf(debug_stream, fmt, va);
 	va_end(va);
+	fflush(debug_stream);
 	return n;
 }
 
@@ -228,7 +235,7 @@ int load_module(struct module_info *m, const char *path);
 int map_elf_object(struct module_info *m, int fd);
 void* sys_mmap(void *addr, ULONG len, int prot,
 		int flags, int fd, off_t offset);
-int sys_close(int fd);
+int do_close(int fd);
 NTSTATUS GetClientId(HANDLE thread, CLIENT_ID *id);
 void dump_string_list(char **list);
 void unlink_process(struct process *process);
@@ -812,6 +819,8 @@ void purge_address_space(void)
 	PVOID Address = 0;
 	NTSTATUS r;
 
+	current->brk = 0;
+
 	while (1)
 	{
 		MEMORY_BASIC_INFORMATION info;
@@ -956,9 +965,9 @@ int do_exec(const char *filename, char **argv, char **envp)
 	dprintf("Esp = %08lx\n", current->regs.Esp);
 end:
 	if (exe_fd)
-		sys_close(exe_fd);
+		do_close(exe_fd);
 	if (interp_fd)
-		sys_close(interp_fd);
+		do_close(interp_fd);
 	return r;
 }
 
@@ -1099,14 +1108,22 @@ NTSTATUS dump_tls(struct process *context)
 	return r;
 }
 
-filp* filp_from_fd(int fd)
+struct fdinfo* fdinfo_from_fd(int fd)
 {
 	assert(_L(EBADF) == 9);
 	if (fd >= MAX_FDS)
 		return NULL;
 	if (fd < 0)
 		return NULL;
-	return current->handles[fd];
+	return &current->handles[fd];
+}
+
+filp* filp_from_fd(int fd)
+{
+	struct fdinfo* fdinfo = fdinfo_from_fd(fd);
+	if (!fdinfo)
+		return NULL;
+	return fdinfo->fp;
 }
 
 int alloc_fd_above(int start)
@@ -1115,7 +1132,7 @@ int alloc_fd_above(int start)
 
 	for (newfd = start; newfd < MAX_FDS; newfd++)
 	{
-		if (!current->handles[newfd])
+		if (!current->handles[newfd].fp)
 			break;
 	}
 
@@ -1128,6 +1145,27 @@ int alloc_fd_above(int start)
 int alloc_fd(void)
 {
 	return alloc_fd_above(0);
+}
+
+void init_fp(filp *fp, const struct filp_ops *ops)
+{
+	memset(fp, 0, sizeof *fp);
+	fp->ops = ops;
+	fp->handle = INVALID_HANDLE_VALUE;
+	fp->refcount = 1;
+}
+
+void copy_fd_set(struct process *to, struct process *from)
+{
+	int i;
+
+	for (i = 0; i < MAX_FDS; i++)
+	{
+		to->handles[i].fp = from->handles[i].fp;
+		to->handles[i].flags = from->handles[i].flags;
+		if (to->handles[i].fp)
+			to->handles[i].fp->refcount++;
+	}
 }
 
 int sys_fork(void)
@@ -1187,10 +1225,10 @@ int sys_fork(void)
 	/* copy fd set */
 	for (i = 0; i < MAX_FDS; i++)
 	{
-		if (!(current->fd_flags[i] & FD_CLOSE_ON_EXEC))
-			context->handles[i] = current->handles[i];
-		else
-			context->handles[i] = NULL;
+		if (current->handles[i].flags & FD_CLOSE_ON_EXEC)
+		{
+			do_close(i);
+		}
 	}
 
 	/* copy the parent thread's context into this one's */
@@ -1231,7 +1269,11 @@ int sys_fork(void)
 		goto out;
 	}
 
+	/* dup the fd set */
+	copy_fd_set(context, current);
+
 	context->cwd = strdup(current->cwd);
+	context->brk = current->brk;
 
 	/* set the process parent */
 	context->parent = current;
@@ -1241,6 +1283,7 @@ int sys_fork(void)
 	current->child = context;
 	context->umask = current->umask;
 	context->tty = current->tty;
+	context->tty->refcount++;
 
 	dprintf("fork() good!\n");
 
@@ -1269,24 +1312,36 @@ int sys_exit(int exit_code)
 
 int sys_read(int fd, void *addr, size_t length)
 {
+	struct fdinfo *fdi;
+	filp *fp;
+
 	dprintf("read(%d,%p,%d)\n", fd, addr, length);
 
-	filp *fp = filp_from_fd(fd);
-	if (!fp)
+	fdi = fdinfo_from_fd(fd);
+	if (!fdi)
 		return -_L(EBADF);
 
-	return fp->ops->fn_read(fp, addr, length, &fp->offset);
+	fp = fdi->fp;
+
+	return fp->ops->fn_read(fp, addr, length, &fp->offset,
+				 !(fdi->flags & FD_NONBLOCKING));
 }
 
 int sys_pread64(int fd, void *addr, size_t length, loff_t ofs)
 {
+	struct fdinfo *fdi;
+	filp *fp;
+
 	dprintf("pread64(%d,%p,%d,%d)\n", fd, addr, length, (int)ofs);
 
-	filp *fp = filp_from_fd(fd);
-	if (!fp)
+	fdi = fdinfo_from_fd(fd);
+	if (!fdi)
 		return -_L(EBADF);
 
-	return fp->ops->fn_read(fp, addr, length, &ofs);
+	fp = fdi->fp;
+
+	return fp->ops->fn_read(fp, addr, length, &ofs,
+				 !(fdi->flags & FD_NONBLOCKING));
 }
 
 int sys_write(int fd, void *addr, size_t length)
@@ -1352,7 +1407,18 @@ static int do_open(const char *file, int flags, int mode)
 	}
 
 	if (fs)
+	{
+		/* FIXME: get the filp, not fd from fs->open() */
 		r = fs->open(fs, &path[len], flags, mode);
+		if (r >= 0)
+		{
+			if (flags & _L(O_NONBLOCK))
+			{
+				dprintf("open(O_NONBLOCK)\n");
+				current->handles[r].flags |= FD_NONBLOCKING;
+			}
+		}
+	}
 	else
 		r = _L(ENOENT);
 
@@ -1598,7 +1664,7 @@ int sys_open(const char *ptr, int flags, int mode)
 	return r;
 }
 
-int sys_close(int fd)
+int do_close(int fd)
 {
 	filp *fp;
 
@@ -1606,20 +1672,39 @@ int sys_close(int fd)
 	if (!fp)
 		return -_L(EBADF);
 
-	if (fp->ops->fn_close)
-		fp->ops->fn_close(fp);
-	current->handles[fd] = NULL;
+	if (fp->refcount == -1)
+	{
+		fprintf(stderr, "reference to bad fd %d\n", fd);
+		exit(1);
+	}
+
+	fp->refcount--;
+	if (fp->refcount == 0)
+	{
+		if (fp->ops->fn_close)
+			fp->ops->fn_close(fp);
+		memset(fp, 0xff, sizeof *fp);
+		free(fp);
+	}
+	current->handles[fd].fp = NULL;
+	current->handles[fd].flags = 0;
 
 	return 0;
+}
+
+int sys_close(int fd)
+{
+	dprintf("close(%d)\n", fd);
+	return do_close(fd);
 }
 
 int sys_llseek(unsigned int fd, unsigned long offset_high,
 	unsigned long offset_low, loff_t *result, unsigned int whence)
 {
 	filp* fp;
-	LARGE_INTEGER pos;
-	LARGE_INTEGER out;
-	BOOL r;
+	uint64_t pos;
+	uint64_t out;
+	int r;
 
 	dprintf("llseek(%d,%lu,%lu,%p,%u)\n", fd,
 		offset_high, offset_low, result, whence);
@@ -1628,22 +1713,46 @@ int sys_llseek(unsigned int fd, unsigned long offset_high,
 	if (!fp)
 		return -_L(EBADF);
 
-	pos.LowPart = offset_low;
-	pos.HighPart = offset_high;
+	pos = offset_low;
+	pos |= ((uint64_t)offset_high << 32);
 
 	if (whence > 2)
 		return -_L(EINVAL);
 
-	r = SetFilePointerEx(fp->handle, pos, &out, whence);
-	if (!r)
-		return -_L(EIO);
+	if (!fp->ops->fn_seek)
+		return -_L(EPERM);
 
-	return current->ops->memcpy_to(result, &out.QuadPart,
-					sizeof out.QuadPart);
+	r = fp->ops->fn_seek(fp, whence, pos, &out);
+	if (r < 0)
+		return r;
+
+	return current->ops->memcpy_to(result, &out, sizeof *result);
 }
 
-#define SECSPERDAY 86400
-#define SECS_1601_TO_1970 ((369 * 365 + 89) * (ULONGLONG)SECSPERDAY)
+int sys_lseek(unsigned int fd, long offset, unsigned int whence)
+{
+	int r;
+	filp* fp;
+	uint64_t out;
+
+	dprintf("lseek(%d,%lu,%u)\n", fd, offset, whence);
+
+	fp = filp_from_fd(fd);
+	if (!fp)
+		return -_L(EBADF);
+
+	if (whence > 2)
+		return -_L(EINVAL);
+
+	if (!fp->ops->fn_seek)
+		return -_L(EPERM);
+
+	r = fp->ops->fn_seek(fp, whence, offset, &out);
+	if (r < 0)
+		return r;
+
+	return (int) out;
+}
 
 static void gettimeval(struct timeval *tv)
 {
@@ -1943,7 +2052,10 @@ void* sys_mmap(void *addr, ULONG len, int prot, int flags, int fd, off_t offset)
 		addr, len, prot, flags, fd, offset);
 
 	if (fd != -1)
+	{
+		fprintf(stderr, "mmap'ing files not yet supported\n");
 		return (void*) -_L(EINVAL);
+	}
 
 	/* find current state of memory */
 	Address = (void*)((int)addr & ~0xffff);
@@ -2035,6 +2147,52 @@ int sys_munmap(void *addr, size_t len)
 		return -1;
 
 	return 0;
+}
+
+int sys_socket(int domain, int type, int protocol)
+{
+	dprintf("socket(%d,%d,%d)\n", domain, type, protocol);
+
+	switch (domain)
+	{
+	case _L(AF_INET):
+		return inet4_socket(type, protocol);
+	}
+	return -_L(ENOSYS);
+}
+
+/* semi-documented at http://isomerica.net/~dpn/socketcall1.pdf */
+int sys_socketcall(int call, unsigned long *argptr)
+{
+	int argcount[] = { 3, 3, 3, 2, 3, 3, 3, 4, 4, 4, 6, 6, 2, 5, 5, 3, 3 };
+	unsigned long args[10];
+	struct fdinfo *fdi;
+	filp* fp;
+	int r;
+
+	dprintf("socketcall(%d,%p)\n", call, argptr);
+
+	if (call < 1 || call > 17)
+		return -_L(ENOSYS);
+
+	r = current->ops->memcpy_from(args, argptr, sizeof args[0] * argcount[call - 1]);
+	if (r < 0)
+		return r;
+
+	if (call == _L(SYS_SOCKET))
+		return sys_socket(args[0], args[1], args[2]);
+
+	fdi = fdinfo_from_fd(args[0]);
+	if (!fdi)
+		return -_L(EBADF);
+
+	fp = fdi->fp;
+
+	if (!fp->ops->fn_sockcall)
+		return -_L(ENOTSOCK);
+
+	return fp->ops->fn_sockcall(call, fp, args,
+				 !(fdi->flags & FD_NONBLOCKING));
 }
 
 void* sys_brk(void *addr)
@@ -2139,6 +2297,33 @@ static int do_stat64(const char *file, struct stat64 *statbuf, BOOL follow_links
 	return r;
 }
 
+static int sys_access(const char *ptr, int mode)
+{
+	char *path = NULL;
+	struct stat64 st;
+	int r;
+
+	r = read_string(ptr, &path);
+	if (r < 0)
+	{
+		dprintf("access(<invalid>,%08x)\n", mode);
+		return r;
+	}
+
+	dprintf("access(\"%s\",%08x)\n", path, mode);
+
+	r = do_stat64(path, &st, TRUE);
+	if (r == 0)
+	{
+		if ((mode & W_OK) && !(st.st_mode & 0222))
+			r = -_L(EACCES);
+	}
+
+	free(path);
+
+	return r;
+}
+
 static void stat_from_stat64(struct stat *st, const struct stat64 *st64)
 {
 	memset(st, 0, sizeof *st);
@@ -2214,6 +2399,30 @@ int sys_stat64(const char *ptr, struct stat64 *statbuf)
 	return r;
 }
 
+int sys_ftruncate64(int fd, unsigned int offsethi, unsigned int offsetlo)
+{
+	uint64_t offset;
+	filp* fp;
+	int r;
+
+	offset = offsethi;
+	offset <<= 32;
+	offset |= offsetlo;
+
+	dprintf("ftruncate64(%d, %08llx)\n", fd, offset);
+
+	fp = filp_from_fd(fd);
+	if (!fp)
+		return -_L(EBADF);
+
+	if (!fp->ops->fn_truncate)
+		return -_L(EPERM);
+
+	r = fp->ops->fn_truncate(fp, offset);
+
+	return r;
+}
+
 int sys_lstat64(const char *ptr, struct stat64 *statbuf)
 {
 	struct stat64 st;
@@ -2235,6 +2444,32 @@ int sys_lstat64(const char *ptr, struct stat64 *statbuf)
 		r = current->ops->memcpy_to(statbuf, &st, sizeof st);
 
 	free(path);
+
+	return r;
+}
+
+int sys_fstat(int fd, struct stat *statbuf)
+{
+	struct stat64 st64;
+	filp* fp;
+	int r;
+
+	dprintf("fstat(%d,%p)\n", fd, statbuf);
+
+	fp = filp_from_fd(fd);
+	if (!fp)
+		return -_L(EBADF);
+
+	if (!fp->ops->fn_stat)
+		return -_L(ENOENT);
+
+	r = fp->ops->fn_stat(fp, &st64);
+	if (r == 0)
+	{
+		struct stat st;
+		stat_from_stat64(&st, &st64);
+		r = current->ops->memcpy_to(statbuf, &st, sizeof st);
+	}
 
 	return r;
 }
@@ -2330,7 +2565,12 @@ int sys_dup(int fd)
 
 	newfd = alloc_fd();
 	if (newfd >= 0)
-		current->handles[newfd] = fp;
+	{
+		struct fdinfo *fdi = &current->handles[newfd];
+		fp->refcount++;
+		fdi->fp = fp;
+		fdi->flags = 0;
+	}
 
 	return newfd;
 }
@@ -2362,8 +2602,24 @@ static int sys_fcntl_fdup(filp *fp, int fd, int start)
 	if (newfd < 0)
 		return newfd;
 
-	current->handles[newfd] = fp;
+	fp->refcount++;
+	current->handles[newfd].fp = fp;
+	current->handles[newfd].flags = 0;
+
 	return newfd;
+}
+
+int sys_fcntl_setfl(int fd, long arg)
+{
+	if (arg & _L(O_NONBLOCK))
+		current->handles[fd].flags |= FD_NONBLOCKING;
+	else
+		current->handles[fd].flags &= ~FD_NONBLOCKING;
+
+	if (arg & ~_L(O_NONBLOCK))
+		dprintf("fcntl(): unknown fd flag %08lx\n", arg);
+
+	return 0;
 }
 
 int sys_fcntl(int fd, int cmd, long arg)
@@ -2383,17 +2639,71 @@ int sys_fcntl(int fd, int cmd, long arg)
 		r = sys_fcntl_fdup(fp, fd, arg);
 		break;
 	case _L(F_SETFD):
-		current->fd_flags[fd] |= FD_CLOSE_ON_EXEC;
+		current->handles[fd].flags |= FD_CLOSE_ON_EXEC;
 		r = 0;
 		break;
 	case _L(F_GETFD):
-		r = !!(current->fd_flags[fd] & FD_CLOSE_ON_EXEC);
+		r = !!(current->handles[fd].flags & FD_CLOSE_ON_EXEC);
+		break;
+	case _L(F_SETFL):
+		r = sys_fcntl_setfl(fd, arg);
 		break;
 	default:
 		dprintf("unknown fcntl(%d, %08x, %08lx)\n",
 			fd, cmd, arg);
 		r = -_L(EINVAL);
 	}
+
+	return r;
+}
+
+int sys_utimes(const char *ptr, struct timeval *ptrtimes)
+{
+	char *filename = NULL;
+	struct timeval times[2];
+	struct fs *fs;
+	size_t len = 0;
+	char *path;
+	int r;
+
+	if (ptrtimes)
+	{
+		r = current->ops->memcpy_from(times, ptrtimes, sizeof times);
+		if (r < 0)
+			return r;
+		ptrtimes = times;
+	}
+
+	r = read_string(ptr, &filename);
+	if (r < 0)
+	{
+		dprintf("utimes(<invalid>,%p)\n", ptrtimes);
+		return r;
+	}
+
+	dprintf("utimes(%s,%p)\n", filename, ptrtimes);
+
+	path = get_path(filename);
+
+	for (fs = fs_first; fs; fs = fs->next)
+	{
+		len = strlen(fs->root);
+		if (!strncmp(fs->root, path, len))
+			break;
+	}
+
+	if (fs)
+	{
+		if (fs->utimes)
+			r = fs->utimes(fs, &path[len], ptrtimes);
+		else
+			r = -_L(EPERM);
+	}
+	else
+		r = -_L(ENOENT);
+
+	free(path);
+	free(filename);
 
 	return r;
 }
@@ -2412,8 +2722,8 @@ int sys_pipe(int *ptr)
 	r = current->ops->memcpy_to(ptr, fds, sizeof fds);
 	if (r < 0)
 	{
-		sys_close(fds[0]);
-		sys_close(fds[1]);
+		do_close(fds[0]);
+		do_close(fds[1]);
 	}
 
 	return 0;
@@ -2489,9 +2799,11 @@ int sys_dup2(int oldfd, int newfd)
 	if (newfd < 0 || newfd > MAX_FDS)
 		return -_L(EBADF);
 
-	/* FIXME: dereference former newfd entry */
+	do_close(newfd);
 
-	current->handles[newfd] = fp;
+	fp->refcount++;
+	current->handles[newfd].fp = fp;
+	current->handles[newfd].flags = 0;
 
 	return 0;
 }
@@ -2523,10 +2835,10 @@ static void poll_timeout_waker(struct timeout *t)
 	current = p;
 }
 
-int sys_nanosleep(struct timeval *in, struct timeval *out)
+int sys_nanosleep(struct timespec *in, struct timeval *out)
 {
 	struct poll_timeout pt;
-	struct timeval req;
+	struct timespec req;
 	int r;
 
 	dprintf("nanosleep(%p,%p)\n", in, out);
@@ -2538,11 +2850,18 @@ int sys_nanosleep(struct timeval *in, struct timeval *out)
 	pt.t.fn = &poll_timeout_waker;
 	pt.p = current;
 
-	timeout_add_tv(&pt.t, &req);
+	timeout_add_timespec(&pt.t, &req);
 	current->state = thread_stopped;
 	yield();
 	current->state = thread_running;
 	timeout_remove(&pt.t);
+
+	if (out)
+	{
+		req.tv_sec = 0;
+		req.tv_nsec = 0;
+		current->ops->memcpy_to(out, &req, sizeof req);
+	}
 
 	return 0;
 }
@@ -2556,6 +2875,9 @@ static int poll_check(filp **fps, struct _l_pollfd *fds, int nfds)
 	{
 		if (fps[i])
 		{
+			if (!fps[i]->ops->fn_poll)
+				continue;
+
 			fds[i].revents = fps[i]->ops->fn_poll(fps[i]);
 			if (fds[i].revents & fds[i].events)
 				ready++;
@@ -2603,7 +2925,10 @@ int do_poll(int nfds, struct _l_pollfd *fds, struct timeval *tv)
 	for (i = 0; i < nfds; i++)
 	{
 		wait_list[i].p = current;
-		fps[i]->ops->fn_poll_add(fps[i], &wait_list[i]);
+		if (fps[i]->ops->fn_poll_add)
+			fps[i]->ops->fn_poll_add(fps[i], &wait_list[i]);
+		else
+			dprintf("%d is not pollable\n", fds[i].fd);
 	}
 
 	while (1)
@@ -2619,7 +2944,8 @@ int do_poll(int nfds, struct _l_pollfd *fds, struct timeval *tv)
 
 	for (i = 0; i < nfds; i++)
 	{
-		fps[i]->ops->fn_poll_del(fps[i], &wait_list[i]);
+		if (fps[i]->ops->fn_poll_del)
+			fps[i]->ops->fn_poll_del(fps[i], &wait_list[i]);
 	}
 
 	if (tv)
@@ -2848,6 +3174,9 @@ int do_syscall(int n, int a1, int a2, int a3, int a4, int a5, int a6)
 	case 13:
 		r = sys_time(ptr(a1));
 		break;
+	case 19:
+		r = sys_lseek(a1, a2, a3);
+		break;
 	case 20:
 		r = sys_getpid();
 		break;
@@ -2857,11 +3186,9 @@ int do_syscall(int n, int a1, int a2, int a3, int a4, int a5, int a6)
 	case 24:
 		r = sys_getuid();
 		break;
-#if 0
 	case 33:
 		r = sys_access(ptr(a1), a2);
 		break;
-#endif
 	case 37:
 		r = sys_kill(a1, a2);
 		break;
@@ -2921,8 +3248,14 @@ int do_syscall(int n, int a1, int a2, int a3, int a4, int a5, int a6)
 	case 91:
 		r = sys_munmap(ptr(a1), a2);
 		break;
+	case 102:
+		r = sys_socketcall(a1, ptr(a2));
+		break;
 	case 106:
 		r = sys_stat(ptr(a1), ptr(a2));
+		break;
+	case 108:
+		r = sys_fstat(a1, ptr(a2));
 		break;
 	case 122:
 		r = sys_newuname(ptr(a1));
@@ -2961,6 +3294,9 @@ int do_syscall(int n, int a1, int a2, int a3, int a4, int a5, int a6)
 	case 192:
 		r = (int) sys_mmap(ptr(a1), a2, a3, a4, a5, a6);
 		break;
+	case 194:
+		r = sys_ftruncate64(a1, a2, a3);
+		break;
 	case 195:
 		r = sys_stat64(ptr(a1), ptr(a2));
 		break;
@@ -2995,6 +3331,9 @@ int do_syscall(int n, int a1, int a2, int a3, int a4, int a5, int a6)
 		r = sys_exit_group(a1);
 		break;
 #endif
+	case 271:
+		r = sys_utimes(ptr(a1), ptr(a2));
+		break;
 	default:
 		printf("unknown/invalid system call %d (%08x)\n", n, n);
 		exit(1);
@@ -3031,7 +3370,7 @@ int mmap_flags_from_elf(int flags)
 
 void print_map_flags(int flags)
 {
-	printf("map -> %s %s %s\n",
+	dprintf("map -> %s %s %s\n",
 		flags & _l_PROT_READ ? "PROT_READ" : "",
 		flags & _l_PROT_WRITE ? "PROT_WRITE" : "",
 		flags & _l_PROT_EXEC ? "PROT_EXEC" : "");
@@ -3075,8 +3414,7 @@ int map_elf_object(struct module_info *m, int fd)
 		unsigned int memsz = round_up_to_page(vaddr_offset + m->to_load[i].p_memsz);
 		unsigned int max_addr;
 
-		if (verbose)
-			print_map_flags(mapflags);
+		print_map_flags(mapflags);
 
 		p = (void*)(m->base - m->min_vaddr + vaddr);
 
@@ -3485,6 +3823,64 @@ NTSTATUS handle_reg_indirect_to_write(void)
 	return r;
 }
 
+static int emulate_instruction(unsigned char *buffer, CONTEXT *regs)
+{
+	int r;
+
+	return 0;
+
+	// 8e e8			mov    %eax,%gs
+	if (buffer[0] == 0x8e)
+	{
+		handle_mov_reg_to_seg_reg(buffer[1]);
+		regs->Eip += 2;
+	}
+	// 65 a3 14 00 00 00		mov    %eax,%gs:0x14
+	else if (buffer[0] == 0x65 && buffer[1] == 0xa3)
+	{
+		r = handle_mov_eax_to_gs_addr();
+		if (r != STATUS_SUCCESS)
+			return 0;
+	}
+	else if (buffer[0] == 0x65 && buffer[1] == 0xa1)
+	{
+		r = handle_mov_gs_addr_to_eax();
+		if (r != STATUS_SUCCESS)
+			return 0;
+	}
+	// 65 c7 00 80 c4 1b 08		movl   $0x81bc480,%gs:(%eax)
+	else if (buffer[0] == 0x65 && buffer[1] == 0xc7)
+	{
+		r = handle_movl_to_gs_reg();
+		if (r != STATUS_SUCCESS)
+			return 0;
+	}
+	// 65 83 3d 0c 00 00 00 00    cmpl   $0x0,%gs:0xc
+	else if (buffer[0] == 0x65 && buffer[1] == 0x83)
+	{
+		r = handle_imm32_to_gs_address();
+		if (r != STATUS_SUCCESS)
+			return 0;
+	}
+	// 65 89 0b			mov    %ecx,%gs:(%ebx)
+	else if (buffer[0] == 0x65 && buffer[1] == 0x89)
+	{
+		r = handle_reg_indirect_to_write();
+		if (r != STATUS_SUCCESS)
+			return 0;
+	}
+	// 65 8b 03			mov    %gs:(%ebx),%eax
+	// 65 8b 38			mov    %gs:(%eax),%edi
+	else if (buffer[0] == 0x65 && buffer[1] == 0x8b)
+	{
+		r = handle_reg_indirect_to_read();
+		if (r != STATUS_SUCCESS)
+			return 0;
+	}
+
+	return 1;
+}
+
 typedef NTSTATUS (*EventHandlerFn)(DEBUGEE_EVENT *event,
 				struct process *context);
 
@@ -3551,55 +3947,7 @@ static NTSTATUS OnDebuggerException(DEBUGEE_EVENT *event,
 			/* syscall fiber will continue the client thread */
 			return STATUS_SUCCESS;
 		}
-		// 8e e8			mov    %eax,%gs
-		else if (buffer[0] == 0x8e)
-		{
-			handle_mov_reg_to_seg_reg(buffer[1]);
-			regs->Eip += 2;
-		}
-		// 65 a3 14 00 00 00		mov    %eax,%gs:0x14
-		else if (buffer[0] == 0x65 && buffer[1] == 0xa3)
-		{
-			r = handle_mov_eax_to_gs_addr();
-			if (r != STATUS_SUCCESS)
-				goto fail;
-		}
-		else if (buffer[0] == 0x65 && buffer[1] == 0xa1)
-		{
-			r = handle_mov_gs_addr_to_eax();
-			if (r != STATUS_SUCCESS)
-				goto fail;
-		}
-		// 65 c7 00 80 c4 1b 08		movl   $0x81bc480,%gs:(%eax)
-		else if (buffer[0] == 0x65 && buffer[1] == 0xc7)
-		{
-			r = handle_movl_to_gs_reg();
-			if (r != STATUS_SUCCESS)
-				goto fail;
-		}
-		// 65 83 3d 0c 00 00 00 00    cmpl   $0x0,%gs:0xc
-		else if (buffer[0] == 0x65 && buffer[1] == 0x83)
-		{
-			r = handle_imm32_to_gs_address();
-			if (r != STATUS_SUCCESS)
-				goto fail;
-		}
-		// 65 89 0b			mov    %ecx,%gs:(%ebx)
-		else if (buffer[0] == 0x65 && buffer[1] == 0x89)
-		{
-			r = handle_reg_indirect_to_write();
-			if (r != STATUS_SUCCESS)
-				goto fail;
-		}
-		// 65 8b 03			mov    %gs:(%ebx),%eax
-		// 65 8b 38			mov    %gs:(%eax),%edi
-		else if (buffer[0] == 0x65 && buffer[1] == 0x8b)
-		{
-			r = handle_reg_indirect_to_read();
-			if (r != STATUS_SUCCESS)
-				goto fail;
-		}
-		else
+		else if (!emulate_instruction(buffer, regs))
 		{
 			fprintf(stderr, "not a syscall: %02x %02x\n",
 				buffer[0], buffer[1]);
@@ -4031,6 +4379,20 @@ void timeout_add_tv(struct timeout *t, struct timeval *ts)
 	timeout_add(t);
 }
 
+void timeout_add_timespec(struct timeout *t, struct timespec *ts)
+{
+	struct timeval now;
+
+	timeout_now(&now);
+
+	t->tv.tv_usec = now.tv_usec + (ts->tv_nsec+999)/1000;
+	t->tv.tv_sec = now.tv_sec + ts->tv_sec;
+	t->tv.tv_sec += t->tv.tv_usec / (1000 * 1000);
+	t->tv.tv_usec %= (1000 * 1000);
+
+	timeout_add(t);
+}
+
 void tv_from_ms(struct timeval *tv, int ms)
 {
 	tv->tv_usec = (ms % 1000) * 1000;
@@ -4103,6 +4465,7 @@ int main(int argc, char **argv)
 	struct process *context = alloc_process();
 	int n = 1;
 	HANDLE console_handle;
+	HANDLE inet4_handle;
 	DWORD console_mode = 0;
 	BOOL backtrace_on_ctrl_c = 0;
 
@@ -4113,9 +4476,6 @@ int main(int argc, char **argv)
 	context->egid = 1000;
 
 	InitializeCriticalSection(&ready_list_lock);
-
-	winfs_init();
-	devfs_init();
 
 	loop_event = CreateEvent(NULL, 0, 0, NULL);
 
@@ -4149,12 +4509,26 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	debug_stream = stderr;
 	while (n < argc)
 	{
 		if (!strcmp(argv[n], "-d"))
 		{
 			verbose = 1;
 			n++;
+			continue;
+		}
+
+		if (!strcmp(argv[n], "-D") && (n + 1) < argc)
+		{
+			verbose = 1;
+			debug_stream = fopen(argv[n+1], "a");
+			if (!debug_stream)
+			{
+				fprintf(stderr, "failed to open %s\n", argv[n+1]);
+				exit(1);
+			}
+			n += 2;
 			continue;
 		}
 
@@ -4173,6 +4547,13 @@ int main(int argc, char **argv)
 		fprintf(stderr, "usage: %s prog ...\n", argv[0]);
 		return 1;
 	}
+
+	/*
+	 * Logging should be enabled at this point
+	 */
+	inet4_handle = inet4_init();
+	winfs_init();
+	devfs_init();
 
 	/*
 	 * Create a debugger port
@@ -4209,9 +4590,12 @@ int main(int argc, char **argv)
 		fprintf(stderr, "output not a console...\n");
 
 	current->tty = get_vt100_console(console_handle);
-	context->handles[0] = current->tty;
-	context->handles[1] = current->tty;
-	context->handles[2] = current->tty;
+	context->handles[0].fp = current->tty;
+	context->handles[0].flags = 0;
+	context->handles[1].fp = current->tty;
+	context->handles[1].flags = 0;
+	context->handles[2].fp = current->tty;
+	context->handles[2].flags = 0;
 
 	/* move exec into fiber */
 	r = do_exec(argv[n], argv + n, env);
@@ -4252,17 +4636,19 @@ int main(int argc, char **argv)
 
 	while (first_process != NULL)
 	{
-		HANDLE handles[3];
+		HANDLE handles[4];
 		int n = 0;
 		DWORD timeout;
 
 		handles[n++] = hBreakEvent;
 		handles[n++] = debugObject;
 		handles[n++] = loop_event;
+		handles[n++] = inet4_handle;
 
 		timeout = timeout_get_next();
 
-		r = WaitForMultipleObjects(n, handles, FALSE, timeout);
+		r = MsgWaitForMultipleObjectsEx(n, handles, timeout,
+					QS_ALLEVENTS, MWMO_ALERTABLE);
 		if (r == WAIT_OBJECT_0)
 		{
 			fprintf(stderr,"User abort!\n");
@@ -4282,6 +4668,10 @@ int main(int argc, char **argv)
 			r = ReadDebugPort(debugObject);
 			if (r != STATUS_SUCCESS)
 				break;
+		}
+		else if (r == (WAIT_OBJECT_0 + 3))
+		{
+			inet4_process_events();
 		}
 		else if (r == WAIT_TIMEOUT)
 		{

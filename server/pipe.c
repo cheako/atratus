@@ -1,3 +1,24 @@
+/*
+ * pipe emulation
+ *
+ * Copyright (C) 2012 - 2013 Mike McCormack
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ *
+ */
+
 #include <windows.h>
 #include "pipe.h"
 #include "filp.h"
@@ -5,7 +26,7 @@
 #include "linux-errno.h"
 #include "debug.h"
 
-static int pipe_read(filp *f, void *buf, size_t size, loff_t *off)
+static int pipe_read(filp *f, void *buf, size_t size, loff_t *off, int block)
 {
 	return 0;
 }
@@ -29,10 +50,7 @@ int do_pipe(int *fds)
 		return -_L(ENOMEM);
 
 	memset(fp, 0, sizeof *fp);
-	fp->ops = &pipe_ops;
-	fp->pgid = 0;
-	fp->handle = INVALID_HANDLE_VALUE;
-	fp->offset = 0;
+	init_fp(fp, &pipe_ops);
 
 	fds[0] = alloc_fd();
 	if (fds[0] < 0)
@@ -41,7 +59,8 @@ int do_pipe(int *fds)
 		return -_L(ENOMEM);
 	}
 
-	current->handles[fds[0]] = fp;
+	current->handles[fds[0]].fp = fp;
+	current->handles[fds[0]].flags = 0;
 
 	fds[1] = alloc_fd();
 	if (fds[1] < 0)
@@ -51,7 +70,8 @@ int do_pipe(int *fds)
 		return -_L(ENOMEM);
 	}
 
-	current->handles[fds[1]] = fp;
+	current->handles[fds[1]].fp = fp;
+	current->handles[fds[1]].flags = 0;
 
 	dprintf("fds[] -> %d, %d\n", fds[0], fds[1]);
 

@@ -3,23 +3,20 @@
  *
  * Copyright (C)  2006-2012 Mike McCormack
  *
- *  This program is free software: you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation, version 3.
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
  *
- *  You should have received a copy of the GNU General Public License
- *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
- */
-
-/*
- * TODO:
- *   - load libraries specified by DT_NEEDED
- *   - resolve symbols from symbol tables
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ *
  */
 
 #include <sys/types.h>
@@ -32,28 +29,12 @@
 #include "loader.h"
 #include "string.h"
 #include "stdlib.h"
+#include "debug.h"
+#include "linux-defines.h"
+#include "linux-errno.h"
 
-#define NULL ((void *)0)
-
-static struct module_info loader_module;
-static struct module_info main_module;
-extern char **environ;
-
-/*
- * errno should be per thread,
- * leave as global until we can load an ELF binary
- */
-
-static unsigned int ld_get_auxv(Elf32_Aux *auxv, int value)
-{
-	int i;
-
-	for (i = 0; auxv[i].a_type != AT_NULL; i++)
-		if (auxv[i].a_type == value)
-			return auxv[i].a_value;
-
-	return 0;
-}
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#define MAX(a, b) (((a) > (b)) ? (a) : (b))
 
 struct dt_info
 {
@@ -85,9 +66,255 @@ struct dt_info
 struct module_info
 {
 	unsigned int delta;
+	unsigned int base;
 	struct dt_info dt;
 	const char *name;
 };
+
+static struct module_info modules[32];
+static struct module_info *main_module = &modules[0];
+static struct module_info *loader_module = &modules[1];
+static int module_count = 2;
+extern char **environ;
+static int ldverbose = 0;
+
+/*
+ * bootstrapping functions
+ */
+static void *ldmemcpy(void *dest, const void *src, size_t n)
+{
+	const unsigned char *sc = src;
+	unsigned char *dc = dest;
+	int i;
+
+	for (i = 0; i < n; i++)
+		dc[i] = sc[i];
+
+	return dest;
+}
+
+static int ldmemcmp(const void *s1, const void *s2, size_t n)
+{
+	const unsigned char *left = s1, *right = s2;
+	int r = 0;
+	int i;
+
+	for (i = 0; r == 0 && i < n; i++)
+		r = left[i] - right[i];
+
+	return r;
+}
+
+static int ldstrcmp(const char *a, const char *b)
+{
+	while (*a || *b)
+	{
+		if (*a == *b)
+		{
+			a++;
+			b++;
+			continue;
+		}
+		if (*a < *b)
+			return -1;
+		else
+			return 1;
+	}
+	return 0;
+}
+
+/*static*/ int ldstrlen(const char *s)
+{
+	int n = 0;
+	while (s[n])
+		n++;
+	return n;
+}
+
+static void ldexit(int status)
+{
+	while (1)
+	{
+		__asm__ __volatile__ (
+			"\tint $0x80\n"
+		:
+		: "a"(1), "b"(status)
+		: "memory");
+	}
+}
+
+static int ldopen(const char *filename, int flags, int mode)
+{
+	int r;
+	SYSCALL3(5, filename, flags, mode);
+	return r;
+}
+
+static int ldread(int fd, void *buffer, size_t length)
+{
+	int r;
+	SYSCALL3(3, fd, buffer, length);
+	return r;
+}
+
+static int ldpread(int fd, void *buf, size_t count, off_t offset)
+{
+	int r;
+	SYSCALL5(180, fd, buf, count, offset, 0);
+	return r;
+}
+
+static int ldwrite(int fd, const void *buffer, size_t length)
+{
+	int r;
+	SYSCALL3(4, fd, buffer, length);
+	return r;
+}
+
+static void* ldmmap(void *start, size_t len, int prot, int flags, int fd, off_t offset)
+{
+	int r;
+	unsigned long args[6];
+
+	/* not enough free registers to pass 6 args in */
+	args[0] = (unsigned long) start;
+	args[1] = (unsigned long) len;
+	args[2] = (unsigned long) prot;
+	args[3] = (unsigned long) flags;
+	args[4] = (unsigned long) fd;
+	args[5] = (unsigned long) offset;
+
+	__asm__ __volatile__(
+		"\tpush %%ebx\n"
+		"\tpush %%ebp\n"
+		"\tmov (%%eax), %%ebx\n"
+		"\tmov 4(%%eax), %%ecx\n"
+		"\tmov 8(%%eax), %%edx\n"
+		"\tmov 12(%%eax), %%esi\n"
+		"\tmov 16(%%eax), %%edi\n"
+		"\tmov 20(%%eax), %%ebp\n"
+		"\tmov $192, %%eax\n"
+		"\tint $0x80\n"
+		"\tpop %%ebp\n"
+		"\tpop %%ebx\n"
+		: "=a"(r)
+		: "a" (args)
+		: "memory", "ecx", "edx", "esi", "edi"
+	);
+
+	if ((r & 0xfffff000) == 0xfffff000)
+		return _L(MAP_FAILED);
+
+	return (void*) r;
+}
+
+static int ldclose(int fd)
+{
+	int r;
+	SYSCALL1(6, fd);
+	return r;
+}
+
+static void ldvprintf(const char *str, va_list va)
+{
+	const char *p = str;
+	char buffer[0x200];
+	char *out = buffer;
+
+	while (*p)
+	{
+		size_t len = 0;
+
+		while (p[len] && p[len] != '%')
+			len++;
+		if (len)
+		{
+			ldmemcpy(out, p, len);
+			out += len;
+			p += len;
+			continue;
+		}
+
+		if (!*p)
+			break;
+
+		p++;
+
+		switch (*p)
+		{
+		case '%':
+			*out++ = '%';
+			p++;
+			break;
+		case 'p':
+		case 'x':
+			{
+				unsigned int val = va_arg(va, unsigned int);
+				int i;
+				for (i = 0; i < 8; i++)
+				{
+					unsigned int rem = (val % 0x10);
+					out[7 - i] = (rem > 9) ? (rem - 10 + 'A') : (rem + '0');
+					val /= 0x10;
+				}
+				out += i;
+			}
+			p++;
+			break;
+		case 's':
+			{
+				const char *val = va_arg(va, const char*);
+				while (*val)
+					*out++ = *val++;
+			}
+			p++;
+			break;
+		case 'c':
+			*out = va_arg(va, int);
+			p++;
+			break;
+		default:
+			ldwrite(2, "ldprintf ??\n", 10);
+			ldexit(1);
+		}
+	}
+
+	ldwrite(1, buffer, out - buffer);
+}
+
+static void ldprintf(const char *str, ...)
+{
+	va_list va;
+
+	if (!ldverbose)
+		return;
+
+	va_start(va, str);
+	ldvprintf(str, va);
+	va_end(va);
+}
+
+static void lddie(const char *error, ...)
+{
+	va_list va;
+
+	va_start(va, error);
+	ldvprintf(error, va);
+	va_end(va);
+
+	ldexit(1);
+}
+
+static unsigned int ld_get_auxv(Elf32_Aux *auxv, int value)
+{
+	int i;
+
+	for (i = 0; auxv[i].a_type != AT_NULL; i++)
+		if (auxv[i].a_type == value)
+			return auxv[i].a_value;
+
+	return 0;
+}
 
 unsigned long elf_hash(const char *name)
 {
@@ -158,14 +385,17 @@ Elf32_Sym *elf_hash_lookup(struct module_info *m,
 			abort();
 		}
 #endif
-		if (!strcmp(name, symbol_name))
+		if (!ldstrcmp(name, symbol_name))
 			return sym;
 
 		index = chains[index];
 		count--;
 	}
 	if (!count)
-		die("circular chain in ELF32 hash\n");
+	{
+		ldprintf("circular chain in ELF32 hash\n");
+		ldexit(1);
+	}
 
 	return 0;
 }
@@ -212,7 +442,7 @@ Elf32_Sym *elf_gnu_hash_lookup(struct module_info *m,
 			sym = (void*)(m->delta + m->dt.symtab);
 			sym += index;
 			name = strtab_get(m, sym->st_name);
-			if (!strcmp(name, symbol_name))
+			if (!ldstrcmp(name, symbol_name))
 			{
 				r = sym;
 				break;
@@ -224,7 +454,7 @@ Elf32_Sym *elf_gnu_hash_lookup(struct module_info *m,
 	}
 
 	if (!r)
-		dprintf("symbol %s not found in %s\n",
+		ldprintf("symbol %s not found in %s\n",
 			symbol_name, m->name);
 
 	return r;
@@ -250,27 +480,24 @@ static Elf32_Word ld_get_symbol_address_exclude(const char *sym,
 					 struct module_info *exclude)
 {
 	Elf32_Word r;
+	int i;
 
 	/*
 	 * search order...?
 	 * main module first
 	 * then libraries
 	 */
-	if (exclude != &main_module)
+	for (i = 0; i < module_count; i++)
 	{
-		r = module_get_symbol_address(&main_module, sym);
+		if (exclude == &modules[i])
+			continue;
+
+		r = module_get_symbol_address(&modules[i], sym);
 		if (r)
-			return (main_module.delta + r);
+			return (modules[i].delta + r);
 	}
 
-	if (exclude != &loader_module)
-	{
-		r = module_get_symbol_address(&loader_module, sym);
-		if (r)
-			return (loader_module.delta + r);
-	}
-
-	dprintf("no symbol = %s\n", sym);
+	ldprintf("no symbol = %s\n", sym);
 
 	return 0;
 }
@@ -292,50 +519,50 @@ void *__ld_dynamic_resolve(void *arg, unsigned int entry, void *callee)
 	Elf32_Sym *st;
 	void **got_entry;
 
-	dprintf("%s arg=%p plt_entry=%08x callee=%p\n",
+	ldprintf("%s arg=%p plt_entry=%x callee=%p\n",
 		__FUNCTION__, arg, entry, callee);
 
 	if (m->dt.pltrel != DT_REL)
-		dprintf("not DT_REL\n");
-	rel = (void*) (m->dt.jmprel + entry);
+		ldprintf("not DT_REL\n");
+	rel = (void*) (m->delta + m->dt.jmprel + entry);
 
 	syminfo = ELF32_R_SYM(rel->r_info);
 	symtype = ELF32_R_TYPE(rel->r_info);
 	if (symtype != R_386_JMP_SLOT)
 		return 0;
 
-	dprintf("dt.symtab = %08x\n", m->dt.symtab);
-	dprintf("syminfo = %08x\n", syminfo);
+	ldprintf("dt.symtab = %x\n", m->dt.symtab);
+	ldprintf("syminfo = %x\n", syminfo);
 
-	st = (Elf32_Sym*) m->dt.symtab;
+	st = (Elf32_Sym*) (m->delta + m->dt.symtab);
 	st += syminfo;
 
-	dprintf("st_name = %d offset = %08x\n", st->st_name, rel->r_offset);
-	symbol_name = (const char*) m->dt.strtab + st->st_name;
-	dprintf("symbol_name = %s\n", symbol_name);
+	ldprintf("st_name = %x offset = %x\n", st->st_name, rel->r_offset);
+	symbol_name = (const char*) (m->delta + m->dt.strtab + st->st_name);
+	ldprintf("symbol_name = %s\n", symbol_name);
 
 	target = ld_get_symbol_address(symbol_name);
 	if (!target)
 	{
-		// FIXME: handle weak symbols
+		/* FIXME: handle weak symbols */
 		die("no such symbol (%s)\n", symbol_name);
 	}
 
 	r = (void*) target;
 
-	dprintf("dynamic resolve: %08x -> %p\n", entry, r);
+	ldprintf("dynamic resolve: %x -> %p\n", entry, r);
 
 	/* patch the correct value into the GOT */
 	got_entry = (void**)((char*)m->delta + rel->r_offset);
 
 	/* patch the resolved address into the GOT */
 	*got_entry = r;
-	dprintf("patched GOT at %p\n", got_entry);
+	ldprintf("patched GOT at %p\n", got_entry);
 
 	return r;
 }
 
-// this address is patched into the GOT at offset 2
+/* this address is patched into the GOT at offset 2 */
 extern void __dynamic_resolve_trampoline(void);
 __asm__ (
 	"\n"
@@ -352,12 +579,13 @@ __asm__ (
 void patch_got(struct module_info *m)
 {
 	int i;
+	unsigned int *got = (void*) m->delta + m->dt.pltgot;
 
-	/* TODO: apply delta between actual and intended load address */
+	ldprintf("PLTGOT:    %x\n", m->dt.pltgot);
+	ldprintf("PLTRELSZ:  %x\n", m->dt.pltrelsz);
 
-	unsigned int *got = (void*) + m->dt.pltgot;
-	dprintf("PLTGOT:    %08x\n", m->dt.pltgot);
-	dprintf("PLTRELSZ:  %08x\n", m->dt.pltrelsz);
+	if (!m->dt.pltrelsz)
+		return;
 
 	/* skip the first 3 entries, they're special */
 	i = 1;
@@ -382,12 +610,12 @@ void elf_apply_reloc_glob_dat(struct module_info *m, int offset)
 
 	syminfo = ELF32_R_SYM(rel[offset].r_info);
 
-	dprintf("%08x %06x R_386_GLOB_DAT\n", rel->r_offset, syminfo);
+	ldprintf("%x %x R_386_GLOB_DAT\n", rel->r_offset, syminfo);
 
-	st = (Elf32_Sym*) m->dt.symtab;
+	st = (Elf32_Sym*) (m->delta + m->dt.symtab);
 	st += syminfo;
 
-	symbol_name = (const char*) m->dt.strtab + st->st_name;
+	symbol_name = (const char*) (m->delta + m->dt.strtab + st->st_name);
 
 	p = (uint32_t*)(m->delta + rel[offset].r_offset);
 
@@ -396,17 +624,17 @@ void elf_apply_reloc_glob_dat(struct module_info *m, int offset)
 		/* has a value and size, so is defined */
 		value = (uint32_t) (m->delta + st->st_value);
 
-		dprintf("R_386_GLOB_DAT: definition "
-			"of %s (in %s) @%p -> %08x\n",
+		ldprintf("R_386_GLOB_DAT: definition "
+			"of %s (in %s) @%p -> %x\n",
 			symbol_name, m->name, p, value);
 	}
 	else
 	{
-		dprintf("%s used in %s\n", symbol_name, m->name);
+		ldprintf("%s used in %s\n", symbol_name, m->name);
 		value = ld_get_symbol_address(symbol_name);
 
-		dprintf("R_386_GLOB_DAT: reference "
-			"to %s (in %s) @%p -> %08x\n",
+		ldprintf("R_386_GLOB_DAT: reference "
+			"to %s (in %s) @%p -> %x\n",
 			symbol_name, m->name, p, value);
 	}
 
@@ -428,16 +656,16 @@ void ld_apply_reloc_copy(struct module_info *m, Elf32_Rel *rel)
 	value = ld_get_symbol_address_exclude(symbol_name, m);
 	if (!value)
 	{
-		dprintf("symbol not found: %s\n", symbol_name);
+		ldprintf("symbol not found: %s\n", symbol_name);
 		return;
 	}
 
 	src = (void*)value;
 	dest = (void*)(st->st_value + m->delta);
 
-	memcpy(dest, (void*)src, st->st_size);
+	ldmemcpy(dest, (void*)src, st->st_size);
 
-	dprintf("R_386_COPY (%s) %p -> %p\n", symbol_name, src, dest);
+	ldprintf("R_386_COPY (%s) %p -> %p\n", symbol_name, src, dest);
 }
 
 static void ld_apply_reloc_32(struct module_info *m, Elf32_Rel *rel)
@@ -453,22 +681,63 @@ static void ld_apply_reloc_32(struct module_info *m, Elf32_Rel *rel)
 
 	value = ld_get_symbol_address(symbol_name);
 	if (!value)
-		die("symbol '%s' not found\n", symbol_name);
+	{
+		ldprintf("symbol '%s' not found\n", symbol_name);
+		ldexit(1);
+	}
 
-	value += main_module.delta;
+	value += main_module->delta;
 
-	dprintf("R_386_32 reloc applied %s -> %08x\n",
+	ldprintf("R_386_32 reloc applied %s -> %x\n",
 		symbol_name, value);
 
 	dest = (void*)(m->delta + rel->r_offset);
 	*dest = value;
 }
 
+static void ld_apply_reloc_relative(struct module_info *m, Elf32_Rel *rel)
+{
+	Elf32_Word *dest;
+
+	dest = (void*)(m->delta + rel->r_offset);
+
+	ldprintf("R_386_RELATIVE: %x %x -> %x\n", dest, *dest, *dest + m->base);
+
+	*dest += m->base;
+}
+
+static void ld_apply_symbol_value(struct module_info *m, Elf32_Rel *rel)
+{
+	Elf32_Word syminfo = ELF32_R_SYM(rel->r_info);
+	const char *symbol_name;
+	Elf32_Sym *st = (Elf32_Sym*) (m->delta + m->dt.symtab);
+	Elf32_Word value;
+	Elf32_Word *dest;
+
+	st += syminfo;
+	symbol_name = (const char*) (m->delta + m->dt.strtab + st->st_name);
+
+	/* find the copy source */
+	value = ld_get_symbol_address_exclude(symbol_name, m);
+	if (!value)
+	{
+		ldprintf("symbol not found: %s\n", symbol_name);
+		return;
+	}
+
+	dest = (void*)(m->delta + rel->r_offset);
+
+	ldprintf("R_386_32 apply: %s at %x in %s\n", symbol_name, dest, m->name);
+
+	(*dest) += value;
+}
+
+
 int ld_apply_relocations(struct module_info *m)
 {
 	int i;
 
-	dprintf("Applying relocs for %s\n", m->name);
+	ldprintf("Applying relocs for %s\n", m->name);
 
 	for (i = 0; i < m->dt.relsz/sizeof (Elf32_Rel); i++)
 	{
@@ -484,10 +753,18 @@ int ld_apply_relocations(struct module_info *m)
 		case R_386_COPY:
 			ld_apply_reloc_copy(m, &rel[i]);
 			break;
+		case R_386_RELATIVE:
+			if (syminfo)
+				lddie("R_386_RELATIVE expects syminfo to be zero\n");
+			ld_apply_reloc_relative(m, &rel[i]);
+			break;
+		case R_386_32: /* Add symbol value. */
+			ld_apply_symbol_value(m, &rel[i]);
+			break;
 		default:
 			/* FIXME */
-			dprintf("%08x %06x %d (not applied)\n", rel[i].r_offset,
-				syminfo, symtype);
+			lddie("%s: %x %x %x (relocation type unknown, cannot be applied)\n",
+				m->name, rel[i].r_offset, syminfo, symtype);
 		}
 	}
 
@@ -498,7 +775,7 @@ static int ld_apply_loader_relocations(struct module_info *m)
 {
 	int i;
 
-	dprintf("Applying relocs for %s\n", m->name);
+	ldprintf("Applying relocs for %s\n", m->name);
 
 	for (i = 0; i < m->dt.relsz/sizeof (Elf32_Rel); i++)
 	{
@@ -514,13 +791,32 @@ static int ld_apply_loader_relocations(struct module_info *m)
 			ld_apply_reloc_32(m, &rel[i]);
 			break;
 		default:
-			die("%08x %06x "
-                               "(symbol type %d not supported)\n",
+			ldprintf("%x %x "
+                               "(symbol type %x not supported)\n",
 				rel[i].r_offset, syminfo, symtype);
+			ldexit(1);
 		}
 	}
 
 	return 0;
+}
+
+static void ld_add_needed(const char *name)
+{
+	int i, n;
+
+	/* in the list already? */
+	for (i = 0; i < module_count; i++)
+		if (!ldstrcmp(name, modules[i].name))
+			return;
+
+	if (module_count > sizeof modules/sizeof modules[0])
+		die("Too many libraries needed\n");
+
+	n = module_count++;
+	modules[n].name = name;
+
+	ldprintf("need %s\n", modules[n].name);
 }
 
 void ld_read_dynamic_section(struct module_info *m, Elf32_Word dyn_offset)
@@ -560,11 +856,19 @@ void ld_read_dynamic_section(struct module_info *m, Elf32_Word dyn_offset)
 		default:
 			if (0)
 			{
-				dprintf("[%2d] %08x %08x\n", i,
+				ldprintf("[%x] %x %x\n", i,
 					dyn[i].d_tag,
 					dyn[i].d_un.d_val);
 			}
 		}
+	}
+
+	/* store DT_NEEDED sections after stringtab is valid */
+	for (i = 0; dyn[i].d_tag != DT_NULL; i++)
+	{
+		if (dyn[i].d_tag != DT_NEEDED)
+			continue;
+		ld_add_needed(strtab_get(m, dyn[i].d_un.d_val));
 	}
 }
 
@@ -575,7 +879,7 @@ static const Elf32_Phdr* ld_find_dynamic_phdr(Elf32_Phdr *phdr, unsigned int phn
 
 	if (phdr == NULL || phnum == 0)
 	{
-		dprintf("no program header?\n");
+		ldprintf("no program header?\n");
 		return NULL;
 	}
 
@@ -585,6 +889,188 @@ static const Elf32_Phdr* ld_find_dynamic_phdr(Elf32_Phdr *phdr, unsigned int phn
 			dynamic = &phdr[i];
 
 	return dynamic;
+}
+
+const int pagesize = 0x1000;
+const int pagemask = 0x0fff;
+
+static unsigned int round_down_to_page(unsigned int addr)
+{
+	return addr &= ~pagemask;
+}
+
+static unsigned int round_up_to_page(unsigned int addr)
+{
+	return (addr + pagemask) & ~pagemask;
+}
+
+static int mmap_flags_from_elf(int flags)
+{
+	int mapflags = 0;
+
+	if (flags & PF_X)
+		mapflags |= _L(PROT_EXEC);
+	if (flags & PF_W)
+		mapflags |= _L(PROT_WRITE);
+	if (flags & PF_R)
+		mapflags |= _L(PROT_READ);
+	return mapflags;
+}
+
+static int map_elf_object(struct module_info *m, Elf32_Ehdr *ehdr, int fd)
+{
+	int i;
+	int r;
+	int num_to_load = 0;
+	Elf32_Phdr dynamic;
+	Elf32_Phdr to_load[8];
+	bool dynamic_seen = false;
+	Elf32_Word min_vaddr = ~0;
+	Elf32_Word max_vaddr = 0;
+	unsigned char *base;
+
+	ldprintf("Program headers (%x)\n", ehdr->e_phnum);
+	ldprintf("     type     offset   vaddr    filesz   memsz    flags    align\n");
+
+	for (i = 0; i < ehdr->e_phnum; i++)
+	{
+		Elf32_Phdr phdr;
+		r = ldpread(fd, &phdr, sizeof phdr,
+			 ehdr->e_phoff + i * sizeof phdr);
+		if (r < 0)
+			break;
+
+		ldprintf("[%x] %x %x %x %x %x %x\n", i, phdr.p_offset,
+			phdr.p_vaddr, phdr.p_filesz, phdr.p_memsz,
+			phdr.p_flags, phdr.p_align);
+
+		/* load segments */
+		if (phdr.p_type == PT_LOAD)
+		{
+			ldmemcpy(&to_load[num_to_load], &phdr, sizeof phdr);
+			num_to_load++;
+		}
+
+		if (phdr.p_type == PT_DYNAMIC)
+		{
+			if (dynamic_seen)
+			{
+				lddie("two PT_DYNAMIC sections\n");
+				goto error;
+			}
+			dynamic_seen = 1;
+			ldmemcpy(&dynamic, &phdr, sizeof phdr);
+		}
+	}
+
+	ldprintf("to load (%x)\n", num_to_load);
+	ldprintf("vaddr    memsz    offset   filesz\n");
+	for (i = 0; i < num_to_load; i++)
+	{
+		min_vaddr = MIN(round_down_to_page(to_load[i].p_vaddr), min_vaddr);
+		max_vaddr = MAX(round_up_to_page(to_load[i].p_vaddr + to_load[i].p_memsz), max_vaddr);
+
+		ldprintf("%x %x %x %x\n",
+			to_load[i].p_vaddr, to_load[i].p_memsz,
+			to_load[i].p_offset, to_load[i].p_filesz);
+	}
+
+	ldprintf("vaddr -> %x-%x\n", min_vaddr, max_vaddr);
+
+	/* reserve memory for image */
+	base = ldmmap((void*)min_vaddr, max_vaddr - min_vaddr,
+			_L(PROT_NONE), _L(MAP_ANONYMOUS)|_L(MAP_PRIVATE), -1, 0);
+	if (base == _L(MAP_FAILED))
+		lddie("mmap\n");
+
+	m->delta = (char*) base - (char*) min_vaddr;
+	m->base = (unsigned int) base;
+
+	ldprintf("base = %p\n", base);
+
+	for (i = 0; i < num_to_load; i++)
+	{
+		int mapflags = mmap_flags_from_elf(to_load[i].p_flags);
+		void *p;
+		unsigned int vaddr = round_down_to_page(to_load[i].p_vaddr);
+		unsigned int vaddr_offset = (to_load[i].p_vaddr & pagemask);
+		unsigned int filesz = round_up_to_page(vaddr_offset + to_load[i].p_filesz);
+
+		(void) mapflags;	/* FIXME: use these */
+
+		p = (void*)(base - min_vaddr + vaddr);
+
+		ldprintf("map at %p, offset %x sz %x\n", p, vaddr, filesz);
+		/*
+		 * Map anonymous memory then read the data in
+		 * rather than mapping the file directly.
+		 *
+		 * The windows page granularity is different to that on Linux.
+		 * The pages may need to be modified to apply relocations.
+		 *
+		 * nb. need MAP_FIXED to blow away our old mapping
+		 */
+		p = ldmmap(p, filesz, _L(PROT_READ)|_L(PROT_WRITE)|_L(PROT_EXEC),
+			 _L(MAP_FIXED)|_L(MAP_PRIVATE)|_L(MAP_ANONYMOUS), -1, 0);
+		if (p == _L(MAP_FAILED))
+		{
+			lddie("mmap");
+			goto error;
+		}
+		r = ldpread(fd, base + to_load[i].p_vaddr,
+			 to_load[i].p_filesz, to_load[i].p_offset);
+		if (r != to_load[i].p_filesz)
+		{
+			lddie("read failed (%x != %x)\n",
+				to_load[i].p_filesz, r);
+			goto error;
+		}
+	}
+
+	/* after all pages are mapped... */
+	ld_read_dynamic_section(m, dynamic.p_vaddr);
+
+	return 0;
+error:
+	return -1;
+}
+
+static int ld_load_module(struct module_info *m)
+{
+	int fd = -1;
+	int r = -1;
+	Elf32_Ehdr ehdr;
+
+	/* TODO: support something like /etc/ld.so.conf */
+	char path[0x100] = "/lib/";
+
+	ldmemcpy(&path[5], m->name, ldstrlen(m->name)+1);
+
+	fd = ldopen(path, _L(O_RDONLY), 0);
+	if (fd < 0)
+		lddie("failed to open %s\n", path);
+
+	r = ldread(fd, &ehdr, sizeof ehdr);
+	if (r < 0)
+		lddie("%s read failed\n", path);
+
+	if (ldmemcmp(&ehdr.e_ident, ELFMAG, SELFMAG))
+		lddie("%s is not in ELF file\n", path);
+
+	if (ehdr.e_type != ET_REL && ehdr.e_type != ET_DYN)
+		lddie("%s is not an ELF library (%x)\n", path, ehdr.e_type);
+
+	if (ehdr.e_machine != EM_386)
+		lddie("%s is not for i386\n", path);
+
+	if (0 > map_elf_object(m, &ehdr, fd))
+		lddie("failed to map %s\n", path);
+
+	ldprintf("opened ELF file %s, entry=%x\n", path, ehdr.e_entry);
+
+	ldclose(fd);
+
+	return r;
 }
 
 /*
@@ -616,48 +1102,61 @@ void *ld_main(int argc, char **argv, char **env, Elf32_Aux *auxv)
 	void *ld_base = (void*) ld_get_auxv(auxv, AT_BASE);
 	const Elf32_Phdr *dynamic = NULL;
 	Elf32_Ehdr *ehdr = ld_base;
+	int i;
 
 	ld_setup_gs();
 
 	/* read the loader's dynamic section */
-	loader_module.name = "ld.so";
+	loader_module->name = "ld.so";
 
 	/* FIXME: assumes target load address is zero */
-	loader_module.delta = (int) ld_base;
+	loader_module->delta = (int) ld_base;
 
-	dynamic = ld_find_dynamic_phdr((void*) (loader_module.delta + ehdr->e_phoff),
+	dynamic = ld_find_dynamic_phdr((void*) (loader_module->delta + ehdr->e_phoff),
 					ehdr->e_phnum);
 	if (!dynamic)
-	{
-		dprintf("loader has no dynamic program header\n");
-		goto error;
-	}
-	ld_read_dynamic_section(&loader_module, dynamic->p_vaddr);
+		lddie("loader has no dynamic program header\n");
+
+	ld_read_dynamic_section(loader_module, dynamic->p_vaddr);
 
 	/* read the main exe's dynamic sectin */
 	dynamic = ld_find_dynamic_phdr(phdr, phnum);
 	if (!dynamic)
+		lddie("target has no dynamic program header\n");
+
+	main_module->name = "exe";
+
+	ld_read_dynamic_section(main_module, dynamic->p_vaddr);
+
+	/* TODO: not working yet */
+	for (i = 2; i < module_count; i++)
 	{
-		dprintf("target has no dynamic program header\n");
-		goto error;
+		int r = ld_load_module(&modules[i]);
+		if (r < 0)
+			lddie("failed to load %s\n", modules[i].name);
 	}
 
-	main_module.name = "exe";
+	ldprintf("patching GOT\n");
 
-	ld_read_dynamic_section(&main_module, dynamic->p_vaddr);
+	for (i = 0; i < module_count; i++)
+	{
+		if (i == 1)
+			continue;
+		patch_got(&modules[i]);
+	}
 
-	dprintf("patching GOT\n");
+	ld_apply_loader_relocations(loader_module);
 
-	patch_got(&main_module);
-	dprintf("done returning to %p\n", entry);
-
-	ld_apply_loader_relocations(&loader_module);
-
-	ld_apply_relocations(&main_module);
+	for (i = 0; i < module_count; i++)
+	{
+		if (i == 1)
+			continue;
+		ld_apply_relocations(&modules[i]);
+	}
 
 	environ = env;
 
+	ldprintf("done returning to %p\n", entry);
+
 	return entry;
-error:
-	return 0;
 }

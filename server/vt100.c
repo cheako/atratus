@@ -1,19 +1,21 @@
 /*
  * vt100 terminal emulation in a windows console
  *
- * Copyright (C)  2006-2012 Mike McCormack
+ * Copyright (C) 2011 - 2013 Mike McCormack
  *
- *  This program is free software: you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation, version 3.
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
  *
- *  You should have received a copy of the GNU General Public License
- *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  *
  */
 
@@ -32,7 +34,7 @@
 #include "tty.h"
 #include "vt100.h"
 
-#define MAX_VT100_PARAMS 3
+#define MAX_VT100_PARAMS 8
 
 struct _vt100_filp
 {
@@ -44,12 +46,31 @@ struct _vt100_filp
 	int bg_color;
 	int brightness;
 	int cursor_key_mode;
+	int alternate_key_mode;
+	int ansi;
+	unsigned int unicode;
+	int utf8_count;
+	int charset;
+	int scroll_start;
+	int scroll_end;
+	int normal_lf;
+	WCHAR saved_char;
+	WORD saved_attr;
 	HANDLE thread;
 	HANDLE handle;
 	CRITICAL_SECTION cs;
 };
 
 typedef struct _vt100_filp vt100_filp;
+
+static void vt100_get_cursor_pos(vt100_filp *vt, int *x, int *y)
+{
+	CONSOLE_SCREEN_BUFFER_INFO info;
+
+	GetConsoleScreenBufferInfo(vt->handle, &info);
+	*x = info.dwCursorPosition.X - info.srWindow.Left + 1;
+	*y = info.dwCursorPosition.Y - info.srWindow.Top + 1;
+}
 
 static int vt100_set_cursor_pos(vt100_filp *vt, int x, int y)
 {
@@ -61,10 +82,6 @@ static int vt100_set_cursor_pos(vt100_filp *vt, int x, int y)
 	dprintf("cursor to %d,%d\n", x, y);
 
 	GetConsoleScreenBufferInfo(vt->handle, &info);
-	dprintf("dwSize %d,%d\n", info.dwSize.X, info.dwSize.Y);
-	dprintf("srWindow %d,%d-%d,%d\n",
-		info.srWindow.Left, info.srWindow.Top,
-		info.srWindow.Right, info.srWindow.Bottom);
 	height = info.srWindow.Bottom - info.srWindow.Top + 1;
 	width = info.srWindow.Right - info.srWindow.Left + 1;
 	if (x >= width)
@@ -75,9 +92,9 @@ static int vt100_set_cursor_pos(vt100_filp *vt, int x, int y)
 		y = 1;
 	if (x < 1)
 		x = 1;
-	coord.X = x - 1;
-	coord.Y = y - 1;
-	dprintf("Set %d,%d\n", coord.X, coord.Y);
+	coord.X = info.srWindow.Left + x - 1;
+	coord.Y = info.srWindow.Top + y - 1;
+	dprintf("cursor at %d,%d\n", coord.X, coord.Y);
 	r = SetConsoleCursorPosition(vt->handle, coord);
 	if (!r)
 		dprintf("failed to set cursor\n");
@@ -182,94 +199,281 @@ static int vt100_set_color(vt100_filp *vt)
 /* carriage return.  Move the cursor to the start of the line */
 static void vt100_do_cr(vt100_filp *vt)
 {
-	CONSOLE_SCREEN_BUFFER_INFO info;
-	COORD coord;
+	int x, y;
+	vt100_get_cursor_pos(vt, &x, &y);
+	vt100_set_cursor_pos(vt, 0, y);
+}
 
-	GetConsoleScreenBufferInfo(vt->handle, &info);
-	coord = info.dwCursorPosition;
-	coord.X = 0;
-	SetConsoleCursorPosition(vt->handle, coord);
+static void vt100_scroll(vt100_filp *vt, int up)
+{
+	CONSOLE_SCREEN_BUFFER_INFO info;
+	SMALL_RECT rect;
+	COORD newpos;
+	CHAR_INFO ci;
+	DWORD width;
+	int start, end, target;
+
+	if (!GetConsoleScreenBufferInfo(vt->handle, &info))
+		return;
+
+	width = info.srWindow.Right - info.srWindow.Left + 1;
+	if (width > 256)
+	{
+		dprintf("scroll area too wide: %d\n", width);
+		return;
+	}
+
+	if (up)
+	{
+		start =	vt->scroll_start + 1;
+		end = vt->scroll_end;
+		target = vt->scroll_start;
+	}
+	else
+	{
+		start = vt->scroll_start;
+		end = vt->scroll_end - 1;
+		target = start + 1;
+	}
+
+	dprintf("scroll: (%d-%d) moved to %d\n",
+		start, end, target);
+
+	/* select the region to move */
+	rect.Top = info.srWindow.Top + start - 1;
+	rect.Bottom = info.srWindow.Top + end - 1;
+	rect.Left = info.srWindow.Left;
+	rect.Right = info.srWindow.Right;
+
+	/* select the new place */
+	newpos.X = info.srWindow.Left;
+	newpos.Y = info.srWindow.Top + target - 1;
+
+	ci.Char.AsciiChar = ' ';
+	ci.Attributes = vt100_get_attributes(vt);
+	ScrollConsoleScreenBuffer(vt->handle, &rect, NULL,
+				 newpos, &ci);
 }
 
 /* line feed. Go down one line, but not to the start */
 static void vt100_do_lf(vt100_filp *vt)
 {
-	CONSOLE_SCREEN_BUFFER_INFO info;
-	COORD coord;
+	int x, y;
 
-	GetConsoleScreenBufferInfo(vt->handle, &info);
-	coord = info.dwCursorPosition;
-	if (coord.Y >= info.srWindow.Bottom)
+	vt100_get_cursor_pos(vt, &x, &y);
+
+	if (vt->normal_lf)
 	{
-		SMALL_RECT rect;
-		COORD topleft;
-		CHAR_INFO ci;
+		CONSOLE_SCREEN_BUFFER_INFO info;
+		DWORD count = 0;
+		COORD coord;
 
-		topleft.X = info.srWindow.Left;
-		topleft.Y = info.srWindow.Top - 1;
-		rect = info.srWindow;
-		ci.Char.AsciiChar = ' ';
-		ci.Attributes = 0;
-		ScrollConsoleScreenBuffer(vt->handle, &rect, NULL, topleft, &ci);
-		dprintf("scrolled\n");
+		/* preserve the X position */
+		GetConsoleScreenBufferInfo(vt->handle, &info);
+		coord.X = info.dwCursorPosition.X;
+		WriteConsole(vt->handle, "\n", 1, &count, NULL);
+		GetConsoleScreenBufferInfo(vt->handle, &info);
+		coord.Y = info.dwCursorPosition.Y;
+		SetConsoleCursorPosition(vt->handle, coord);
+
+		return;
+	}
+
+	if (y >= vt->scroll_end)
+	{
+		vt100_scroll(vt, 1);
 	}
 	else
-		coord.Y++;
-	SetConsoleCursorPosition(vt->handle, coord);
+	{
+		y++;
+		vt100_set_cursor_pos(vt, x, y);
+	}
+}
+
+static void vt100_move_up(vt100_filp *vt)
+{
+	int x, y;
+	vt100_get_cursor_pos(vt, &x, &y);
+	vt100_set_cursor_pos(vt, x, vt->scroll_end);
+	vt100_scroll(vt, 0);
+}
+
+static void vt100_move_down(vt100_filp *vt)
+{
+	int x, y;
+	vt100_get_cursor_pos(vt, &x, &y);
+	vt100_set_cursor_pos(vt, x, vt->scroll_start);
+	vt100_do_lf(vt);
+}
+
+static void vt100_do_backspace(vt100_filp *vt)
+{
+	int x, y;
+
+	dprintf("BS\n");
+
+	vt100_get_cursor_pos(vt, &x, &y);
+	x--;
+	vt100_set_cursor_pos(vt, x, y);
+}
+
+static void vt100_do_vertical_tab(vt100_filp *vt)
+{
+	int x, y;
+
+	dprintf("VT\n");
+
+	vt100_get_cursor_pos(vt, &x, &y);
+	y++;
+	vt100_set_cursor_pos(vt, x, y);
+}
+
+static void vt100_do_tab(vt100_filp *vt)
+{
+	int x, y;
+
+	dprintf("TAB\n");
+
+	vt100_get_cursor_pos(vt, &x, &y);
+	x += 8;
+	x %= 8;
+	vt100_set_cursor_pos(vt, x, y);
+}
+
+static int vt100_utf8_out(vt100_filp *vt, unsigned char ch)
+{
+	DWORD write_count = 0;
+	BOOL r;
+	WCHAR wch[3];
+	int n = 0;
+
+	/* tail char 10xxxxxx */
+	if ((ch & 0xc0) == 0x80)
+	{
+		if (vt->utf8_count == 0)
+			return 0;
+		vt->unicode <<= 6;
+		vt->unicode |= (ch & 0x3f);
+		vt->utf8_count--;
+		if (vt->utf8_count != 0)
+			return 0;
+	}
+
+	/* 110xxxxx 10xxxxxx */
+	else if ((ch & 0xe0) == 0xc0)
+	{
+		vt->unicode = (ch & 0x1f);
+		vt->utf8_count = 1;
+		return 0;
+	}
+
+	/* 1110xxxx 10xxxxxx 10xxxxxx */
+	else if ((ch & 0xf0) == 0xe0)
+	{
+		vt->unicode = (ch & 0x0f);
+		vt->utf8_count = 2;
+		return 0;
+	}
+
+	/* 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx */
+	else if ((ch & 0xf8) == 0xf0)
+	{
+		vt->unicode = (ch & 0x07);
+		vt->utf8_count = 3;
+		return 0;
+	}
+
+	/* 111110xx 10xxxxxx 10xxxxxx 10xxxxxx 10xxxxxx */
+	else if ((ch & 0xfc) == 0xf8)
+	{
+		vt->unicode = (ch & 0x03);
+		vt->utf8_count = 4;
+		return 0;
+	}
+
+	/* 1111110x 10xxxxxx 10xxxxxx 10xxxxxx 10xxxxxx 10xxxxxx */
+	else if ((ch & 0xfe) == 0xfc)
+	{
+		vt->unicode = (ch & 0x01);
+		vt->utf8_count = 5;
+		return 0;
+	}
+
+	/* 0xxxxxxx */
+	else
+		vt->unicode = ch;
+
+	/* recode to UTF-16 */
+	if (vt->unicode <= 0xffff)
+		wch[n++] = vt->unicode;
+	else
+	{
+		vt->unicode -= 0x10000;
+		wch[n++] = 0xd800 | ((vt->unicode & 0xffc00) >> 10);
+		wch[n++] = 0xdc00 | (vt->unicode & 0x3ff);
+	}
+
+	r = WriteConsoleW(vt->handle, &wch, n, &write_count, NULL);
+	if (!r)
+		return -_L(EIO);
+
+	return 0;
 }
 
 static int vt100_write_normal(vt100_filp *vt, unsigned char ch)
 {
-	DWORD write_count = 0;
-	BOOL r;
-
 	switch (ch)
 	{
 	case 0x1b:
 		vt->state = 1;
 		break;
-	case 0x0d:
-		vt100_do_cr(vt);
-		break;
-	case 0x0a:
-		vt100_do_lf(vt);
-		break;
 	default:
-		r = WriteConsole(vt->handle, &ch, 1, &write_count, NULL);
-		if (!r)
-			return -_L(EIO);
+		return vt100_utf8_out(vt, ch);
 	}
 
 	return 0;
 }
 
-static int vt100_write_wait_first_char(vt100_filp *vt, unsigned char ch)
+static void vt100_save_char(vt100_filp *vt)
 {
-	int i;
+	CONSOLE_SCREEN_BUFFER_INFO info;
+	DWORD count;
+	COORD pos;
+	BOOL r;
 
-	for (i = 0; i < MAX_VT100_PARAMS; i++)
-		vt->num[i] = 0;
-	vt->num_count = 0;
+	r = GetConsoleScreenBufferInfo(vt->handle, &info);
+	if (!r)
+		return;
 
-	switch (ch)
-	{
-	case '[':
-		vt->state = 2;
-		break;
-	case '#':
-		vt->state = 3;
-		break;
-	case '(':
-		vt->state = 6;
-		break;
-	case ')':
-		vt->state = 7;
-		break;
-	default:
-		vt->state = 0;
-	}
+	pos = info.dwCursorPosition;
 
-	return 0;
+	ReadConsoleOutputCharacterW(vt->handle, &vt->saved_char, 1,
+					info.dwCursorPosition, &count);
+	ReadConsoleOutputAttribute(vt->handle, &vt->saved_attr, 1,
+					pos, &count);
+	dprintf("save '%c'\n", (char) vt->saved_char);
+}
+
+static void vt100_restore_char(vt100_filp *vt)
+{
+	CONSOLE_SCREEN_BUFFER_INFO info;
+	DWORD count;
+	COORD pos;
+	BOOL r;
+
+	r = GetConsoleScreenBufferInfo(vt->handle, &info);
+	if (!r)
+		return;
+
+	pos = info.dwCursorPosition;
+
+	/* doesn't move cursor ... */
+	WriteConsoleOutputCharacterW(vt->handle, &vt->saved_char, 1,
+					pos, &count);
+	WriteConsoleOutputAttribute(vt->handle, &vt->saved_attr, 1,
+					pos, &count);
+
+	dprintf("restore '%c'\n", (char) vt->saved_char);
 }
 
 static void vt100_device_status(vt100_filp *vt, int req)
@@ -293,11 +497,16 @@ static void vt100_device_status(vt100_filp *vt, int req)
 	}
 }
 
-static void vt100_erase_to_end_of_line(vt100_filp *vt)
+static void vt100_erase(vt100_filp *vt, int mode)
 {
 	CONSOLE_SCREEN_BUFFER_INFO info;
 	COORD pos;
 	DWORD count = 0;
+	WCHAR row[256];
+	WORD attr[256];
+	DWORD dwAttribute;
+	int width;
+	int i;
 
 	memset(&info, 0, sizeof info);
 
@@ -310,50 +519,78 @@ static void vt100_erase_to_end_of_line(vt100_filp *vt)
 
 	pos = info.dwCursorPosition;
 
-	FillConsoleOutputCharacter(vt->handle, ' ',
-		info.dwSize.X - pos.X, pos, &count);
+	switch (mode)
+	{
+	case 0: /* from current to end */
+		width = info.srWindow.Right - pos.X;
+		break;
+	case 1: /* from start to current */
+		width = pos.X - info.srWindow.Left;
+		pos.X = info.srWindow.Left;
+		break;
+	case 2: /* entire line */
+		width = info.srWindow.Right - info.srWindow.Left + 1;
+		pos.X = info.srWindow.Left;
+		break;
+	default:
+		dprintf("unknown line erase mode %d\n", mode);
+		return;
+	}
 
-	dprintf("erased %d at %hd,%hd\n", count, pos.X, pos.Y);
+	/* fill with spaces using current attribute */
+	dwAttribute = vt100_get_attributes(vt);
+	for (i = 0; i < 256; i++)
+	{
+		row[i] = ' ';
+		attr[i] = dwAttribute;
+	}
 
-	SetConsoleCursorPosition(vt->handle, pos);
+	WriteConsoleOutputCharacterW(vt->handle, row, width,
+					pos, &count);
+	WriteConsoleOutputAttribute(vt->handle, attr, width,
+					pos, &count);
+}
+
+static void vt100_clear(vt100_filp *vt, DWORD length, COORD pos)
+{
+	DWORD count = 0;
+	DWORD attribute = vt100_get_attributes(vt);
+	FillConsoleOutputCharacter(vt->handle, ' ', length, pos, &count);
+	FillConsoleOutputAttribute(vt->handle, attribute, length, pos, &count);
 }
 
 static void vt100_erase_screen(vt100_filp *vt, int n)
 {
 	CONSOLE_SCREEN_BUFFER_INFO info;
 	COORD pos, top;
-	DWORD count;
+	DWORD width, height;
 
 	GetConsoleScreenBufferInfo(vt->handle, &info);
 
 	pos = info.dwCursorPosition;
-	top.X = 0;
-	top.Y = 0;
+	top.X = info.srWindow.Left;
+	top.Y = info.srWindow.Top;
+
+	width = info.srWindow.Right - info.srWindow.Left;
+	height = info.srWindow.Bottom - info.srWindow.Top;
 
 	switch (n)
 	{
 	case 0:
 		/* erase from cursor to end */
-		FillConsoleOutputCharacter(vt->handle, ' ',
-			(info.dwSize.Y - pos.Y) * info.dwSize.X +
-			info.dwSize.X - pos.X, pos, &count);
+		vt100_clear(vt, (info.srWindow.Bottom - pos.Y) * width +
+				(info.srWindow.Right - pos.X), pos);
 		break;
 	case 1:
 		/* erase from top to cursor */
-		FillConsoleOutputCharacter(vt->handle, ' ',
-					pos.Y * info.dwSize.X + pos.X,
-					top, &count);
+		vt100_clear(vt, (pos.Y - top.Y) * width +
+				(pos.X - top.X), top);
 		break;
 	case 2:
 		/* erase entire screen */
-		SetConsoleCursorPosition(vt->handle, top);
-		FillConsoleOutputCharacter(vt->handle, ' ',
-					info.dwSize.Y * info.dwSize.X,
-					top, &count);
+		vt100_clear(vt, height * width, top);
 		break;
 	}
-
-	SetConsoleCursorPosition(vt->handle, pos);
 }
 
 static void vt100_move_cursor(vt100_filp *vt, int delta_x, int delta_y)
@@ -380,6 +617,30 @@ static void vt100_move_cursor(vt100_filp *vt, int delta_x, int delta_y)
 	SetConsoleCursorPosition(vt->handle, pos);
 }
 
+static void vt100_cursor_home(vt100_filp *vt)
+{
+	CONSOLE_SCREEN_BUFFER_INFO info;
+	COORD pos;
+
+	GetConsoleScreenBufferInfo(vt->handle, &info);
+
+	pos = info.dwCursorPosition;
+
+	pos.Y = info.srWindow.Top;
+	pos.X = info.srWindow.Left;
+
+	SetConsoleCursorPosition(vt->handle, pos);
+}
+
+static void vt100_screen_alignment(vt100_filp *vt)
+{
+	/*
+	 * We're meant to write Es all over the screen
+	 * but the most important thing is to
+	 * move the cursor to the top left.
+	 */
+	vt100_cursor_home(vt);
+}
 
 /*
  * wait for a double height/double width command
@@ -390,6 +651,8 @@ static int vt100_write_wait_dhdw_mode(vt100_filp *vt, unsigned char ch)
 	switch (ch)
 	{
 	case '8':	/* fill upper area of screen with E */
+		vt100_screen_alignment(vt);
+		break;
 	case '3':	/* double height line, top half */
 	case '4':	/* double height line, bottom half */
 	case '5':	/* single line mode */
@@ -440,6 +703,7 @@ static int vt100_write_wait_mode_switch_num(vt100_filp *vt, unsigned char ch)
 		vt->cursor_key_mode = enable;
 		break;
 	case 2:	/* vt52/ANSI mode */
+		vt->ansi = enable;
 		break;
 	case 3:	/* 132 column mode: 132/80 */
 		break;
@@ -477,6 +741,39 @@ static int vt100_write_wait_char_set_g1(vt100_filp *vt, unsigned char ch)
 	dprintf("switch to g1 %c - unsupported\n", ch);
 	vt->state = 0;
 	return 0;
+}
+
+static void vt100_identify(vt100_filp *vt)
+{
+	const char ident[] = "\033[0n"; /* vt100 */
+	tty_input_add_string(&vt->con, ident);
+}
+
+static void vt100_enable_scrolling(vt100_filp *vt, int start, int end)
+{
+	CONSOLE_SCREEN_BUFFER_INFO info;
+	int max;
+
+	vt->normal_lf = (start == 0 && end == 0);
+
+	GetConsoleScreenBufferInfo(vt->handle, &info);
+	max = info.srWindow.Bottom - info.srWindow.Top + 1;
+
+	/* handle unset case */
+	if (!start)
+		start = 1;
+	if (!end)
+		end = max;
+
+	/* clamp */
+	if (start > max)
+		start = max;
+	if (end > max)
+		end = max;
+
+	dprintf("enable scrolling(%d,%d)\n", start, end);
+	vt->scroll_start = start;
+	vt->scroll_end = end;
 }
 
 static int vt100_write_wait_number(vt100_filp *vt, unsigned char ch)
@@ -529,7 +826,7 @@ static int vt100_write_wait_number(vt100_filp *vt, unsigned char ch)
 		vt->state = 0;
 		break;
 	case 'K':
-		vt100_erase_to_end_of_line(vt);
+		vt100_erase(vt, vt->num[0]);
 		vt->state = 0;
 		break;
 	case 'J':
@@ -540,14 +837,116 @@ static int vt100_write_wait_number(vt100_filp *vt, unsigned char ch)
 		vt100_set_cursor_pos(vt, vt->num[1], vt->num[0]);
 		vt->state = 0;
 		break;
+	case 'r':
+		vt100_enable_scrolling(vt, vt->num[0], vt->num[1]);
+		vt->state = 0;
+		break;
 	case '?':
 		vt->state = 4;
 		break;
+	case 'c':
+		vt100_identify(vt);
+		vt->state = 0;
+		break;
+	case 'f':
+		vt100_set_cursor_pos(vt, vt->num[1], vt->num[0]);
+		vt->state = 0;
+		break;
 	default:
-		dprintf("unknown escape code %c (num1)\n", ch);
+		dprintf("unknown code ESC [ %c\n", ch);
 		vt->state = 0;
 	}
 	return 0;
+}
+
+static void vt100_reset(vt100_filp *vt)
+{
+	vt->state = 0;
+	vt->num_count = 0;
+	vt->fg_color = 37;
+	vt->bg_color = 40;
+	vt->brightness = 0;
+	vt->cursor_key_mode = 0;
+	vt->alternate_key_mode = 0;
+	vt->utf8_count = 0;
+	vt->charset = 0;
+	vt->saved_char = '?';
+	vt->saved_attr = FOREGROUND_RED;
+	vt->ansi = 1;
+	vt100_enable_scrolling(vt, 0, 0);
+}
+
+static int vt100_write_wait_first_char(vt100_filp *vt, unsigned char ch)
+{
+	int i;
+
+	for (i = 0; i < MAX_VT100_PARAMS; i++)
+		vt->num[i] = 0;
+	vt->num_count = 0;
+
+	switch (ch)
+	{
+	case '[':
+		vt->state = 2;
+		break;
+	case '#':
+		vt->state = 3;
+		break;
+	case '(':
+		vt->state = 6;
+		break;
+	case ')':
+		vt->state = 7;
+		break;
+	case '7':
+		vt100_save_char(vt);
+		vt->state = 0;
+		break;
+	case '8':
+		vt100_restore_char(vt);
+		vt->state = 0;
+		break;
+	case 'M':
+		vt100_move_up(vt);
+		vt->state = 0;
+		break;
+	case 'D':
+		vt100_move_down(vt);
+		vt->state = 0;
+		break;
+	case 'E':
+		vt100_move_cursor(vt, 0, 1);
+		vt->state = 0;
+		break;
+	case 'c':
+		vt100_reset(vt);
+		vt100_set_cursor_pos(vt, 0, 0);
+		vt100_erase_screen(vt, 2);
+		vt_hide_cursor(vt, 0);
+		vt->state = 0;
+		break;
+	case '<':
+		vt->ansi ^= 1;
+		vt->state = 0;
+		break;
+	case '>':
+		vt->alternate_key_mode = 1;
+		vt->state = 0;
+		break;
+	case '=':
+		vt->alternate_key_mode = 0;
+		vt->state = 0;
+		break;
+	default:
+		dprintf("unknown escape code '%c'\n", ch);
+		vt->state = 0;
+	}
+
+	return 0;
+}
+
+static void vt100_do_nul(vt100_filp *vt)
+{
 }
 
 typedef int (*vt100_state_fn)(vt100_filp *vt, unsigned char ch);
@@ -563,15 +962,121 @@ static vt100_state_fn vt100_state_list[] = {
 	vt100_write_wait_char_set_g1,
 };
 
+typedef void (*vt100_control_fn)(vt100_filp *vt);
+
+static void vt100_do_escape(vt100_filp *vt)
+{
+	vt->state = 1;
+}
+
+static void vt100_do_bel(vt100_filp *vt)
+{
+	Beep(2000, 200);
+}
+
+static void vt100_do_si(vt100_filp *vt)
+{
+	vt->charset = 0;
+}
+
+static void vt100_do_so(vt100_filp *vt)
+{
+	vt->charset = 1;
+}
+
+static vt100_control_fn vt100_control_list[0x20] =
+{
+	/* 0x00 - NUL */
+	vt100_do_nul,
+	NULL,
+	NULL,
+	NULL,
+
+	/* 0x04 - ^D */
+	NULL,
+	NULL,
+	NULL,
+	vt100_do_bel,
+
+	/* 0x08 - ^H */
+	vt100_do_backspace,
+	vt100_do_tab,
+	vt100_do_lf,
+	vt100_do_vertical_tab,
+
+	/* 0x0c - ^L */
+	NULL,
+	vt100_do_cr,
+	vt100_do_si,
+	vt100_do_so,
+
+	/* 0x10 - ^P */
+	NULL,
+	NULL,
+	NULL,
+	NULL,
+
+	/* 0x14 - ^T */
+	NULL,
+	NULL,
+	NULL,
+	NULL,
+
+	/* 0x18 - ^Y */
+	NULL,
+	NULL,
+	NULL,
+	vt100_do_escape,
+
+	/* 0x1c */
+	NULL,
+	NULL,
+	NULL,
+	NULL,
+};
+
 static int vt100_write(con_filp *con, unsigned char ch)
 {
 	vt100_filp *vt = (void*) con;
-	return vt100_state_list[vt->state](vt, ch);
+	int r = 0;
+
+	if (ch < 0x20)
+	{
+		vt100_control_fn fn;
+		fn = vt100_control_list[ch];
+		if (fn)
+			fn(vt);
+		else
+			dprintf("vt100 ^%c unhandled\n", '@' + ch);
+	}
+	else
+	{
+		vt100_state_fn fn;
+		fn = vt100_state_list[vt->state];
+		r = fn(vt, ch);
+	}
+
+	return r;
 }
 
 static void vt100_send_cursor_code(vt100_filp *vt, char ch)
 {
-	char cursor[4] = { '\033', vt->cursor_key_mode ? '[' : 'O', ch, 0 };
+	char cursor[4];
+	int n = 0;
+
+	dprintf("cursor %c, ansi = %d\n", ch, vt->ansi);
+
+	cursor[n++] = '\033';
+	if (vt->ansi)
+	{
+		if (vt->cursor_key_mode)
+			cursor[n++] = 'O';
+		else
+			cursor[n++] = '[';
+	}
+	cursor[n++] = ch;
+	cursor[n++] = 0;
+
 	tty_input_add_string(&vt->con, cursor);
 }
 
@@ -617,6 +1122,9 @@ static DWORD WINAPI vt100_input_thread(LPVOID param)
 			break;
 		case VK_LEFT:
 			vt100_send_cursor_code(vt, 'D');
+			break;
+		case VK_DELETE:
+			tty_input_add_char(&vt->con, 0x7f);
 			break;
 		default:
 			ch = ir.Event.KeyEvent.uChar.AsciiChar;
@@ -682,14 +1190,8 @@ static filp* alloc_vt100_console(HANDLE handle)
 
 	tty_init(con);
 
-	vt->state = 0;
-	vt->num_count = 0;
-	vt->fg_color = 37;
-	vt->bg_color = 40;
-	vt->brightness = 0;
 	vt->handle = handle;
-	vt->cursor_key_mode = 1;
-
+	vt100_reset(vt);
 	SetConsoleMode(handle, ENABLE_PROCESSED_INPUT);
 
 	InitializeCriticalSection(&vt->cs);

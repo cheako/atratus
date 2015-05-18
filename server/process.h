@@ -1,3 +1,24 @@
+/*
+ * process definitions
+ *
+ * Copyright (C)  2012 - 2013 Mike McCormack
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ *
+ */
+
 #ifndef __ATRATUS_PROCESS_H__
 #define __ATRATUS_PROCESS_H__
 
@@ -30,7 +51,14 @@ typedef enum {
 	thread_terminated,
 } thread_state;
 
-#define FD_CLOSE_ON_EXEC 1
+#define FD_CLOSE_ON_EXEC (1 << 0)
+#define FD_NONBLOCKING   (1 << 1)
+
+struct fdinfo
+{
+	filp *fp;
+	int flags;
+};
 
 struct process
 {
@@ -42,13 +70,11 @@ struct process
 	int                             gid;
 	int                             euid;
 	int                             egid;
-	HANDLE				poll_event;
 	int				brk;
 	unsigned int			vtls_selector;
 	unsigned int			vtls_entries;
 	struct user_desc		vtls[MAX_VTLS_ENTRIES];
-	filp				*handles[MAX_FDS];
-	uint8_t				fd_flags[MAX_FDS];
+	struct fdinfo			handles[MAX_FDS];
 	struct process                  *next_process;
 	struct process                  *parent;
 	struct process                  *child;
@@ -142,6 +168,7 @@ extern void timeout_add(struct timeout *t);
 extern void tv_from_ms(struct timeval *t, int ms);
 extern void timeout_add_ms(struct timeout *t, int ms);
 extern void timeout_add_tv(struct timeout *t, struct timeval *ts);
+extern void timeout_add_timespec(struct timeout *t, struct timespec *ts);
 extern void timeout_remove(struct timeout *t);
 extern void timeout_now(struct timeval *tv);
 

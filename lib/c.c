@@ -1,25 +1,22 @@
 /*
- * basic dynamic linker
+ * C library
  *
  * Copyright (C)  2006-2012 Mike McCormack
  *
- *  This program is free software: you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation, version 3.
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
  *
- *  You should have received a copy of the GNU General Public License
- *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
- */
-
-/*
- * TODO:
- *   - load libraries specified by DT_NEEDED
- *   - resolve symbols from symbol tables
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ *
  */
 
 #include <sys/types.h>
@@ -36,8 +33,7 @@
 #include "time.h"
 #include "linux-errno.h"
 #include "linux-defines.h"
-
-#define NULL ((void *)0)
+#include "debug.h"
 
 /*
  * errno should be per thread,
@@ -47,8 +43,6 @@ static int errno;
 int verbose = 0;
 
 #define EXPORT __attribute__((visibility("default")))
-
-EXPORT char **environ;
 
 EXPORT void abort(void);
 
@@ -69,10 +63,10 @@ EXPORT void _exit(int status)
 		__asm__ __volatile__ (
 			"\tpushl %%ebx\n"
 			"\tmovl %%eax, %%ebx\n"
-			"\tmov $1, %%eax\n"
+			"\tmov %0, %%eax\n"
 			"\tint $0x80\n"
 			"\tpopl %%ebx\n"
-		:: "a"(status) : "memory");
+		:: "n"(1), "a"(status) : "memory");
 	}
 }
 
@@ -119,60 +113,28 @@ EXPORT void exit(int status)
 EXPORT int ioctl(int fd, int request, int value)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmovl $54, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(fd), "c"(request), "d"(value) : "memory");
+	SYSCALL3(54, fd, request, value);
 	return set_errno(r);
 }
 
 EXPORT int read(int fd, void *buffer, size_t length)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmovl $3, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(fd), "c"(buffer), "d"(length) : "memory");
-	return set_errno(r);
-}
-
-int dl_write(int fd, const void *buffer, size_t length)
-{
-	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $4, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(fd), "c"(buffer), "d"(length) : "memory");
-
+	SYSCALL3(3, fd, buffer, length);
 	return set_errno(r);
 }
 
 EXPORT int write(int fd, const void *buffer, size_t length)
 {
-	return dl_write(fd, buffer, length);
+	int r;
+	SYSCALL3(4, fd, buffer, length);
+	return set_errno(r);
 }
 
 EXPORT int open(const char *filename, int flags, int mode)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $5, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(filename), "c"(flags), "d"(mode)
-	: "memory");
-
+	SYSCALL3(5, filename, flags, mode);
 	return set_errno(r);
 }
 
@@ -186,13 +148,7 @@ EXPORT int open64(const char *filename, int flags)
 EXPORT off_t lseek(int fd, off_t offset, int whence)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $19, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(fd), "c"(offset), "d"(whence) : "memory");
+	SYSCALL3(19, fd, offset, whence);
 	return set_errno(r);
 }
 
@@ -219,25 +175,14 @@ EXPORT off64_t lseek64(int fd, off64_t offset, int whence)
 EXPORT int close(int fd)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $6, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(fd) : "memory");
-
+	SYSCALL1(6, fd);
 	return set_errno(r);
 }
 
 EXPORT int fork(void)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tint $0x80\n"
-	: "=a"(r)
-	: "a"(2)
-	: "memory");
+	SYSCALL0(2);
 	return set_errno(r);
 }
 
@@ -246,43 +191,28 @@ EXPORT int execve(const char *filename,
 	char **env)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $11, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	: "=a"(r)
-	: "a"(filename), "c"(argv), "d"(env)
-	: "memory");
+	SYSCALL3(11, filename, argv, env);
+	return set_errno(r);
+}
 
+EXPORT int access(const char *path, int mode)
+{
+	int r;
+	SYSCALL2(33, path, mode);
 	return set_errno(r);
 }
 
 EXPORT int kill(pid_t pid, int signal)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $37, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(pid), "c"(signal) : "memory");
+	SYSCALL2(37, pid, signal);
 	return set_errno(r);
 }
 
 static int sys_getcwd(char *buf, size_t size)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $183, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(buf), "c"(size) : "memory");
-
+	SYSCALL2(183, buf, size);
 	return set_errno(r);
 }
 
@@ -342,115 +272,69 @@ EXPORT char *getcwd(char *buf, size_t size)
 EXPORT int chdir(const char *path)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $12, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	: "=a"(r)
-	: "a"(path)
-	: "memory");
+	SYSCALL1(12, path);
 	return set_errno(r);
 }
 
 EXPORT int getdents(int fd, void *de, int len)
 {
 	int r;
-	__asm__ __volatile__(
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $141, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-		:"=a"(r)
-		: "a"(fd), "c"(de), "d"(len)
-		: "memory");
+	SYSCALL3(141, fd, de, len);
 	return r;
 }
 
 EXPORT int getdents64(int fd, void *de, int len)
 {
 	int r;
-	__asm__ __volatile__(
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $220, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-		:"=a"(r)
-		: "a"(fd), "c"(de), "d"(len)
-		: "memory");
+	SYSCALL3(220, fd, de, len);
 	return r;
 }
 
 EXPORT int setuid(uid_t uid)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $23, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	: "=a"(r)
-	: "a"(uid)
-	: "memory");
+	SYSCALL1(23, uid);
 	return set_errno(r);
 }
 
 EXPORT int getuid(void)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tmov $24, %%eax\n"
-		"\tint $0x80\n"
-	:"=a"(r):: "memory");
+	SYSCALL0(24);
 	return set_errno(r);
 }
 
 EXPORT int setgid(gid_t gid)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $46, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	: "=a"(r)
-	: "a"(gid)
-	: "memory");
+	SYSCALL1(46, gid);
 	return set_errno(r);
+}
+
+EXPORT int setegid(gid_t gid)
+{
+	/* FIXME */
+	return 0;
 }
 
 EXPORT gid_t getgid(void)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tmov $47, %%eax\n"
-		"\tint $0x80\n"
-	:"=a"(r):: "memory");
+	SYSCALL0(47);
 	return set_errno(r);
 }
 
 EXPORT int geteuid(void)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tmov $49, %%eax\n"
-		"\tint $0x80\n"
-	:"=a"(r):: "memory");
+	SYSCALL0(49);
 	return set_errno(r);
 }
 
 EXPORT int getegid(void)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tmov $50, %%eax\n"
-		"\tint $0x80\n"
-	:"=a"(r):: "memory");
+	SYSCALL0(50);
 	return set_errno(r);
 }
 
@@ -458,80 +342,42 @@ typedef int pid_t;
 EXPORT pid_t getpid(void)
 {
 	pid_t r;
-	__asm__ __volatile__ (
-		"\tmov $20, %%eax\n"
-		"\tint $0x80\n"
-	:"=a"(r):: "memory");
+	SYSCALL0(20);
 	return set_errno(r);
 }
 
 EXPORT pid_t getppid(void)
 {
 	pid_t r;
-	__asm__ __volatile__ (
-		"\tmov $64, %%eax\n"
-		"\tint $0x80\n"
-	:"=a"(r):: "memory");
+	SYSCALL0(64);
 	return set_errno(r);
 }
 
 EXPORT int setreuid(int uid, int euid)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $70, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	: "=a"(r)
-	: "a"(uid), "c"(euid)
-	: "memory");
+	SYSCALL2(70, uid, euid);
 	return set_errno(r);
 }
 
 EXPORT int setregid(int gid, int egid)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $71, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	: "=a"(r)
-	: "a"(gid), "c"(egid)
-	: "memory");
+	SYSCALL2(71, gid, egid);
 	return set_errno(r);
 }
 
 EXPORT int pipe(int *fds)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $42, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	: "=a"(r)
-	: "a"(fds)
-	: "memory");
+	SYSCALL1(42, fds);
 	return set_errno(r);
 }
 
 EXPORT int waitpid(int pid, int *status, int options)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $7, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	: "=a"(r)
-	: "a"(pid), "c"(status), "d"(options)
-	: "memory");
+	SYSCALL3(7, pid, status, options);
 	return set_errno(r);
 }
 
@@ -549,14 +395,61 @@ struct stat;
 EXPORT int __xstat(int ver, const char *path, struct stat *st)
 {
 	int r;
+	SYSCALL2(106, path, st);
+	return set_errno(r);
+}
 
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $106, %%eax\n"
+EXPORT int __fxstat(int ver, int fd, struct stat *st)
+{
+	int r;
+	SYSCALL2(108, fd, st);
+	return set_errno(r);
+}
+
+EXPORT void* mmap(void *start, size_t len, int prot, int flags, int fd, off_t offset)
+{
+	int r;
+	unsigned long args[6];
+
+	/* not enough free registers to pass 6 args in */
+	args[0] = (unsigned long) start;
+	args[1] = (unsigned long) len;
+	args[2] = (unsigned long) prot;
+	args[3] = (unsigned long) flags;
+	args[4] = (unsigned long) fd;
+	args[5] = (unsigned long) offset;
+
+	__asm__ __volatile__(
+		"\tpush %%ebx\n"
+		"\tpush %%ebp\n"
+		"\tmov (%%eax), %%ebx\n"
+		"\tmov 4(%%eax), %%ecx\n"
+		"\tmov 8(%%eax), %%edx\n"
+		"\tmov 12(%%eax), %%esi\n"
+		"\tmov 16(%%eax), %%edi\n"
+		"\tmov 20(%%eax), %%ebp\n"
+		"\tmov $192, %%eax\n"
 		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(path), "c"(st) : "memory");
+		"\tpop %%ebp\n"
+		"\tpop %%ebx\n"
+		: "=a"(r)
+		: "a" (args)
+		: "memory", "ecx", "edx", "esi", "edi"
+	);
+
+	if ((r & 0xfffff000) == 0xfffff000)
+	{
+		errno = - (int) r;
+		return _L(MAP_FAILED);
+	}
+
+	return (void*) r;
+}
+
+EXPORT int pread(int fd, void *buf, size_t count, off_t offset)
+{
+	int r;
+	SYSCALL5(180, fd, buf, count, offset, 0);
 	return set_errno(r);
 }
 
@@ -565,69 +458,42 @@ struct stat64;
 EXPORT int __xstat64(int ver, const char *path, struct stat64 *st)
 {
 	int r;
-
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $195, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(path), "c"(st) : "memory");
+	SYSCALL2(195, path, st);
 	return set_errno(r);
 }
 
 EXPORT int __lxstat64(int ver, const char *path, struct stat64 *st)
 {
 	int r;
-
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $196, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(path), "c"(st) : "memory");
+	SYSCALL2(196, path, st);
 	return set_errno(r);
 }
 
 EXPORT int __fxstat64(int ver, int fd, struct stat64 *st)
 {
 	int r;
+	SYSCALL2(197, fd, st);
+	return set_errno(r);
+}
 
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $197, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(fd), "c"(st) : "memory");
+EXPORT int utimes(const char *filename, struct timeval times[2])
+{
+	int r;
+	SYSCALL2(271, filename, times);
 	return set_errno(r);
 }
 
 EXPORT int dup2(int oldfd, int newfd)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmovl %%eax, %%ebx\n"
-		"\tmov $63, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(oldfd), "c"(newfd) : "memory");
-
+	SYSCALL2(63, oldfd, newfd);
 	return set_errno(r);
 }
 
 EXPORT time_t time(time_t *t)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmov %%eax, %%ebx\n"
-		"\tmov $13, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(t) : "memory");
+	SYSCALL1(13, t);
 	return r;
 }
 
@@ -640,41 +506,21 @@ struct timezone
 EXPORT int gettimeofday(struct timeval *tv, struct timezone *tz)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmov %%eax, %%ebx\n"
-		"\tmov $78, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(tv), "c"(tz) : "memory");
+	SYSCALL2(78, tv, tz);
 	return r;
 }
 
 void* sys_brk(void *addr)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmov %%eax, %%ebx\n"
-		"\tmov $45, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	:"=a"(r): "a"(addr) : "memory");
+	SYSCALL1(45, addr);
 	return (void*) set_errno(r);
 }
 
 EXPORT int fcntl(int fd, int cmd, int arg)
 {
 	int r;
-	__asm__ __volatile__(
-		"\tpushl %%ebx\n"
-		"\tmov %%eax, %%ebx\n"
-		"\tmov $55, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	: "=a"(r)
-	: "a"(fd), "c"(cmd), "d"(arg)
-	: "memory");
+	SYSCALL3(55, fd, cmd, arg);
 	return set_errno(r);
 }
 
@@ -682,15 +528,16 @@ typedef unsigned int mode_t;
 EXPORT mode_t umask(mode_t mask)
 {
 	int r;
-	__asm__ __volatile__(
-		"\tpushl %%ebx\n"
-		"\tmov %%eax, %%ebx\n"
-		"\tmov $60, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	: "=a"(r)
-	: "a"(mask)
-	: "memory");
+	SYSCALL1(60, mask);
+	return set_errno(r);
+}
+
+EXPORT int ftruncate64(int fd, uint64_t length)
+{
+	int r;
+	SYSCALL3(194, fd,
+		 (unsigned int) (length >> 32),
+		 (unsigned int) length);
 	return set_errno(r);
 }
 
@@ -704,30 +551,14 @@ struct pollfd
 EXPORT int poll(struct pollfd *pfds, int nfds, int timeout)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tpushl %%ebx\n"
-		"\tmov %%eax, %%ebx\n"
-		"\tmov $168, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	: "=a"(r)
-	: "a"(pfds), "c"(nfds), "d"(timeout)
-	: "memory");
-
+	SYSCALL3(168, pfds, nfds, timeout);
 	return set_errno(r);
 }
 
 int sys_select(void *args)
 {
 	int r;
-	__asm__ __volatile__ (
-		"\tmov %%eax, %%ebx\n"
-		"\tmov $82, %%eax\n"
-		"\tint $0x80\n"
-	: "=a"(r)
-	: "a"(args)
-	: "memory");
-
+	SYSCALL1(82, args);
 	return set_errno(r);
 }
 
@@ -756,30 +587,14 @@ struct utsname {
 EXPORT int uname(struct utsname *buf)
 {
 	int r;
-	__asm__ __volatile__(
-		"\tpushl %%ebx\n"
-		"\tmov %%eax, %%ebx\n"
-		"\tmov $122, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	: "=a"(r)
-	: "a"(buf)
-	: "memory");
+	SYSCALL1(122, buf);
 	return set_errno(r);
 }
 
 EXPORT int nanosleep(const struct timespec *req, struct timespec *rem)
 {
 	int r;
-	__asm__ __volatile__(
-		"\tpushl %%ebx\n"
-		"\tmov %%eax, %%ebx\n"
-		"\tmov $162, %%eax\n"
-		"\tint $0x80\n"
-		"\tpopl %%ebx\n"
-	: "=a"(r)
-	: "a"(req), "c"(rem)
-	: "memory");
+	SYSCALL2(162, req, rem);
 	return set_errno(r);
 }
 
@@ -791,6 +606,97 @@ EXPORT int usleep(unsigned int usec)
 	tv.tv_usec = usec % 1000000;
 
 	return select(0, NULL, NULL, NULL, &tv);
+}
+
+EXPORT unsigned int sleep(unsigned int seconds)
+{
+	struct timeval tv;
+
+	tv.tv_sec = seconds;
+	tv.tv_usec = 0;
+
+	/* FIXME: return number of seconds left on signal */
+	select(0, NULL, NULL, NULL, &tv);
+
+	return 0;
+}
+
+EXPORT int socketcall(int call, unsigned long *args)
+{
+	int r;
+	SYSCALL2(102, call, args);
+	return set_errno(r);
+}
+
+EXPORT int socket(int domain, int type, int protocol)
+{
+	unsigned long args[] = { domain, type, protocol };
+	return socketcall(_L(SYS_SOCKET), args);
+}
+
+typedef size_t socklen_t;
+
+EXPORT int setsockopt(int fd, int level, int optname,
+			const void *optval, socklen_t optlen)
+{
+	unsigned long args[] = {
+		fd, level, optname, (unsigned long) optval, optlen
+	};
+	return socketcall(_L(SYS_SETSOCKOPT), args);
+}
+
+struct sockaddr;
+
+EXPORT int connect(int fd, const struct sockaddr *addr, socklen_t addrlen)
+{
+	unsigned long args[] = {
+		fd, (unsigned long) addr, addrlen
+	};
+	return socketcall(_L(SYS_CONNECT), args);
+}
+
+EXPORT int bind(int fd, const struct sockaddr *addr, socklen_t addrlen)
+{
+	unsigned long args[] = {
+		fd, (unsigned long) addr, addrlen
+	};
+	return socketcall(_L(SYS_BIND), args);
+}
+
+EXPORT int listen(int fd, int backlog)
+{
+	unsigned long args[] = { fd, backlog };
+	return socketcall(_L(SYS_LISTEN), args);
+}
+
+EXPORT int accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
+{
+	unsigned long args[] = {
+		fd, (unsigned long) addr, (unsigned long) addrlen
+	};
+	return socketcall(_L(SYS_ACCEPT), args);
+}
+
+EXPORT int getpeername(int fd, struct sockaddr *addr, socklen_t *addrlen)
+{
+	unsigned long args[] = {
+		fd, (unsigned long) addr, (unsigned long) addrlen
+	};
+	return socketcall(_L(SYS_GETPEERNAME), args);
+}
+
+EXPORT int getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen)
+{
+	unsigned long args[] = {
+		fd, (unsigned long) addr, (unsigned long) addrlen
+	};
+	return socketcall(_L(SYS_GETSOCKNAME), args);
+}
+
+EXPORT int shutdown(int fd, int how)
+{
+	unsigned long args[] = { fd, how };
+	return socketcall(_L(SYS_SHUTDOWN), args);
 }
 
 #define CTYPE_UPPER   (1 << 8)
@@ -886,7 +792,19 @@ EXPORT unsigned short ** __ctype_b_loc(void)
 	return &pa;
 }
 
-unsigned int random_value;
+EXPORT int toupper(int ch)
+{
+	int32_t **a = __ctype_toupper_loc();
+	return (*a)[ch];
+}
+
+EXPORT int tolower(int ch)
+{
+	int32_t **a = __ctype_tolower_loc();
+	return (*a)[ch];
+}
+
+static unsigned int random_value;
 
 EXPORT void srand(unsigned int seed)
 {
@@ -913,6 +831,16 @@ EXPORT void srandom(unsigned int seed)
 }
 
 EXPORT long int random()
+{
+	return rand();
+}
+
+EXPORT void srand48(long int seed)
+{
+	srand(seed);
+}
+
+EXPORT long int lrand48(void)
 {
 	return rand();
 }
@@ -964,6 +892,22 @@ EXPORT int strncmp(const char *a, const char *b, size_t n)
 	return 0;
 }
 
+EXPORT int strncasecmp(const char *a, const char *b, size_t n)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+	{
+		if (toupper(a[i]) == toupper(b[i]))
+			continue;
+		if (a[i] < b[i])
+			return -1;
+		else
+			return 1;
+	}
+	return 0;
+}
+
 EXPORT int memcmp(const void *s1, const void *s2, size_t n)
 {
 	const unsigned char *left = s1, *right = s2;
@@ -971,7 +915,7 @@ EXPORT int memcmp(const void *s1, const void *s2, size_t n)
 	int i;
 
 	for (i = 0; r == 0 && i < n; i++)
-		r = left[n] - right[n];
+		r = left[i] - right[i];
 
 	return r;
 }
@@ -1052,7 +996,7 @@ EXPORT int fputs_unlocked(const char *str, FILE *stream)
 	/* FIXME: use stream */
 	int fd = stream->fd;
 	size_t len = strlen(str);
-	if (len != dl_write(fd, str, len))
+	if (len != write(fd, str, len))
 		return EOF;
 	return len;
 }
@@ -1143,9 +1087,22 @@ EXPORT FILE *fopen64(const char *path, const char *mode)
 	return fopen(path, mode);
 }
 
+EXPORT FILE *tmpfile(void)
+{
+	warn("tmpfile()\n");
+	return NULL;
+}
+
 EXPORT int fflush(FILE *stream)
 {
 	dprintf("fflush(%p)\n", stream);
+	return 0;
+}
+
+EXPORT int fseek(FILE *stream, long offset, int whence)
+{
+	stream->read_avail = 0;
+	lseek(stream->fd, offset, whence);
 	return 0;
 }
 
@@ -1165,10 +1122,45 @@ EXPORT size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *f)
 	return nmemb;
 }
 
-EXPORT size_t fread(void *ptr, size_t size, size_t nmemb, FILE *f)
+EXPORT size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
 {
-	dprintf("fread(%p,%zd,%zd,%p)\n", ptr, size, nmemb, f);
-	return 0;
+	int count = 0;
+
+	if (!size)
+		return 0;
+	if (!nmemb)
+		return 0;
+
+	while (count < nmemb)
+	{
+		size_t fragsize = 0;
+
+		while (fragsize < size)
+		{
+			size_t readlen;
+			if (stream->read_avail == 0 && !stdio_read_to_buffer(stream))
+				goto done;
+
+			if (!stream->read_avail)
+				goto done;
+
+			readlen = size - fragsize;
+			if (readlen > stream->read_avail)
+				readlen = stream->read_avail;
+
+			memcpy((uint8_t*) ptr + count * size + fragsize,
+				&stream->read_buffer[stream->read_start], readlen);
+			stream->read_start += readlen;
+			stream->read_avail -= readlen;
+
+			fragsize += readlen;
+		}
+
+		count++;
+	}
+done:
+
+	return count;
 }
 
 EXPORT int fputc(int c, FILE *stream)
@@ -1237,6 +1229,11 @@ EXPORT int getc(FILE *stream)
 	return getc_unlocked(stream);
 }
 
+EXPORT int _IO_getc(FILE *stream)
+{
+	return getc(stream);
+}
+
 EXPORT int getchar(void)
 {
 	return getc(stdin);
@@ -1257,6 +1254,11 @@ EXPORT int feof(FILE *f)
 	return f->flags & STDIO_READ_EOF;
 }
 
+EXPORT int fileno(FILE *f)
+{
+	return f->fd;
+}
+
 EXPORT int fclose(FILE *f)
 {
 	if (f != stdin && f != stdout && f != stderr)
@@ -1269,6 +1271,35 @@ EXPORT int fclose(FILE *f)
 		return 0;
 	}
 	return -1;
+}
+
+EXPORT int setvbuf(FILE *stream, char *buf, int mod, size_t size)
+{
+	warn("setvbuf(%p,%p,%d,%d)\n", stream, buf, mod, size);
+	return 0;
+}
+
+EXPORT int setbuf(FILE *stream, char *buf)
+{
+	warn("setvbuf(%p,%p)\n", stream, buf);
+	return 0;
+}
+
+typedef int nl_item;
+enum {
+	CODESET = 14,
+};
+
+EXPORT char *nl_langinfo(nl_item item)
+{
+	switch (item)
+	{
+	case CODESET:
+		return "UTF-8";
+	default:
+		warn("nl_langinfo(%d)\n", item);
+		return "";
+	}
 }
 
 #define DIR_MAGIC 0xd1aad1ab
@@ -1384,6 +1415,8 @@ EXPORT char *dcgettext(const char *domain,
 	return (char*) msgid;
 }
 
+#define DAYS_IN_EACH_MONTH  { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }
+
 /* ignore leap seconds... */
 EXPORT struct tm *gmtime_r(const time_t *timep, struct tm *result)
 {
@@ -1393,10 +1426,7 @@ EXPORT struct tm *gmtime_r(const time_t *timep, struct tm *result)
 	int days_per_400_years = days_per_100_years * 4 + 1; /* 400 years */
 	int days_1970til2000 = days_per_4_years * 7 + days_per_year * 2; /* 30 years */
 	int yrs400, yrs100, yrs4, yrs;
-	int mdays[] = {
-		31, 28, 31, 30, 31, 30,
-		31, 31, 30, 31, 30, 31
-	};
+	int mdays[] = DAYS_IN_EACH_MONTH;
 	int i;
 	time_t t = *timep;
 
@@ -1602,8 +1632,20 @@ EXPORT size_t strftime(char *s, size_t max,
 				s[n++] = ((tm->tm_year + 1900) / 10) % 10 + '0';
 				s[n++] = ((tm->tm_year + 1900) / 1) % 10 + '0';
 				break;
+			case 'm':
+				if ((n + 2) > max)
+					return 0;
+				s[n++] = (tm->tm_mon / 10) + '0';
+				s[n++] = (tm->tm_mon % 10) + '0';
+				break;
+			case 'd':
+				if ((n + 2) > max)
+					return 0;
+				s[n++] = (tm->tm_mday / 10) + '0';
+				s[n++] = (tm->tm_mday % 10) + '0';
+				break;
 			default:
-				dprintf("strftime(): %c unhandled\n", format[i]);
+				warn("strftime(): %c unhandled\n", format[i]);
 			}
 			saw_percent = 0;
 		}
@@ -1615,6 +1657,47 @@ EXPORT size_t strftime(char *s, size_t max,
 		return 0;
 
 	return n;
+}
+
+EXPORT time_t mktime(struct tm *tm)
+{
+	int mdays[] = DAYS_IN_EACH_MONTH;
+	time_t t;
+	int i;
+
+	if (tm->tm_year < 70 || tm->tm_year > 138)
+		return -1;
+
+	/* fix tm_yday */
+	tm->tm_yday = 0;
+	for (i = 0; i < tm->tm_mon; i++)
+		tm->tm_yday += mdays[i];
+	tm->tm_yday += tm->tm_mday;
+
+	t = tm->tm_year - 70;
+	t *= 365;
+	/* add one day for each daylight savings year */
+	t += (tm->tm_year - 68)/4;
+	if (tm->tm_year >= 100)
+		t--;
+	t += tm->tm_yday;
+
+	/* now we can workout the day of the week */
+	tm->tm_wday = (t + 4) % 7;
+
+	t *= 24;
+	t += tm->tm_hour;
+	t *= 60;
+	t += tm->tm_min;
+	t *= 60;
+	t += tm->tm_sec;
+
+	return t;
+}
+
+EXPORT void tzset(void)
+{
+	warn("tzset() unimplemented\n");
 }
 
 struct printf_output
@@ -1761,6 +1844,12 @@ static void pf_char(char value, struct printf_output *pfo)
 	pf_output(pfo, &value, 1);
 }
 
+static void pf_double(float value, struct printf_output *pfo)
+{
+	/* wrong */
+	pf_decimal((int)value, pfo);
+}
+
 static int internal_vsprintf(int flags, const char *str, va_list va,
 				struct printf_output *pfo)
 {
@@ -1838,12 +1927,14 @@ static int internal_vsprintf(int flags, const char *str, va_list va,
 		{
 			lng++;
 			p++;
+			if (*p == 'l')
+			{
+				lng++;
+				p++;
+			}
 		}
-		if (*p == 'l')
-		{
-			lng++;
+		else if (*p == 'z')
 			p++;
-		}
 
 		switch (*p)
 		{
@@ -1899,6 +1990,10 @@ static int internal_vsprintf(int flags, const char *str, va_list va,
 			pf_char(va_arg(va, int), pfo);
 			p++;
 			break;
+		case 'f':
+			pf_double(va_arg(va, double), pfo);
+			p++;
+			break;
 		default:
 			warn("printf(): %c unhandled\n", *p);
 			return 0;
@@ -1909,7 +2004,7 @@ static int internal_vsprintf(int flags, const char *str, va_list va,
 
 static int printf_chk_pfo(struct printf_output *pfo, const char *str, size_t len)
 {
-	dl_write(1, str, len);
+	write(1, str, len);
 	pfo->out_size += len;
 	return 1;
 }
@@ -1940,6 +2035,20 @@ EXPORT int __printf_chk(int flag, const char *str, ...)
 	va_start(va, str);
 
 	r = __vprintf_chk(flag, str, va);
+
+	va_end(va);
+
+	return r;
+}
+
+EXPORT int printf(const char *str, ...)
+{
+	va_list va;
+	int r;
+
+	va_start(va, str);
+
+	r = __vprintf_chk(0, str, va);
 
 	va_end(va);
 
@@ -2119,12 +2228,30 @@ EXPORT int __asprintf_chk(char **strp, int flags, const char *fmt, ...)
 	return r;
 }
 
-void warn(const char *str, ...)
+EXPORT void warn(const char *str, ...)
 {
 	va_list va;
 
 	va_start(va, str);
-	vprintf(str, va);
+	__vfprintf_chk(stderr, 0, str, va);
+	va_end(va);
+}
+
+EXPORT void warnx(const char *str, ...)
+{
+	va_list va;
+
+	va_start(va, str);
+	__vfprintf_chk(stderr, 0, str, va);
+	va_end(va);
+}
+
+EXPORT void err(int eval, const char *fmt, ...)
+{
+	va_list va;
+
+	va_start(va, fmt);
+	__vfprintf_chk(stderr, 0, fmt, va);
 	va_end(va);
 }
 
@@ -2149,7 +2276,6 @@ void die(const char *str, ...)
 
 	abort();
 }
-
 
 #define STRTOX_IMPL							\
 	int sign = 1;							\
@@ -2182,9 +2308,9 @@ void die(const char *str, ...)
 		if (ch >= '0' && ch <= '9')				\
 			ch -= '0';					\
 		else if (ch >= 'A' && ch <= 'Z')			\
-			ch -= ch - 'A' + 10;				\
+			ch = ch - 'A' + 10;				\
 		else if (ch >= 'a' && ch <= 'z')			\
-			ch -= ch - 'a' + 10;				\
+			ch = ch - 'a' + 10;				\
 		else							\
 			break;						\
 									\
@@ -2227,6 +2353,119 @@ EXPORT unsigned long long int strtoull(const char *nptr, char **endptr, int base
 {
 	unsigned long long value;
 	STRTOX_IMPL;
+}
+
+EXPORT int atoi(const char *p)
+{
+	return strtol(p, NULL, 10);
+}
+
+static const char *sscanf_read_int(const char *p, int *out, int width)
+{
+	int sign = 1;
+	int value = 0;
+	int n = 0;
+
+	if (p[n] == '-')
+	{
+		sign = -1;
+		n++;
+	}
+	else if (p[n] == '+')
+		n++;
+
+	while (p[n] >= '0' && p[n] <= '9' &&
+		(width == 0 || n < width))
+	{
+		value *= 10;
+		value += (p[n] - '0');
+		n++;
+	}
+
+	if (out)
+		*out = sign * value;
+
+	return &p[n];
+}
+
+static const char *sscanf_read_char(const char *in, char *out)
+{
+	if (out)
+		*out = *in;
+	return in + 1;
+}
+
+EXPORT int sscanf(const char *str, const char *format, ...)
+{
+	const char *p = format;
+	const char *in = str;
+	int width = 0;
+	va_list va;
+	int n = 0;
+	int suppress = 0;
+
+	va_start(va, format);
+
+	while (*p)
+	{
+		/* whitespace */
+		if (*p == ' ' || *p == '\t')
+		{
+			p++;
+			while (*in == ' ' || *in == '\t')
+				in++;
+			continue;
+		}
+
+		/* ordinary character */
+		if (*p != '%')
+		{
+			if (*p != *in)
+				return 0;
+			p++;
+			in++;
+			continue;
+		}
+		p++;
+
+		if (*p == '*')
+		{
+			suppress = 1;
+			p++;
+		}
+
+		width = 0;
+		while (*p >= '0' && *p <= '9')
+		{
+			width *= 10;
+			width += (*p - '0');
+			p++;
+		}
+
+		/* conversion */
+		switch (*p)
+		{
+		case 'd':
+		case 'u':
+			in = sscanf_read_int(in, suppress ? NULL : va_arg(va, int *), width);
+			n++;
+			break;
+		case 'c':
+			in = sscanf_read_char(in, suppress ? NULL : va_arg(va, char *));
+			n++;
+			break;
+		default:
+			warn("sscanf(): unhandled conversion '%c'\n", *p);
+		case 0:
+			return 0;
+		}
+
+		p++;
+	}
+
+	va_end(va);
+
+	return n;
 }
 
 EXPORT char *strerror(int errno)
@@ -2535,6 +2774,21 @@ EXPORT void *memmove(void *dest, const void *src, size_t n)
 	return dest;
 }
 
+EXPORT void *calloc(size_t nmemb, size_t size)
+{
+	void *p;
+
+	if (!nmemb)
+		return NULL;
+	if (!size)
+		return NULL;
+	p = malloc(nmemb * size);
+	if (!p)
+		return NULL;
+	memset(p, 0, nmemb * size);
+	return p;
+}
+
 EXPORT int *__errno_location(void)
 {
 	return &errno;
@@ -2626,9 +2880,9 @@ EXPORT char *strncpy(char *dest, const char *s, size_t n)
 {
 	size_t i;
 	for (i = 0; i < n && s[n]; i++)
-		dest[n] = s[n];
+		dest[i] = s[i];
 	for ( ; i < n; i++)
-		dest[n] = 0;
+		dest[i] = 0;
 	return dest;
 }
 
@@ -2696,6 +2950,11 @@ EXPORT char *strdup(const char *str)
 	return r;
 }
 
+EXPORT char *__strdup(const char *str)
+{
+	return strdup(str);
+}
+
 EXPORT size_t strspn(const char *str, const char *accept)
 {
 	unsigned char ok[256] = {0};
@@ -2716,6 +2975,21 @@ EXPORT size_t strspn(const char *str, const char *accept)
 	}
 
 	return r;
+}
+
+EXPORT char *strstr(const char *haystack, const char *needle)
+{
+	char *p = (char*) haystack;
+	size_t len = strlen(needle);
+
+	while (*p)
+	{
+		if (!strncmp(p, needle, len))
+			return p;
+		p++;
+	}
+
+	return NULL;
 }
 
 EXPORT size_t strcspn(const char *str, const char *reject)
@@ -2864,15 +3138,43 @@ EXPORT void qsort(void *base, size_t nmemb, size_t size, fn_compare fn)
 	}
 }
 
-EXPORT char **__environ;
+extern char **environ;
+extern char **__environ;
+__asm__ (
+".globl __environ\n"
+".globl environ\n"
+"environ:\n"
+"__environ:\n"
+"\t.long	0\n"
+);
 
-EXPORT char *getenv(const char *name)
+/* move the environment to the heap */
+static void environ_realloc(void)
 {
-	char **p;
-	size_t len = strlen(name);
-	for (p = environ;
-		*p;
-		p++)
+	char **t = environ;
+	int n;
+
+	for (n = 0; t[n]; n++)
+		;
+
+	environ = malloc((n + 1) * sizeof t[0]);
+
+	for (n = 0; t[n]; n++)
+		__environ[n] = strdup(t[n]);
+
+	environ[n] = NULL;
+}
+
+/*
+ * returns a /pointer to NULL/
+ * at the end of the environment if no string is found
+ * Allows setenv to know the length of the environment
+ *
+ * TODO: consider sorting the environment to make finding more efficient
+ */
+static char **findenv(char **p, const char *name, size_t len)
+{
+	for (; *p; p++)
 	{
 		size_t n;
 		char *x = strchr(*p, '=');
@@ -2884,10 +3186,138 @@ EXPORT char *getenv(const char *name)
 			continue;
 
 		if (!strncmp(name, *p, n))
-			return *p + n + 1;
+			break;
 	}
 
-	return NULL;
+	return p;
+}
+
+EXPORT char *getenv(const char *name)
+{
+	size_t len;
+	char **p;
+
+	if (!environ)
+		return NULL;
+
+	len = strlen(name);
+	p = findenv(environ, name, len);
+	if (!*p)
+		return NULL;
+
+	return *p + len + 1;
+}
+
+EXPORT int setenv(const char *name, const char *value, int overwrite)
+{
+	size_t len = strlen(name);
+	char **p;
+	char *tagval;
+
+	if (strchr(name, '='))
+	{
+		set_errno(_L(EINVAL));
+		return -1;
+	}
+
+	if (!environ)
+	{
+		environ = calloc(16, sizeof (char*));
+		if (!environ)
+		{
+			set_errno(_L(ENOMEM));
+			return -1;
+		}
+		p = environ;
+	}
+	else
+	{
+		p = findenv(environ, name, len);
+		if (!*p)
+		{
+			size_t n = p - environ;
+			char **t;
+
+			/* allocate space for an extra string pointer */
+			t = realloc(environ, (n + 2) * sizeof t[0]);
+			if (!t)
+			{
+				set_errno(_L(ENOMEM));
+				return -1;
+			}
+			t[n] = NULL;
+			t[n+1] = NULL;
+			environ = t;
+			p = &t[n];
+		}
+		else
+		{
+			if (!overwrite)
+				return 0;
+			/* value is the same? */
+			if (!strcmp(&(*p)[len+1], value))
+				return 0;
+		}
+	}
+
+	/* allocate a new pair */
+	tagval = malloc(len + 1 + strlen(value) + 1);
+	if (!tagval)
+	{
+		set_errno(_L(ENOMEM));
+		return -1;
+	}
+	strcpy(tagval, name);
+	tagval[len] = '=';
+	strcpy(&tagval[len+1], value);
+
+	free(*p);
+	*p = tagval;
+
+	return 0;
+}
+
+EXPORT int clearenv(void)
+{
+	char **p = environ;
+
+	if (p)
+	{
+		while (*p)
+		{
+			free(*p);
+			*p = NULL;
+			p++;
+		}
+		free(environ);
+		environ = NULL;
+	}
+	return 0;
+}
+
+EXPORT int unsetenv(const char *name)
+{
+	size_t len = strlen(name);
+	char **p;
+
+	if (!environ)
+		return 0;
+
+	p = findenv(environ, name, len);
+
+	if (*p)
+	{
+		free(*p);
+
+		/* shuffle */
+		while (*p)
+		{
+			*p = p[1];
+			p++;
+		}
+	}
+
+	return 0;
 }
 
 struct option
@@ -3153,6 +3583,25 @@ EXPORT struct passwd *getpwuid(uid_t uid)
 	return pw;
 }
 
+EXPORT int getlogin_r(char *buf, size_t bufsize)
+{
+	char login[] = "atratus";
+	if (bufsize < sizeof login)
+		return set_errno(-_L(ERANGE));
+	strcpy(buf, login);
+	return 0;
+}
+
+EXPORT char *getlogin(void)
+{
+	static char buffer[32];
+
+	if (0 != getlogin_r(buffer, sizeof buffer))
+		return NULL;
+
+	return buffer;
+}
+
 /*typedef uint64_t dev_t;*/
 
 EXPORT unsigned int gnu_dev_major(dev_t devid)
@@ -3185,6 +3634,34 @@ EXPORT pid_t tcgetpgrp(int fd)
 EXPORT int tcsetpgrp(int fd, pid_t pgrp)
 {
 	dprintf("tcsetpgrp(%d, %d)\n", fd, pgrp);
+	return 0;
+}
+
+EXPORT void cfmakeraw(struct termios *tios)
+{
+	tios->c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP |
+				 INLCR | IGNCR | ICRNL | IXON);
+	tios->c_oflag &= ~OPOST;
+	tios->c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+	tios->c_cflag &= ~(CSIZE | PARENB);
+	tios->c_cflag |= CS8;
+}
+
+EXPORT int cfgetospeed(struct termios *tios)
+{
+	return tios->c_ospeed;
+}
+
+EXPORT int tcflush(int fd, int queue_selector)
+{
+	/* FIXME: */
+	dprintf("tcflush(%d,%d) does nothing\n", fd, queue_selector);
+	return 0;
+}
+
+EXPORT int tcdrain(int fd)
+{
+	dprintf("tcdrain(%d)\n", fd);
 	return 0;
 }
 
@@ -3231,6 +3708,181 @@ EXPORT char *ttyname(int fd)
 	if (r < 0)
 		return NULL;
 	return buf;
+}
+
+EXPORT struct servent *getservbyname(const char *name, const char *protocol)
+{
+	warn("getservbyname(%s,%s)\n", name, protocol);
+	return NULL;
+}
+
+typedef uint32_t in_addr_t;
+
+struct in_addr
+{
+	in_addr_t s_addr;
+};
+
+static int inet_part(const char *part)
+{
+	if (part[0] == '0' && part[1] == 'x')
+		return strtol(part, NULL, 16);
+	if (part[0] == '0')
+		return strtol(part, NULL, 8);
+	return strtol(part, NULL, 10);
+}
+
+EXPORT int inet_aton(const char *cp, struct in_addr *inp)
+{
+	unsigned int parts[4];
+	int i, n = 0, start = 0;
+
+	/* validate and store numbers */
+	for (i = 0; cp[i]; i++)
+	{
+		if (cp[i] == '.')
+		{
+			if (n >= 3)
+				return 0;
+			parts[n++] = inet_part(&cp[start]);
+			start = i + 1;
+			continue;
+		}
+
+		/* allow hex */
+		if (cp[start] == '0' && cp[start+1] == 'x')
+		{
+			if (i == start+1)
+				continue;
+			if (cp[i] >= 'A' && cp[i] <= 'F')
+				continue;
+			if (cp[i] >= 'a' && cp[i] <= 'f')
+				continue;
+		}
+
+		/* allow number */
+		if (cp[i] >= '0' && cp[i] <= '9')
+			continue;
+
+		return 0;
+	}
+
+	if (!cp[start])
+		return 0;
+	parts[n++] = inet_part(&cp[start]);
+
+	if (n < 1)
+		return 0;
+
+	if (n == 1)
+	{
+		inp->s_addr = (parts[0]&0xff) << 24;
+		inp->s_addr |= (parts[0]&0xff00) << 8;
+		inp->s_addr |= (parts[0]&0xff0000) >> 8;
+		inp->s_addr |= (parts[0]&0xff000000) >> 16;
+		return 1;
+	}
+
+	if (parts[0] >= (1 << 8))
+		return 0;
+	inp->s_addr = parts[0];
+
+	/* class C */
+	if (n == 2)
+	{
+		if (parts[1] >= (1 << 24))
+			return 0;
+		inp->s_addr |= (parts[1]&0xff) << 24;
+		inp->s_addr |= (parts[1]&0xff00) << 8;
+		inp->s_addr |= (parts[1]&0xff0000) >> 8;
+		return 1;
+	}
+
+	if (parts[1] >= (1 << 8))
+		return 0;
+	inp->s_addr |= (parts[1] << 8);
+
+	/* class B */
+	if (n == 3)
+	{
+		if (parts[2] >= (1 << 16))
+			return 0;
+		inp->s_addr |= (parts[2]&0xff) << 24;
+		inp->s_addr |= (parts[2]&0xff00) << 8;
+		return 1;
+	}
+
+	/* class C */
+	if (n == 4)
+	{
+		if (parts[2] >= (1 << 8) || parts[3] >= (1 << 8))
+			return 0;
+
+		inp->s_addr |= (parts[2] << 16);
+		inp->s_addr |= (parts[3] << 24);
+		return 1;
+	}
+
+	/* should never get here */
+	abort();
+
+	return 0;
+}
+
+EXPORT in_addr_t inet_addr(const char *cp)
+{
+	struct in_addr in;
+
+	if (!inet_aton(cp, &in))
+		return -1;
+
+	return in.s_addr;
+}
+
+EXPORT int inet_pton(int af, const char *src, void *dst)
+{
+	if (af == _L(AF_INET))
+		return inet_aton(src, dst);
+
+	else if (af == _L(AF_INET6))
+	{
+		warn("inet_pton(AF_INET6) not supported\n");
+		return 0;
+	}
+
+	errno = _L(EAFNOSUPPORT);
+	return -1;
+}
+
+EXPORT char *inet_ntoa(struct in_addr in)
+{
+	static char out[32];
+	__sprintf_chk(out, 0, sizeof out,
+		"%d.%d.%d.%d",
+		(in.s_addr >> 0) & 0xff,
+		(in.s_addr >> 8) & 0xff,
+		(in.s_addr >> 16) & 0xff,
+		(in.s_addr >> 24) & 0xff);
+	return out;
+}
+
+struct addrinfo
+{
+	int ai_flags;
+	int ai_family;
+	int ai_socktype;
+	int ai_protocol;
+	size_t ai_addrlen;
+	struct sockaddr *ai_addr;
+	char *ai_canonname;
+	struct addrinfo *ai_next;
+};
+
+EXPORT int getaddrinfo(const char *node, const char *service,
+		 const struct addrinfo *hints, struct addrinfo **res)
+{
+	warn("getaddrinfo(%s,%s) not implemented\n", node, service);
+	return -1;
 }
 
 /* jmpbuf is 156 bytes in size */
@@ -3371,6 +4023,12 @@ EXPORT int __sigsetjmp(sigjmp_buf env, int savemask)
 	return 0;
 }
 
+EXPORT unsigned int alarm(unsigned int seconds)
+{
+	dprintf("alarm(%d)\n", seconds);
+	return 0;
+}
+
 typedef int (*fn_main)(int, char * *, char * *);
 typedef void (*fn_init)(void);
 typedef void (*fn_fini)(void);
@@ -3383,6 +4041,8 @@ EXPORT int __libc_start_main(fn_main pmain,
 			void (* stack_end))
 {
 	int r;
+
+	environ_realloc();
 
 	dprintf("%s called\n", __FUNCTION__);
 	dprintf("main   %p\n", pmain);

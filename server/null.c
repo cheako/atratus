@@ -1,7 +1,7 @@
 /*
- * fork() and wait test
+ * null device
  *
- * Copyright (C)  2012 - 2013 Mike McCormack
+ * Copyright (C) 2012 - 2013 Mike McCormack
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -19,32 +19,36 @@
  *
  */
 
-#include <stdlib.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/wait.h>
+#include <windows.h>
 #include <stdio.h>
+#include "ntapi.h"
+#include "filp.h"
+#include "linux-errno.h"
+#include "linux-defines.h"
+#include "debug.h"
+#include "process.h"
+#include "null.h"
 
-int main(int argc, char **argv)
+static int null_read(filp *f, void *buf, size_t size, loff_t *off, int block)
 {
-	int r;
-
-	r = fork();
-	if (r == 0)
-	{
-		_exit(0x123);
-	}
-	else
-	{
-		int child = r;
-		int status = 0;
-		r = waitpid(-1, &status, 0);
-		if (r != child)
-			return 1;
-
-		if (status != 0x2300)
-			return 1;
-	}
-	printf("ok\n");
 	return 0;
+}
+
+static const struct filp_ops null_ops = {
+	.fn_read = &null_read,
+};
+
+filp* null_fp_get(void)
+{
+	filp *fp;
+
+	fp = malloc(sizeof (*fp));
+	if (!fp)
+		return NULL;
+
+	init_fp(fp, &null_ops);
+
+	dprintf("null fd -> %p\n", fp);
+
+	return fp;
 }

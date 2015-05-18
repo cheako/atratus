@@ -1,5 +1,5 @@
 
-    atratus v0.3
+    atratus
 
 Run Linux binaries on Windows!
 
@@ -38,8 +38,8 @@ LIMITATIONS?
   It may not work correctly on Windows 7 or Windows 8, and will
   definitely not work on Windows 2000 in its current state.
 
-* v0.1 is a proof of concept to show that fork() and exec(), which
-  have been a stubling block of previous Linux-binary-on-Windows
+* This version is a proof of concept to show that fork() and exec(),
+  which have been a stubling block of previous Linux-binary-on-Windows
   projects can work.
 
 * programs statically linked with glibc will not work

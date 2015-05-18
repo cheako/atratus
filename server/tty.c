@@ -1,19 +1,21 @@
 /*
- * atratus - Linux binary emulation for Windows
+ * Console emulation
  *
- * Copyright (C)  2006-2012 Mike McCormack
+ * Copyright (C) 2011 - 2013 Mike McCormack
  *
- *  This program is free software: you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation, version 3.
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
  *
- *  You should have received a copy of the GNU General Public License
- *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  *
  */
 
@@ -95,7 +97,7 @@ static int con_process_input(con_filp *con)
 	return end + 1;
 }
 
-static int con_read(filp *f, void *buf, size_t size, loff_t *ofs)
+static int con_read(filp *f, void *buf, size_t size, loff_t *ofs, int block)
 {
 	con_filp *con = (con_filp*) f;
 	int ret = 0;
@@ -139,6 +141,9 @@ static int con_read(filp *f, void *buf, size_t size, loff_t *ofs)
 			wait = 1;
 		}
 		con->ops->fn_unlock(con);
+
+		if (wait && !block)
+			break;
 
 		if (wait)
 		{
@@ -217,6 +222,30 @@ static int con_write_output(con_filp *con, unsigned char ch)
 	return con->ops->fn_write(con, ch);
 }
 
+static void tty_debug_dump_buffer(const unsigned char *buffer, size_t sz)
+{
+	char out[30];
+	int n = 0;
+	int i;
+
+	for (i = 0; i < sz && n < sizeof out - 3; i++)
+	{
+		unsigned char ch = buffer[i];
+		if (ch >= 0x20 && ch < 0x80)
+			out[n++] = ch;
+		else
+		{
+			/* write as octal */
+			out[n++] = '\\';
+			out[n++] = '0' + ((ch >> 6) & 3);
+			out[n++] = '0' + ((ch >> 3) & 7);
+			out[n++] = '0' + (ch & 7);
+		}
+	}
+
+	dprintf("tty out -> '%.*s'\n", n, out);
+}
+
 static int con_write(filp *f, const void *buf, size_t size, loff_t *off)
 {
 	con_filp *con = (con_filp*) f;
@@ -241,7 +270,7 @@ static int con_write(filp *f, const void *buf, size_t size, loff_t *off)
 					break;
 				return r;
 			}
-			dprintf("tty out -> '%*s'\n", sz, buffer);
+			tty_debug_dump_buffer(buffer, sz);
 			buf_remaining = sz;
 			buf = (char*)buf + buf_remaining;
 			p = buffer;
@@ -368,12 +397,8 @@ static const struct filp_ops con_file_ops = {
 
 void tty_init(con_filp *con)
 {
-	con->fp.ops = &con_file_ops;
-	con->fp.handle = NULL;
-	con->fp.pgid = 0;
-	con->fp.poll_first = NULL;
+	init_fp(&con->fp, &con_file_ops);
 
-	con->fp.pgid = 0;
 	con->tios.c_lflag = ICANON | ECHO;
 	con->tios.c_cc[VERASE] = 8;
 	con->tios.c_cc[VEOF] = 4;

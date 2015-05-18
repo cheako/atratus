@@ -1,5 +1,5 @@
 /*
- * fork() and wait test
+ * networking definitions
  *
  * Copyright (C)  2012 - 2013 Mike McCormack
  *
@@ -19,32 +19,11 @@
  *
  */
 
-#include <stdlib.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <stdio.h>
+#ifndef __ATRATUS_INET4__
+#define __ATRATUS_INET4__
 
-int main(int argc, char **argv)
-{
-	int r;
+HANDLE inet4_init(void);
+int inet4_socket(int type, int protocol);
+void inet4_process_events(void);
 
-	r = fork();
-	if (r == 0)
-	{
-		_exit(0x123);
-	}
-	else
-	{
-		int child = r;
-		int status = 0;
-		r = waitpid(-1, &status, 0);
-		if (r != child)
-			return 1;
-
-		if (status != 0x2300)
-			return 1;
-	}
-	printf("ok\n");
-	return 0;
-}
+#endif /* __ATRATUS_INET4__ */

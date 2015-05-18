@@ -1,3 +1,24 @@
+/*
+ * NT API definitions
+ *
+ * Copyright (C)  2006 - 2013 Mike McCormack
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ *
+ */
+
 #ifndef __NTAPI_H__
 #define __NTAPI_H__
 
@@ -916,6 +937,8 @@ typedef struct _DBGUI_WAIT_STATE_CHANGE {
 		DEBUG_MESSAGE_UNLOAD_DLL UnloadDll;
 	};
 } DBGUI_WAIT_STATE_CHANGE, *PDBGUI_WAIT_STATE_CHANGE, DEBUGEE_EVENT;
+
+ULONG WINAPI RtlNtStatusToDosError(NTSTATUS);
 
 NTSTATUS NTAPI NtAddAtom(PWSTR,ULONG,PUSHORT);
 NTSTATUS NTAPI NtAcceptConnectPort(PHANDLE,HANDLE,PLPC_MESSAGE,BOOLEAN,PLPC_SECTION_WRITE,PLPC_SECTION_READ);

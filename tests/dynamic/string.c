@@ -1,17 +1,32 @@
+/*
+ * string functions test
+ *
+ * Copyright (C)  2012 - 2013 Mike McCormack
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ *
+ */
+
 #define _GNU_SOURCE
 
 #include <string.h>
 #include <stdio.h>
+#include "ok.h"
 
-#define OK(expr) \
-	do { \
-		if (!(expr)) \
-		{ \
-			printf("expression '%s' untrue at %d\n", \
-				 #expr, __LINE__); \
-			return 0; \
-		} \
-	} while (0)
+extern char *__strcat_chk(char *dest, const char *src, size_t destlen);
+extern char *__strncat_chk(char *dest, const char *src, size_t count, size_t destlen);
 
 int test_strlen(void)
 {
@@ -27,6 +42,16 @@ int test_strncmp(void)
 	OK(strncmp("a", "b", 0) == 0);
 	OK(strncmp("blah a", "blah b", 6) == -1);
 	OK(strncmp("AAA", "AAA", 3) == 0);
+
+	return 1;
+}
+
+int test_strncasecmp(void)
+{
+	OK(strncasecmp("a", "Aa", 1) == 0);
+	OK(strncasecmp("a", "B", 0) == 0);
+	OK(strncasecmp("bLaH a", "blah b", 6) == -1);
+	OK(strncasecmp("AAa", "AAA", 3) == 0);
 
 	return 1;
 }
@@ -82,6 +107,15 @@ int test_memmove(void)
 	memmove(dest, dest + 1, 6);
 	OK(strcmp(dest, "hello") == 0);
 
+	return 1;
+}
+
+int test_memcmp(void)
+{
+	char dest[10] = "xyz\0Axyz\0B";
+
+	OK(!memcmp(dest, dest+5, 4));
+	OK(memcmp(dest, dest+5, 5));
 	return 1;
 }
 
@@ -248,6 +282,20 @@ int test_strpbrk(void)
 	return 1;
 }
 
+int test_strstr(void)
+{
+	char x[] = "test";
+
+	OK(strstr(x, "") == x);
+	OK(strstr(x, "x") == NULL);
+	OK(strstr(x, "t") == x);
+	OK(strstr(x, "test") == x);
+	OK(strstr(x, "test1") == NULL);
+	OK(strstr(x, "st") == &x[2]);
+
+	return 1;
+}
+
 int main(int argc, char **argv)
 {
 	if (!test_strlen())
@@ -257,6 +305,9 @@ int main(int argc, char **argv)
 		return 1;
 
 	if (!test_strncmp())
+		return 1;
+
+	if (!test_strncasecmp())
 		return 1;
 
 	if (!test_memcpy())
@@ -269,6 +320,9 @@ int main(int argc, char **argv)
 		return 1;
 
 	if (!test_strspn())
+		return 1;
+
+	if (!test_memcmp())
 		return 1;
 
 	if (!test_strcpy())
@@ -302,6 +356,9 @@ int main(int argc, char **argv)
 		return 1;
 
 	if (!test_strpbrk())
+		return 1;
+
+	if (!test_strstr())
 		return 1;
 
 	puts("OK");

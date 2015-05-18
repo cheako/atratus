@@ -1,3 +1,24 @@
+/*
+ * windows filesystem interface
+ *
+ * Copyright (C) 2011 - 2013 Mike McCormack
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ *
+ */
+
 #include <windows.h>
 #include <stdio.h>
 #include "ntapi.h"
@@ -8,10 +29,7 @@
 #include "process.h"
 #include <limits.h>
 
-#define SECSPERDAY 86400
-#define SECS_1601_TO_1970 ((369 * 365 + 89) * (ULONGLONG)SECSPERDAY)
-
-static char rootdir[MAX_PATH + 1];
+static WCHAR rootdir[MAX_PATH + 1];
 
 static int longlong_to_unixtime(ULONGLONG seconds, unsigned int *ns)
 {
@@ -30,41 +48,77 @@ static int filetime_to_unixtime(FILETIME *ft, unsigned int *ns)
 	return longlong_to_unixtime(seconds, ns);
 }
 
-static char *unix2dos_path(const char *unixpath)
+static void timeval_to_filetime(struct timeval *tv, FILETIME *ft)
 {
-	char *ret;
-	int n, i;
+	uint64_t t;
 
-	ret = malloc(strlen(rootdir) + strlen(unixpath) + 2);
+	t = tv->tv_sec;
+	t += SECS_1601_TO_1970;
+	t *= 10000000LL;
+	t += tv->tv_usec * 10LL;
+
+	ft->dwHighDateTime = (t >> 32);
+	ft->dwLowDateTime = t & 0xffffffff;
+}
+
+static WCHAR *unix2dos_path(const char *unixpath)
+{
+	WCHAR *ret;
+	int i, n, len;
+
+	len = MultiByteToWideChar(CP_UTF8, 0, unixpath, -1, NULL, 0);
+
+	ret = malloc((lstrlenW(rootdir) + len + 2)*sizeof (WCHAR));
 	if (ret)
 	{
-		strcpy(ret, rootdir);
-		n = strlen(ret);
+		lstrcpyW(ret, rootdir);
+		n = lstrlenW(ret);
 
 		/* append \ if necessary */
 		if (n && ret[n - 1] != '\\')
 		{
 			ret[n++] = '\\';
-			ret[n++] = 0;
+			ret[n] = 0;
 		}
 
-		/* append unix path, changing / to \ */
-		for (i = 0; unixpath[i]; i++)
-		{
-			if (unixpath[i] == '/')
-			{
-				if (i != 0)
-					ret[n++] = '\\';
-			}
-			else
-				ret[n++] = unixpath[i];
-		}
-		ret[n] = 0;
+		MultiByteToWideChar(CP_UTF8, 0, unixpath, -1, ret + n, len + 1);
+
+		/* change / to \ */
+		for (i = n; ret[i]; i++)
+			if (ret[i] == '/')
+				ret[i] = '\\';
 	}
 
-	dprintf("%s -> %s\n", unixpath, ret);
+	dprintf("%s -> %S\n", unixpath, ret);
 
 	return ret;
+}
+
+/*
+ * Detect a cygwin new style symlink
+ *  - System attribute is set
+ *  - file starts with "!<symlink>"
+ */
+bool winfs_is_link(LPCWSTR dospath, DWORD attributes)
+{
+	char buffer[10];
+	DWORD count = 0;
+	HANDLE handle;
+	BOOL r;
+
+	if (!(attributes & FILE_ATTRIBUTE_SYSTEM))
+		return false;
+	handle = CreateFileW(dospath, GENERIC_READ, FILE_SHARE_READ,
+				 NULL, OPEN_EXISTING, 0, NULL);
+	if (handle == INVALID_HANDLE_VALUE)
+		return false;
+	r = ReadFile(handle, buffer, sizeof buffer, &count, NULL);
+	if (r && count == 10)
+		r = !memcmp(buffer, "!<symlink>", sizeof buffer);
+
+	CloseHandle(handle);
+
+	return r;
 }
 
 static int winfs_stat64(struct fs *fs, const char *path,
@@ -72,19 +126,27 @@ static int winfs_stat64(struct fs *fs, const char *path,
 {
 	WIN32_FILE_ATTRIBUTE_DATA info;
 	BOOL r;
-	char *dospath;
+	WCHAR *dospath;
 
 	dospath = unix2dos_path(path);
-	r = GetFileAttributesEx(dospath, GetFileExInfoStandard, &info);
+	if (!dospath)
+		return -_L(ENOENT);
+
+	r = GetFileAttributesExW(dospath, GetFileExInfoStandard, &info);
 	free(dospath);
 	if (!r)
 		return -_L(ENOENT);
 
 	memset(statbuf, 0, sizeof *statbuf);
-	statbuf->st_mode = 0755;
+	if (info.dwFileAttributes & FILE_ATTRIBUTE_READONLY)
+		statbuf->st_mode = 0555;
+	else
+		statbuf->st_mode = 0755;
 	statbuf->st_uid = current->uid;
 	statbuf->st_gid = current->gid;
-	if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+	if (winfs_is_link(dospath, info.dwFileAttributes))
+		statbuf->st_mode |= 0120000;
+	else if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
 		statbuf->st_mode |= 040000;
 	else
 		statbuf->st_mode |= 0100000;
@@ -97,6 +159,7 @@ static int winfs_stat64(struct fs *fs, const char *path,
 	statbuf->st_size = info.nFileSizeLow;
 	//statbuf->st_size += info.nFileSizeHigh * 0x100000000LL;
 	statbuf->st_blksize = 0x1000;
+	statbuf->st_blocks = statbuf->st_size / 0x1000;
 
 	return 0;
 }
@@ -113,8 +176,12 @@ static int file_stat(filp *f, struct stat64 *statbuf)
 		return _L(EPERM);
 
 	memset(statbuf, 0, sizeof *statbuf);
-	statbuf->st_mode = 0755;
+	if (info.FileAttributes & FILE_ATTRIBUTE_READONLY)
+		statbuf->st_mode = 0555;
+	else
+		statbuf->st_mode = 0755;
 
+	/* can't open a symlink, so don't check for a link */
 	if (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
 		statbuf->st_mode |= 040000;
 	else
@@ -127,6 +194,7 @@ static int file_stat(filp *f, struct stat64 *statbuf)
 				&statbuf->st_atime_nsec);
 	statbuf->st_size = info.AllocationSize.QuadPart;
 	statbuf->st_blksize = 0x1000;
+	statbuf->st_blocks = statbuf->st_size / 0x1000;
 
 	return 0;
 }
@@ -165,6 +233,7 @@ static int file_getdents(filp *fp, void *de, unsigned int count, fn_add_dirent a
 		EntryOffset = 0;
 		do {
 			size_t len;
+			char type;
 
 			info = (FILE_DIRECTORY_INFORMATION*) &buffer[EntryOffset];
 			EntryOffset += info->NextEntryOffset;
@@ -173,17 +242,18 @@ static int file_getdents(filp *fp, void *de, unsigned int count, fn_add_dirent a
 						info->FileName,
 						info->FileNameLength/sizeof (WCHAR),
 						NULL, 0, NULL, NULL);
-			char type;
-			if (info->FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-				type = _L(DT_DIR);
-			else
-				type = _L(DT_REG);
-
 			char name[len + 1];
 			WideCharToMultiByte(CP_UTF8, 0,
 					info->FileName,
 					info->FileNameLength/sizeof (WCHAR),
 					name, len + 1, NULL, NULL);
+
+			if (winfs_is_link(info->FileName, info->FileAttributes))
+				type = _L(DT_LNK);
+			else if (info->FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+				type = _L(DT_DIR);
+			else
+				type = _L(DT_REG);
 
 			de = (struct linux_dirent*)&p[ofs];
 			r = add_de(de, name, len, count - ofs,
@@ -260,7 +330,7 @@ static NTSTATUS file_read_to_userland(HANDLE handle, void *buf,
 	return bytesCopied;
 }
 
-static int file_read(filp *f, void *buf, size_t size, loff_t *off)
+static int file_read(filp *f, void *buf, size_t size, loff_t *off, int block)
 {
 	return file_read_to_userland(f->handle, buf, size, off);
 }
@@ -286,17 +356,20 @@ static int file_write(filp *f, const void *buf, size_t size, loff_t *off)
 			return -_L(EFAULT);
 
 		bytesWritten = 0;
-		r = WriteFile(f->handle, buf, bytesRead, &bytesWritten, NULL);
+		r = WriteFile(f->handle, buffer, bytesRead, &bytesWritten, NULL);
 		if (!r)
 		{
-			fprintf(stderr, "WriteFile %p failed %ld\n",
+			dprintf("WriteFile %p failed %ld\n",
 				f->handle, GetLastError());
 			return -_L(EIO);
 		}
 
+		if (bytesWritten != bytesRead)
+			break;
+
 		/* move along */
 		bytesCopied += bytesWritten;
-		sz -= bytesWritten;
+		size -= bytesWritten;
 		buf = (char*) buf + bytesWritten;
 		(*off) += bytesWritten;
 	}
@@ -310,17 +383,59 @@ static void winfs_close(filp *fp)
 		CloseHandle(fp->handle);
 }
 
+static int winfs_truncate(filp *fp, uint64_t offset)
+{
+	LARGE_INTEGER where;
+	BOOL r;
+
+	where.QuadPart = offset;
+
+	r = SetFilePointerEx(fp->handle, where, NULL, FILE_BEGIN);
+	if (!r)
+		return -_L(EPERM);
+
+	r = SetEndOfFile(fp->handle);
+	if (!r)
+	{
+		/* TODO: go back if we fail? */
+		return -_L(EPERM);
+	}
+
+	return 0;
+}
+
+static int winfs_seek(filp *fp, int whence, uint64_t pos, uint64_t *newpos)
+{
+	LARGE_INTEGER Position;
+	LARGE_INTEGER Result;
+	BOOL r;
+
+	Position.QuadPart = pos;
+	Result.QuadPart = 0LL;
+
+	r = SetFilePointerEx(fp->handle, Position, &Result, whence);
+	if (!r)
+		return -_L(EIO);
+
+	if (newpos)
+		*newpos = Result.QuadPart;
+
+	return 0;
+}
+
 static const struct filp_ops disk_file_ops = {
 	.fn_read = &file_read,
 	.fn_write = &file_write,
 	.fn_stat = &file_stat,
 	.fn_getdents = &file_getdents,
 	.fn_close = &winfs_close,
+	.fn_truncate = &winfs_truncate,
+	.fn_seek = &winfs_seek,
 };
 
 static int winfs_open(struct fs *fs, const char *file, int flags, int mode)
 {
-	char *dospath;
+	WCHAR *dospath;
 	DWORD access;
 	DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 	DWORD create = 0;
@@ -352,18 +467,17 @@ static int winfs_open(struct fs *fs, const char *file, int flags, int mode)
 		create = OPEN_EXISTING;
 
 	dospath = unix2dos_path(file);
-	dprintf("CreateFile(%s,%08lx,%08lx,NULL,%08lx,...)\n",
+	dprintf("CreateFile(%S,%08lx,%08lx,NULL,%08lx,...)\n",
 		dospath, access, share, create);
 
 	/* use FILE_FLAG_BACKUP_SEMANTICS for opening directories */
-	handle = CreateFile(dospath, access, share, NULL,
-			    create,
-			    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
-			    NULL);
+	handle = CreateFileW(dospath, access, share, NULL, create,
+			FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
+			NULL);
 
 	if (handle == INVALID_HANDLE_VALUE)
 	{
-		dprintf("failed to open %s (%ld)\n",
+		dprintf("failed to open %S (%ld)\n",
 			dospath, GetLastError());
 		free(dospath);
 		return -_L(ENOENT);
@@ -378,11 +492,8 @@ static int winfs_open(struct fs *fs, const char *file, int flags, int mode)
 		return -_L(ENOMEM);
 	}
 
-	memset(fp, 0, sizeof *fp);
-	fp->ops = &disk_file_ops;
-	fp->pgid = 0;
+	init_fp(fp, &disk_file_ops);
 	fp->handle = handle;
-	fp->offset = 0;
 
 	fd = alloc_fd();
 	if (fd < 0)
@@ -395,9 +506,51 @@ static int winfs_open(struct fs *fs, const char *file, int flags, int mode)
 	dprintf("handle -> %p\n", handle);
 	dprintf("fd -> %d\n", fd);
 
-	current->handles[fd] = fp;
+	current->handles[fd].fp = fp;
+	current->handles[fd].flags = 0;
 
 	return fd;
+}
+
+static int winfs_utimes(struct fs *fs, const char *path, struct timeval *times)
+{
+	FILETIME create_time, write_time;
+	HANDLE handle;
+	WCHAR *dospath;
+	BOOL r = TRUE;
+
+	if (times)
+	{
+		timeval_to_filetime(&times[0], &create_time);
+		timeval_to_filetime(&times[1], &write_time);
+	}
+	else
+	{
+		SYSTEMTIME st;
+		GetSystemTime(&st);
+		SystemTimeToFileTime(&st, &create_time);
+		write_time = create_time;
+	}
+
+	dospath = unix2dos_path(path);
+	if (!dospath)
+		return -_L(ENOENT);
+
+	SetLastError(0);
+	handle = CreateFileW(dospath, GENERIC_WRITE | GENERIC_READ,
+			FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_ALWAYS,
+			FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
+			NULL);
+	if (handle == INVALID_HANDLE_VALUE)
+		return -_L(ENOENT);
+	if (GetLastError() != ERROR_ALREADY_EXISTS)
+		r = SetFileTime(handle, &create_time, NULL, &write_time);
+
+	CloseHandle(handle);
+	if (!r)
+		return -_L(EPERM);
+
+	return 0;
 }
 
 static struct fs winfs =
@@ -405,10 +558,11 @@ static struct fs winfs =
 	.root = "/",
 	.open = &winfs_open,
 	.stat64 = &winfs_stat64,
+	.utimes = &winfs_utimes,
 };
 
 void winfs_init(void)
 {
-	GetCurrentDirectory(sizeof rootdir, rootdir);
+	GetCurrentDirectoryW(sizeof rootdir/sizeof rootdir[0], rootdir);
 	fs_add(&winfs);
 }
