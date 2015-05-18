@@ -6,9 +6,9 @@
 
 WHAT IS IT?
 
-Atratus is a binary compatibility layer that can run Linux binaries
-on Windows.  Atratus will load an ELF format executable created with
-gcc under Linux run it.
+Atratus is a Windows program that can run Linux binaries.
+It can load an ELF format executable created with
+gcc on Linux run it.
 
 
 WHAT WORKS?
@@ -40,9 +40,7 @@ TECHNICAL DETAILS?
 * fork() is implemented using NtCreateProcess() which is an NT system
   call not exposed to Win32 userland
 
-* Linux system calls are caught using the NT debugger interface,
-  although they could be caught by an exception handler "in process"
-  to improve efficiency.
+* Linux system calls are caught using the NT debugger interface.
 
 * The "kernel" is using co-operative multi-tasking (i.e. yield())
   to keep things simple and reliable for the moment.

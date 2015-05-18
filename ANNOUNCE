@@ -1,5 +1,13 @@
 Announcement & Release notes
 
+Thu May 16 21:26:41 EST 2013
+0.9 - May release
+
+ - implement openat(), allows tab completion in ash
+ - implement sendto() and recvfrom(), for wget
+ - fix fd reference counting
+
+Thu Apr 18 15:34:11 EST 2013
 0.8 - April release
 
  - support glibc 2.15

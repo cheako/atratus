@@ -25,12 +25,20 @@
 #define _l_O_RDWR   (0x02)
 #define _l_O_CREAT  (0x40)
 #define _l_O_TRUNC  (0x200)
-
 #define _l_O_NONBLOCK (0x800)
+#define _l_O_CLOEXEC (0x80000)
 
 #define _l_WNOHANG (1)
 
+#define _l_SIGILL  (4)
+#define _l_SIGKILL (9)
+#define _l_SIGSEGV (11)
 #define _l_SIGCHLD (17)
+#define _l_SIGCONT (18)
+#define _l_SIGSTOP (19)
+
+#define _l_SIG_IGN ((void*) 1)
+#define _l_SIG_DFL ((void*) 0)
 
 #define _l_CLONE_VM (0x100)
 #define _l_CLONE_PARENT_SETTID  (0x100000)
@@ -51,6 +59,8 @@
 #define _l_F_SETFD 2
 #define _l_F_GETFL 3
 #define _l_F_SETFL 4
+
+#define _l_FD_CLOEXEC 1
 
 #define _l_SIGABRT 6
 
@@ -126,6 +136,10 @@
 #define _l_EAI_AGAIN (-3)
 #define _l_EAI_FAIL (-4)
 #define _l_EAI_FAMILY (-6)
+
+#define _l_MSG_OOB (1)
+#define _l_MSG_DONTROUTE (4)
+#define _l_MSG_DONTWAIT (0x40)
 
 #define TIOCGPGRP  0x540F
 #define TIOCSPGRP  0x5410

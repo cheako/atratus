@@ -19,14 +19,14 @@
 #
 
 all:
-	cd server && make
+	cd src && make
 	cd tests/static && make
 	cd tests/dynamic && make
 	cd tests/misc && make
 	cd tests/X11 && make
 
 clean:
-	cd server && make $@
+	cd src && make $@
 	cd tests/static && make $@
 	cd tests/dynamic && make $@
 	cd tests/misc && make $@

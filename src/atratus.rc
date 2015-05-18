@@ -1,0 +1,7 @@
+#include <windef.h>
+#include <winuser.h>
+
+//LANGUAGE LANG_NEUTRAL,SUBLANG_NEUTRAL
+
+WINEMINE ICON MOVEABLE atratus.ico
+
