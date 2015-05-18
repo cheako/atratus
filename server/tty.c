@@ -246,7 +246,7 @@ static void tty_debug_dump_buffer(const unsigned char *buffer, size_t sz)
 	dprintf("tty out -> '%.*s'\n", n, out);
 }
 
-static int tty_write(filp *f, const void *buf, size_t size, loff_t *off)
+static int tty_write(filp *f, const void *buf, size_t size, loff_t *off, int block)
 {
 	tty_filp *tty = (tty_filp*) f;
 	DWORD written = 0;
@@ -285,7 +285,7 @@ static int tty_write(filp *f, const void *buf, size_t size, loff_t *off)
 		p++;
 	}
 
-	dprintf("ret = %d\n", written);
+	dprintf("ret = %ld\n", written);
 
 	return written;
 }
@@ -349,7 +349,7 @@ static int tty_ioctl(filp *f, int cmd, unsigned long arg)
 	case TIOCGWINSZ:
 		return tty_get_winsize(tty, (void*)arg);
 	default:
-		dprintf("unknown tty ioctl(%08x, %08x)\n", cmd, arg);
+		dprintf("unknown tty ioctl(%08x, %08lx)\n", cmd, arg);
 		r = -_L(EINVAL);
 	}
 

@@ -3,6 +3,7 @@ brk
 cat
 date
 dir
+dir64
 echo
 exec
 exit

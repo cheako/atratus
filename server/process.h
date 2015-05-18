@@ -60,6 +60,54 @@ struct fdinfo
 	int flags;
 };
 
+struct vm_mapping
+{
+	struct vm_mapping	*next, *prev;
+	void			*address;
+	size_t			size;
+	uint64_t		offset;
+	int			protection[];
+};
+
+struct vm_mapping_list
+{
+	struct vm_mapping	*first, *last;
+};
+
+static void inline mapping_list_init(struct vm_mapping_list *list)
+{
+	list->first = NULL;
+	list->last = NULL;
+}
+
+static void inline mapping_append(struct vm_mapping_list *list,
+				 struct vm_mapping *entry)
+{
+	if (!list->first)
+		list->first = entry;
+	else
+		list->last->next = entry;
+
+	entry->next = NULL;
+	entry->prev = list->last;
+
+	list->last = entry;
+}
+
+static inline void mapping_remove(struct vm_mapping_list *list,
+				struct vm_mapping *entry)
+{
+	if (entry->prev)
+		entry->prev->next = entry->next;
+	else
+		list->first = entry->next;
+
+	if (entry->next)
+		entry->next->prev = entry->prev;
+	else
+		list->last = entry->prev;
+}
+
 struct process
 {
 	struct process_ops		*ops;
@@ -88,6 +136,7 @@ struct process
 	PVOID				fiber;
 	char				*cwd;
 	filp				*tty;
+	struct vm_mapping_list		mapping_list;
 };
 
 extern struct process *current;
@@ -187,5 +236,7 @@ extern void process_free(struct process *process);
 
 /* add a fiber to wake in the main loop */
 extern void ready_list_add(struct process *p);
+
+extern int process_close_fd(struct process *p, int fd);
 
 #endif /* __ATRATUS_PROCESS_H__ */

@@ -1,7 +1,7 @@
 /*
- * Debuging interface
+ * ELF loader
  *
- * Copyright (C)  2012 - 2013 Mike McCormack
+ * Copyright (C) 2011 - 2013 Mike McCormack
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -19,20 +19,21 @@
  *
  */
 
-#ifndef __ATRATUS_DEBUG_H__
-#define __ATRATUS_DEBUG_H__
+#ifndef ATRATUS_ELF_H__
+#define ATRATUS_ELF_H__
 
-#define STATIC_ASSERT(expr) \
-	do { \
-		char _sa[(expr) ? 1 : -1]; \
-		(void) _sa; \
-	} while(0)
+struct elf_module;
 
-void die(const char *fmt, ...) __attribute__((format(printf,1,2), noreturn));
-int dprintf(const char *fmt, ...) __attribute__((format(printf,1,2)));
-void debug_set_file(const char *filename);
-void debug_set_verbose(int val);
-void debug_init(void);
-void debug_line_dump(void *p, unsigned int len);
+int elf_alloc_vdso(struct process *proc, void **vdso);
+int elf_stack_setup(struct process *context,
+		void *stack, size_t stack_size,
+		char **argv, char **env,
+		struct elf_module *m,
+		struct elf_module *interp);
+const char *elf_interpreter_get(struct elf_module *m);
+unsigned int elf_entry_point_get(struct elf_module *m);
+void elf_object_free(struct elf_module *m);
+int elf_object_map(struct process *proc, struct elf_module *m);
+struct elf_module *elf_module_load(const char *path);
 
-#endif /* __ATRATUS_DEBUG_H__ */
+#endif /* ATRATUS_ELF_H__ */

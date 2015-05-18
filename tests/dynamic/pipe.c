@@ -29,8 +29,28 @@
 int test_create_pipe(void)
 {
 	int fds[2] = {-1, -1};
+	char buffer[10];
 
 	OK(0 == pipe(fds));
+
+	OK(5 == write(fds[1], "hello", 5));
+	OK(5 == read(fds[0], buffer, 5));
+	OK(!memcmp(buffer, "hello", 5));
+
+	OK(3 == write(fds[1], "bye", 3));
+	OK(3 == read(fds[0], buffer, 3));
+	OK(!memcmp(buffer, "bye", 3));
+
+	OK(5 == write(fds[1], "hello", 5));
+	OK(5 == read(fds[0], buffer, 5));
+	OK(!memcmp(buffer, "hello", 5));
+
+	OK(5 == write(fds[1], "hello", 5));
+	OK(2 == read(fds[0], buffer, 2));
+	OK(!memcmp(buffer, "he", 2));
+	OK(3 == read(fds[0], buffer, 3));
+	OK(!memcmp(buffer, "llo", 3));
+
 	OK(0 == close(fds[0]));
 	OK(0 == close(fds[1]));
 

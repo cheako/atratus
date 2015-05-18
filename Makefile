@@ -18,11 +18,12 @@
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
 #
 
-all: 
+all:
 	cd lib && make
 	cd server && make
 	cd tests/static && make
 	cd tests/dynamic && make
+	cd tests/misc && make
 	cd tests/X11 && make
 
 clean:
@@ -30,4 +31,6 @@ clean:
 	cd server && make $@
 	cd tests/static && make $@
 	cd tests/dynamic && make $@
+	cd tests/misc && make $@
 	cd tests/X11 && make $@
+

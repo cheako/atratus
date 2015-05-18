@@ -28,6 +28,9 @@
 #include "debug.h"
 #include "process.h"
 #include <limits.h>
+#include "vm.h"
+
+BOOL WINAPI GetFileSizeEx(HANDLE handle, PLARGE_INTEGER Size);
 
 static const char symlink_magic[] = {
 	'!', '<', 's','y','m','l','i','n','k', '>'
@@ -105,17 +108,22 @@ static char *winfs_read_symlink_target(HANDLE handle)
 	char buffer[0x100];
 	DWORD bytes_read;
 	DWORD ucs2_len, utf8_len;
-	LARGE_INTEGER start;
 	LPWSTR ucs2;
 	char *ret;
 	BOOL r;
+	OVERLAPPED ov;
 
-	r = ReadFile(handle, buffer, sizeof buffer, &bytes_read, NULL);
+	memset(&ov, 0, sizeof ov);
+
+	r = ReadFile(handle, buffer, sizeof buffer, &bytes_read, &ov);
 	if (!r)
-		return NULL;
+	{
+		if (GetLastError() != ERROR_IO_PENDING)
+			return NULL;
 
-	start.QuadPart = 0LL;
-	SetFilePointerEx(handle, start, NULL, FILE_BEGIN);
+		if (!GetOverlappedResult(handle, &ov, &bytes_read, TRUE))
+			return NULL;
+	}
 
 	if (bytes_read < sizeof symlink_magic)
 		return NULL;
@@ -226,7 +234,7 @@ static int winfs_stat(filp *f, struct stat64 *statbuf)
 	r = GetFileInformationByHandle(f->handle, &info);
 	if (!r)
 	{
-		dprintf("GetFileInformationByHandle failed (%08x)\n",
+		dprintf("GetFileInformationByHandle failed (%08lx)\n",
 			GetLastError());
 		return -_L(EPERM);
 	}
@@ -278,6 +286,17 @@ static int winfs_stat(filp *f, struct stat64 *statbuf)
 	return 0;
 }
 
+struct winfs_read_context
+{
+	struct process *p;
+};
+
+static NTAPI void winfs_dir_read_complete(PVOID ptr, PIO_STATUS_BLOCK iosb, ULONG reserved)
+{
+	struct winfs_read_context *ctx = ptr;
+	ready_list_add(ctx->p);
+}
+
 static int winfs_getdents(filp *fp, void *de, unsigned int count, fn_add_dirent add_de)
 {
 	int ofs = 0;
@@ -286,7 +305,6 @@ static int winfs_getdents(filp *fp, void *de, unsigned int count, fn_add_dirent 
 	NTSTATUS ret;
 	IO_STATUS_BLOCK iosb;
 	BYTE buffer[0x1000];
-	BOOL first = TRUE;
 	FILE_DIRECTORY_INFORMATION *info;
 	WCHAR star[] = { '*' };
 	UNICODE_STRING mask;
@@ -301,11 +319,26 @@ static int winfs_getdents(filp *fp, void *de, unsigned int count, fn_add_dirent 
 
 	while (1)
 	{
+		struct winfs_read_context ctx;
+
+		ctx.p = current;
+
 		memset(buffer, 0, sizeof buffer);
-		ret = NtQueryDirectoryFile(fp->handle, NULL, NULL, NULL, &iosb,
+		ret = NtQueryDirectoryFile(fp->handle, NULL,
+			&winfs_dir_read_complete, &ctx, &iosb,
 			buffer, sizeof buffer,
-			FileDirectoryInformation, first, NULL /*&mask*/, 0);
-		dprintf("NtQueryDirectoryFile -> %08lx\n", ret);
+			FileDirectoryInformation, 0, NULL /*&mask*/, fp->dir_count == 0);
+		if (ret == STATUS_PENDING)
+		{
+			current->state = thread_stopped;
+			yield();
+			current->state = thread_running;
+
+			ret = iosb.Status;
+			dprintf("NtQueryDirectoryFile -> %08lx\n", ret);
+		}
+		else
+			dprintf("NtQueryDirectoryFile -> %08lx\n", ret);
 		if (ret != STATUS_SUCCESS)
 			break;
 
@@ -337,14 +370,12 @@ static int winfs_getdents(filp *fp, void *de, unsigned int count, fn_add_dirent 
 
 			de = (struct linux_dirent*)&p[ofs];
 			r = add_de(de, name, len, count - ofs,
-				(first || info->NextEntryOffset) ? EntryOffset : INT_MAX,
-				type);
+				info->NextEntryOffset ? ++fp->dir_count : INT_MAX, type);
 			if (r < 0)
 				break;
 			ofs += r;
 
 		} while (info->NextEntryOffset);
-		first = FALSE;
 	}
 
 	dprintf("%d bytes added\n", ofs);
@@ -352,106 +383,142 @@ static int winfs_getdents(filp *fp, void *de, unsigned int count, fn_add_dirent 
 	return ofs;
 }
 
-/*
- * It would be nice if there was a function to do this in one go in Windows
- * Other ways to achieve better performance:
- *  - issue an APC in the windows client (Wine style)
- *  - do this in the NT kernel in a driver
- */
-static NTSTATUS winfs_read_to_userland(HANDLE handle, void *buf,
-				size_t size, loff_t *ofs)
+static int winfs_read(filp *f, void *buf, size_t size, loff_t *ofs, int block)
 {
-	uint8_t buffer[0x1000];
-	NTSTATUS r;
-	DWORD bytesRead;
 	int bytesCopied = 0;
 
 	while (size)
 	{
-		LARGE_INTEGER pos;
-		LARGE_INTEGER out;
+		OVERLAPPED ov;
 		DWORD sz;
+		DWORD bytesRead = 0;
+		void *ptr = NULL;
+		size_t max_size = 0;
+		int r;
 
-		pos.QuadPart = *ofs;
+		memset(&ov, 0, sizeof ov);
+		ov.OffsetHigh = (*ofs >> 32);
+		ov.Offset = (*ofs & 0xffffffff);
 
-		r = SetFilePointerEx(handle, pos, &out, FILE_BEGIN);
-		if (!r)
-			break;
-
-		if (size > sizeof buffer)
-			sz = sizeof buffer;
-		else
-			sz = size;
-
-		bytesRead = 0;
-		r = ReadFile(handle, buffer, sz, &bytesRead, NULL);
-		if (!r)
-		{
-			dprintf("ReadFile failed %ld\n", GetLastError());
-			return -_L(EIO);
-		}
-
-		if (bytesRead == 0)
-			break;
-
-		r = NtWriteVirtualMemory(current->process, buf,
-					 buffer, bytesRead, &sz);
-		if (r != STATUS_SUCCESS)
+		r = vm_get_pointer(current, buf, &ptr, &max_size);
+		if (r < 0)
 		{
 			if (bytesCopied)
 				break;
 			return -_L(EFAULT);
 		}
+
+		sz = size;
+		if (sz > max_size)
+			sz = max_size;
+
+		dprintf("reading %ld bytes at %08lx:%08lx to %p\n",
+			sz, ov.OffsetHigh, ov.Offset, ptr);
+
+		r = ReadFile(f->handle, ptr, sz, &bytesRead, &ov);
+		if (!r)
+		{
+			DWORD err = GetLastError();
+			if (err == ERROR_HANDLE_EOF)
+			{
+				LARGE_INTEGER fileSize;
+				if (!GetFileSizeEx(f->handle, &fileSize))
+					return -_L(EIO);
+				size = (fileSize.QuadPart - *ofs);
+				continue;
+			}
+			else if (err == ERROR_IO_PENDING)
+			{
+				if (!GetOverlappedResult(f->handle, &ov, &bytesRead, TRUE))
+				{
+					dprintf("ReadFile failed (%ld) at %d\n",
+						GetLastError(), __LINE__);
+					return -_L(EIO);
+				}
+			}
+			else
+			{
+				dprintf("ReadFile failed (%ld) at %d\n",
+					err, __LINE__);
+				return -_L(EIO);
+			}
+		}
+
+		dprintf("bytesRead = %ld\n", bytesRead);
+
+		if (bytesRead == 0)
+			break;
+
 		bytesCopied += bytesRead;
 		buf = (char*) buf + bytesRead;
 		size -= bytesRead;
 		(*ofs) += bytesRead;
 	}
+
 	return bytesCopied;
 }
 
-static int winfs_read(filp *f, void *buf, size_t size, loff_t *off, int block)
+static int winfs_write(filp *f, const void *buf, size_t size, loff_t *ofs, int block)
 {
-	return winfs_read_to_userland(f->handle, buf, size, off);
-}
-
-static int winfs_write(filp *f, const void *buf, size_t size, loff_t *off)
-{
-	uint8_t buffer[0x1000];
 	DWORD bytesCopied = 0;
 
 	while (size)
 	{
-		ULONG sz = size;
+		OVERLAPPED ov;
+		ULONG sz;
 		DWORD bytesWritten;
-		ULONG bytesRead = 0;
 		NTSTATUS r;
+		void *ptr = NULL;
+		size_t max_size = 0;
 
-		if (sz > sizeof buffer)
-			sz = sizeof buffer;
-
-		r = NtReadVirtualMemory(current->process, buf,
-				 buffer, sz, &bytesRead);
-		if (r != STATUS_SUCCESS)
-			return -_L(EFAULT);
-
-		bytesWritten = 0;
-		r = WriteFile(f->handle, buffer, bytesRead, &bytesWritten, NULL);
-		if (!r)
+		r = vm_get_pointer(current, buf, &ptr, &max_size);
+		if (r < 0)
 		{
-			dprintf("WriteFile %p failed %ld\n",
-				f->handle, GetLastError());
-			return -_L(EIO);
+			if (bytesCopied)
+				break;
+			return -_L(EFAULT);
 		}
 
-		if (bytesWritten != bytesRead)
-			break;
+		sz = size;
+		if (sz > max_size)
+			sz = max_size;
+
+		memset(&ov, 0, sizeof ov);
+		ov.OffsetHigh = (*ofs >> 32);
+		ov.Offset = (*ofs & 0xffffffff);
+
+		bytesWritten = 0;
+		r = WriteFile(f->handle, ptr, sz, &bytesWritten, &ov);
+		if (!r)
+		{
+			DWORD err = GetLastError();
+			if (err == ERROR_IO_PENDING)
+			{
+				if (!GetOverlappedResult(f->handle, &ov,
+							&bytesWritten, TRUE))
+				{
+					dprintf("WriteFile failed (%ld) at %d\n",
+						err, __LINE__);
+					return -_L(EIO);
+				}
+
+			}
+			else
+			{
+				dprintf("WriteFile failed (%ld) at %d\n",
+					err, __LINE__);
+				return -_L(EIO);
+			}
+		}
 
 		/* move along */
 		bytesCopied += bytesWritten;
 		size -= bytesWritten;
 		buf = (char*) buf + bytesWritten;
-		(*off) += bytesWritten;
+		(*ofs) += bytesWritten;
+
+		if (bytesWritten != sz)
+			break;
 	}
 
 	return bytesCopied;
@@ -523,7 +590,7 @@ static int winfs_unlink_handle(HANDLE handle)
 				&info, sizeof info,
 				FileDispositionInformation);
 
-	dprintf("NtSetInformationFile -> %08x\n", r);
+	dprintf("NtSetInformationFile -> %08lx\n", r);
 
 	return (r == STATUS_SUCCESS) ? 0 : -_L(EPERM);
 }
@@ -607,7 +674,7 @@ static int winfs_symlink(filp *dir, const char *name, const char *newpath)
 			0, 0);
 	if (r != STATUS_SUCCESS)
 	{
-		dprintf("NtCreateFile failed %08x\n", r);
+		dprintf("NtCreateFile failed %08lx\n", r);
 		return -_L(EPERM);
 	}
 
@@ -643,13 +710,13 @@ static int winfs_getname(filp *fp, char **name)
 				FileNameInformation);
 	if (r != STATUS_SUCCESS)
 	{
-		dprintf("NtQueryInformationFile failed %08x\n", r);
+		dprintf("NtQueryInformationFile failed %08lx\n", r);
 		return -_L(EPERM);
 	}
 
 	dprintf("handle %p name = %.*S\n",
 		fp->handle,
-		info.NameInfo.FileNameLength/2,
+		(int) info.NameInfo.FileNameLength/2,
 		info.NameInfo.FileName);
 
 	/*
@@ -748,7 +815,7 @@ static int winfs_mkdir(filp *dir, const char *name, int mode)
 			FILE_DIRECTORY_FILE, 0, 0);
 	if (r != STATUS_SUCCESS)
 	{
-		dprintf("NtCreateFile failed %08x\n", r);
+		dprintf("NtCreateFile failed %08lx\n", r);
 		return -_L(EPERM);
 	}
 
@@ -798,6 +865,8 @@ static filp *winfs_open(struct fs *fs, const char *file, int flags,
 	DWORD create = 0;
 	HANDLE handle;
 	filp *fp;
+	int symlink_count = 0;
+	DWORD CreateFlags;
 
 	dprintf("open(\"%s\",%08x,%08x)\n", file, flags, mode);
 
@@ -834,17 +903,18 @@ static filp *winfs_open(struct fs *fs, const char *file, int flags,
 			dospath, access, share, create);
 
 		/* FIXME: don't clobber symlinks when opening them */
+		CreateFlags = FILE_ATTRIBUTE_NORMAL |
+				FILE_FLAG_BACKUP_SEMANTICS |
+				FILE_FLAG_OVERLAPPED;
 
 		/* use FILE_FLAG_BACKUP_SEMANTICS for opening directories */
 		handle = CreateFileW(dospath, access, share, NULL, create,
-				FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
-				NULL);
+				CreateFlags, NULL);
 		if (handle == INVALID_HANDLE_VALUE)
 		{
 			access &= ~DELETE;
 			handle = CreateFileW(dospath, access, share, NULL, create,
-					FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
-					NULL);
+					CreateFlags, NULL);
 			if (handle == INVALID_HANDLE_VALUE)
 			{
 				dprintf("failed to open %S (%ld)\n",
@@ -863,6 +933,9 @@ static filp *winfs_open(struct fs *fs, const char *file, int flags,
 		if (!target)
 			break;
 		CloseHandle(handle);
+		symlink_count++;
+		if (symlink_count >= 256)
+			return L_ERROR_PTR(ELOOP);
 
 		/* FIXME: only works for absolute paths */
 		dprintf("symlink -> %s\n", target);
@@ -879,6 +952,7 @@ static filp *winfs_open(struct fs *fs, const char *file, int flags,
 
 	init_fp(fp, &winfs_file_ops);
 	fp->handle = handle;
+	fp->dir_count = 0;
 
 	return fp;
 }

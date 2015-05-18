@@ -219,7 +219,7 @@ static void vt100_scroll(vt100_filp *vt, int up)
 	width = info.srWindow.Right - info.srWindow.Left + 1;
 	if (width > 256)
 	{
-		dprintf("scroll area too wide: %d\n", width);
+		dprintf("scroll area too wide: %ld\n", width);
 		return;
 	}
 
@@ -789,7 +789,7 @@ static int vt100_write_wait_number(vt100_filp *vt, unsigned char ch)
 		vt->num_count++;
 		if (vt->num_count >= MAX_VT100_PARAMS)
 		{
-			dprintf("too many tty params\n", ch);
+			dprintf("too many tty params\n");
 			vt->state = 0;
 		}
 		break;

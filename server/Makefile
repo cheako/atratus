@@ -17,7 +17,6 @@
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
 #
 
-all: 
 CFLAGS = -Wall -fno-stack-protector
 CFLAGS += -Wall -O2
 CFLAGS += -fno-builtin
@@ -34,11 +33,15 @@ all: atratus.exe cygsymlink.exe linux.exe
 
 ATRATUS_SRCS = \
 	atratus.c \
+	debug.c \
 	dev.c \
+	elf.c \
 	inet.c \
 	null.c \
 	pipe.c \
+	ntstatus.c \
 	tty.c \
+	vm.c \
 	vt100.c \
 	winfs.c
 

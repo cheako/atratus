@@ -25,10 +25,11 @@
 
 #define O_RDONLY 0
 
-struct linux_dirent {
-    long d_ino;
-    unsigned long d_off;
+struct linux_dirent64 {
+    unsigned long long d_ino;
+    long long d_off;
     unsigned short d_reclen;
+    unsigned char d_type;
     char d_name[];
 };
 
@@ -102,13 +103,13 @@ int close(int fd)
 }
 
 
-static inline int getdents(int fd, struct linux_dirent *de, int len)
+static inline int getdents64(int fd, struct linux_dirent64 *de, int len)
 {
 	int r;
 	__asm__ __volatile__(
 		"\tint $0x80\n"
 		:"=a"(r)
-		: "a"(141), "b"(fd), "c"(de), "d"(len)
+		: "a"(220), "b"(fd), "c"(de), "d"(len)
 		: "memory");
 	return r;
 }
@@ -151,12 +152,12 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
-	r = getdents(fd, (void*)buf, sizeof buf);
+	r = getdents64(fd, (void*)buf, sizeof buf);
 
 #if 1
 	while (n < r)
 	{
-		struct linux_dirent *de = (void*) &buf[n];
+		struct linux_dirent64 *de = (void*) &buf[n];
 
 		write_int(de->d_reclen);
 		write(1, " ", 1);
@@ -164,7 +165,7 @@ int main(int argc, char **argv)
 		write(1, " ", 1);
 		write_int(de->d_ino);
 		write(1, " ", 1);
-		char t = ((char*)de)[de->d_reclen - 1];
+		char t = de->d_type;
 		switch (t)
 		{
 		case 10: /* link */

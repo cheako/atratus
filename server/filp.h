@@ -43,7 +43,7 @@ struct wait_entry;
 
 struct filp_ops {
 	int (*fn_read)(filp *f, void *buf, size_t size, loff_t *ofs, int block);
-	int (*fn_write)(filp *f, const void *buf, size_t size, loff_t *ofs);
+	int (*fn_write)(filp *f, const void *buf, size_t size, loff_t *ofs, int block);
 	int (*fn_stat)(filp *f, struct stat64 *statbuf);
 	int (*fn_ioctl)(filp *f, int cmd, unsigned long arg);
 	int (*fn_getdents)(filp *f, void *de, unsigned int count, fn_add_dirent fn);
@@ -70,6 +70,7 @@ struct _filp {
 	poll_list *poll_first;
 	loff_t offset;
 	int refcount;
+	int dir_count;
 };
 
 static inline void filp_close(filp *fp)
@@ -77,6 +78,8 @@ static inline void filp_close(filp *fp)
 	if (fp->ops->fn_close)
 		fp->ops->fn_close(fp);
 }
+
+int do_close(int fd);
 
 struct _poll_list {
 	poll_list *next;

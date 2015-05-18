@@ -183,6 +183,13 @@ EXPORT int fork(void)
 {
 	int r;
 	SYSCALL0(2);
+	if (r == 0)
+	{
+		__asm__ __volatile__(
+			"\tmovw %%fs, %%ax\n"
+			"\tmovw %%ax, %%gs\n"
+		:::"eax");
+	}
 	return set_errno(r);
 }
 
@@ -680,7 +687,26 @@ EXPORT int setsockopt(int fd, int level, int optname,
 	return socketcall(_L(SYS_SETSOCKOPT), args);
 }
 
-struct sockaddr;
+struct sockaddr
+{
+	unsigned short sa_family;
+	char sa_data[14];
+} __attribute__((__packed__));
+
+typedef uint32_t in_addr_t;
+
+struct in_addr
+{
+	in_addr_t s_addr;
+};
+
+struct sockaddr_in
+{
+	unsigned short sin_family;
+	unsigned short sin_port;
+	struct in_addr sin_addr;
+	char _pad[8];
+} __attribute__((__packed__));
 
 EXPORT int connect(int fd, const struct sockaddr *addr, socklen_t addrlen)
 {
@@ -733,6 +759,41 @@ EXPORT int shutdown(int fd, int how)
 	unsigned long args[] = { fd, how };
 	return socketcall(_L(SYS_SHUTDOWN), args);
 }
+
+struct rlimit64
+{
+	int64_t rlim_cur;
+	int64_t rlim_max;
+};
+
+EXPORT int setrlimit64(int resource, const struct rlimit64 *rlim)
+{
+	warn("setrlimit64(%d)\n", resource);
+	return 0;
+}
+
+extern int syscall(int n, ...);
+__asm__ (
+"\n"
+".text\n"
+".globl syscall\n"
+".type	syscall, @function\n"
+"syscall:\n"
+	"\tpush %ebx\n"
+	"\tpush %ebp\n"
+	"\tmov 12(%esp), %eax\n"
+	"\tmov 16(%esp), %ebx\n"
+	"\tmov 20(%esp), %ecx\n"
+	"\tmov 24(%esp), %edx\n"
+	"\tmov 28(%esp), %esi\n"
+	"\tmov 32(%esp), %edi\n"
+	"\tmov 36(%esp), %ebp\n"
+	"\tint $0x80\n"
+	"\tpop %ebp\n"
+	"\tpop %ebx\n"
+	"\tret\n"
+	"\t.size	syscall, .-syscall\n"
+);
 
 #define CTYPE_UPPER   (1 << 8)
 #define CTYPE_LOWER   (1 << 9)
@@ -1059,24 +1120,27 @@ EXPORT char *fgets_unlocked(char *s, int n, FILE *stream)
 
 	while (count < (n - 1))
 	{
+		char ch;
+
 		if (stream->read_avail == 0 && !stdio_read_to_buffer(stream))
 			break;
 
 		if (!stream->read_avail)
 			break;
 
-		s[count] = stream->read_buffer[stream->read_start];
+		ch = stream->read_buffer[stream->read_start];
 		stream->read_start++;
 		stream->read_avail--;
-		if (s[count] == '\n')
+		s[count++] = ch;
+		if (ch == '\n')
 			break;
-		count++;
 	}
 
 	if (count == 0)
 		return NULL;
 
-	s[count] = 0;
+	if (s[count - 1] == '\n')
+		s[count - 1] = 0;
 
 	return s;
 }
@@ -1411,7 +1475,7 @@ EXPORT struct linux_dirent64 *readdir64(DIR *dir)
 	if (!dir || dir->magic != DIR_MAGIC)
 		return NULL;
 
-	if (dir->available == dir->used)
+	if (dir->available <= dir->used)
 	{
 		r = getdents64(dir->fd, dir->buffer, sizeof dir->buffer);
 		if (r <= 0)
@@ -1426,6 +1490,9 @@ EXPORT struct linux_dirent64 *readdir64(DIR *dir)
 	{
 		de = (void*) (&dir->buffer[dir->used]);
 		dir->used += de->d_reclen;
+		if (dir->available <= dir->used)
+			return NULL;
+
 		de = (void*) (&dir->buffer[dir->used]);
 	}
 
@@ -3103,7 +3170,9 @@ EXPORT char *strpbrk(const char *s, const char *accept)
 
 EXPORT char *strtok_r(char *str, const char *delim, char **saveptr)
 {
-	char *p;
+	unsigned char sep[256] = {0};
+	unsigned char *p;
+	int i;
 
 	if (!str)
 		str = *saveptr;
@@ -3111,14 +3180,31 @@ EXPORT char *strtok_r(char *str, const char *delim, char **saveptr)
 	if (str[0] == 0)
 		return NULL;
 
-	p = strpbrk(str, delim);
-	if (p)
+	/* mark delimeters */
+	for (i = 0; delim[i]; i++)
+		sep[(unsigned char)delim[i]] = 1;
+
+	/* skip leading separators, not NUL */
+	p = (unsigned char*) str;
+	sep[0] = 0;
+	for (i = 0; sep[p[i]]; i++)
+		;
+	str = (char*) &p[i];
+	if (str[0] == 0)
+		return NULL;
+
+	/* skip non-separators, not NUL */
+	sep[0] = 1;
+	while (!sep[p[i]])
+		i++;
+
+	if (p[i])
 	{
-		p[0] = 0;
-		*saveptr = &p[1];
+		p[i] = 0;
+		*saveptr = (char*) &p[i + 1];
 	}
 	else
-		*saveptr = str + strlen(str);
+		*saveptr = (char*) &p[i];
 
 	return str;
 }
@@ -3239,15 +3325,8 @@ EXPORT void qsort(void *base, size_t nmemb, size_t size, fn_compare fn)
 	}
 }
 
-extern char **environ;
-extern char **__environ;
-__asm__ (
-".globl __environ\n"
-".globl environ\n"
-"environ:\n"
-"__environ:\n"
-"\t.long	0\n"
-);
+EXPORT char **environ = NULL;
+EXPORT extern char **__environ __attribute__ ((weak, alias ("environ")));
 
 /* move the environment to the heap */
 static void environ_realloc(void)
@@ -3255,13 +3334,16 @@ static void environ_realloc(void)
 	char **t = environ;
 	int n;
 
+	if (!t)
+		return;
+
 	for (n = 0; t[n]; n++)
 		;
 
 	environ = malloc((n + 1) * sizeof t[0]);
 
 	for (n = 0; t[n]; n++)
-		__environ[n] = strdup(t[n]);
+		environ[n] = strdup(t[n]);
 
 	environ[n] = NULL;
 }
@@ -3591,6 +3673,8 @@ EXPORT int getopt_long(int argc, const char **argv,
 			}
 		}
 	}
+	else
+		group_count++;
 
 	optopt = argv[pos][nextchar];
 	if (optopt == '-' || optopt == 0)
@@ -3612,6 +3696,7 @@ EXPORT int getopt_long(int argc, const char **argv,
 	{
 		pos++;
 		nextchar = 0;
+		opt_shuffle(argv, pos, group_count);
 	}
 
 	/* handle option with an arg */
@@ -3631,10 +3716,9 @@ EXPORT int getopt_long(int argc, const char **argv,
 			pos++;
 			group_count++;
 			nextchar = 0;
+			opt_shuffle(argv, pos, group_count);
 		}
 	}
-
-	opt_shuffle(argv, pos, group_count);
 
 	return optopt;
 
@@ -3811,18 +3895,146 @@ EXPORT char *ttyname(int fd)
 	return buf;
 }
 
-EXPORT struct servent *getservbyname(const char *name, const char *protocol)
+EXPORT uint16_t htons(uint16_t val)
 {
-	warn("getservbyname(%s,%s)\n", name, protocol);
-	return NULL;
+	return ((val & 0xff) << 8) | ((val && 0xff00) >> 8);
 }
 
-typedef uint32_t in_addr_t;
-
-struct in_addr
+struct servent
 {
-	in_addr_t s_addr;
+	char *s_name;
+	char **s_aliases;
+	int s_port;
+	char *s_proto;
 };
+
+struct servent_list
+{
+	struct servent se;
+	struct servent_list *next;
+	char strings[1];
+};
+
+static struct servent_list *servent_first;
+
+#define ISNUM(x) ((x) >= '0' && (x) <= '9')
+#define ISALPHA(x) (((x) >= 'A' && (x) <= 'Z') || (x >= 'a' && x <= 'z'))
+#define ISSERV(x) (ISNUM(x) || ISALPHA(x) || (x) == '-')
+#define ISSPACE(x) ((x) == ' ' || (x) == '\t')
+
+static struct servent_list *service_parse_servent(char *p)
+{
+	struct servent_list *sl;
+	char *name, *proto;
+	int port;
+	int n = 0;
+	int namelen, protolen;
+
+	/* find name */
+	name = p;
+	while (ISSERV(p[n]))
+		n++;
+	if (!p[n])
+		return NULL;
+	p[n++] = 0;
+
+	/* skip space */
+	while (ISSPACE(p[n]))
+		n++;
+
+	port = 0;
+	while (ISNUM(p[n]))
+	{
+		port *= 10;
+		port += (p[n] - '0');
+		n++;
+	}
+
+	if (p[n++] != '/')
+		return NULL;
+
+	proto = &p[n];
+	while (ISALPHA(p[n]))
+		n++;
+	if (p[n] != 0 && !ISSPACE(p[n]))
+		return NULL;
+	p[n] = 0;
+
+	namelen = strlen(name);
+	protolen = strlen(proto);
+
+	sl = malloc(sizeof *sl + namelen + 1 + protolen + 1);
+	if (!sl)
+		return NULL;
+
+	sl->se.s_port = htons(port);
+	sl->se.s_name = &sl->strings[0];
+	strcpy(sl->se.s_name, name);
+	sl->se.s_proto = &sl->strings[namelen + 1];
+	strcpy(sl->se.s_proto, proto);
+	/* TODO: parse the aliases */
+	sl->se.s_aliases = NULL;
+	sl->next = NULL;
+
+	return sl;
+}
+
+static int service_load(void)
+{
+	struct servent_list **se = &servent_first;
+	char buffer[0x100];
+	FILE *f;
+	char *p;
+
+	if (*se)
+		return 0;
+
+	f = fopen("/etc/services", "r");
+	if (!f)
+		return 0;
+
+	while ((p = fgets(buffer, sizeof buffer, f)))
+	{
+		int i;
+
+		/* remove comments */
+		for (i = 0; p[i]; i++)
+			if (p[i] == '\n' || p[i] == '#')
+				break;
+
+		/* remove trailing whitespace */
+		while (i && ISSPACE(p[i]))
+			i--;
+		p[i] = 0;
+
+		*se = service_parse_servent(p);
+		if (*se)
+			se = &((*se)->next);
+		*se = NULL;
+	}
+
+	fclose(f);
+
+	return 1;
+}
+
+EXPORT struct servent *getservbyname(const char *name, const char *protocol)
+{
+	struct servent_list *sl;
+
+	service_load();
+
+	for (sl = servent_first; sl; sl = sl->next)
+	{
+		if (strcmp(protocol, sl->se.s_proto))
+			continue;
+		if (strcmp(name, sl->se.s_name))
+			continue;
+		return &sl->se;
+	}
+
+	return NULL;
+}
 
 static int inet_part(const char *part)
 {
@@ -3967,6 +4179,98 @@ EXPORT char *inet_ntoa(struct in_addr in)
 	return out;
 }
 
+struct hostent
+{
+	char *h_name;
+	char **h_aliases;
+	int h_addrtype;
+	int h_length;
+	char **h_addr_list;
+};
+
+struct hostent_list
+{
+	struct hostent he;
+	char *h_addr_list[2];
+	struct in_addr addr;
+	struct hostent_list *next;
+	char strings[1];
+};
+
+static struct hostent_list *hostent_first;
+
+static struct hostent_list *hosts_parse_entry(char *p)
+{
+	struct hostent_list *hl;
+	char *save = NULL;
+	char *address, *name;
+	struct in_addr addr;
+	int r;
+
+	address = strtok_r(p, " \t", &save);
+
+	name = strtok_r(NULL, " \t", &save);
+
+	if (!address || !name)
+		return NULL;
+
+	r = inet_aton(address, &addr);
+	if (r < 0)
+		return NULL;
+
+	hl = malloc(sizeof *hl + strlen(name) + 1);
+	if (!hl)
+		return NULL;
+
+	strcpy(hl->strings, name);
+	hl->he.h_name = hl->strings;
+	hl->he.h_addr_list = hl->h_addr_list;
+	hl->he.h_addr_list[0] = (char*) (&hl->addr);
+	hl->he.h_addr_list[1] = NULL;
+	hl->addr = addr;
+	hl->next = NULL;
+
+	return hl;
+}
+
+static int hosts_load(void)
+{
+	struct hostent_list **he = &hostent_first;
+	char buffer[0x100];
+	FILE *f;
+	char *p;
+
+	if (*he)
+		return 0;
+
+	f = fopen("/etc/hosts", "r");
+	if (!f)
+		return 0;
+
+	while ((p = fgets(buffer, sizeof buffer, f)))
+	{
+		int i;
+
+		/* remove comments */
+		for (i = 0; p[i]; i++)
+			if (p[i] == '\n' || p[i] == '#')
+				break;
+
+		/* remove trailing whitespace */
+		while (i && ISSPACE(p[i]))
+			i--;
+		p[i] = 0;
+
+		*he = hosts_parse_entry(p);
+		if (*he)
+			he = &((*he)->next);
+	}
+
+	fclose(f);
+
+	return 1;
+}
+
 struct addrinfo
 {
 	int ai_flags;
@@ -3979,11 +4283,58 @@ struct addrinfo
 	struct addrinfo *ai_next;
 };
 
+EXPORT struct hostent *gethostbyname(const char *name)
+{
+	struct hostent_list *hl;
+
+	hosts_load();
+
+	for (hl = hostent_first; hl; hl = hl->next)
+		if (!strcmp(hl->he.h_name, name))
+			return &hl->he;
+
+	return NULL;
+}
+
 EXPORT int getaddrinfo(const char *node, const char *service,
 		 const struct addrinfo *hints, struct addrinfo **res)
 {
-	warn("getaddrinfo(%s,%s) not implemented\n", node, service);
-	return -1;
+	struct hostent *he;
+	struct addrinfo *ai;
+	struct sockaddr_in *si;
+
+	if (service && service[0])
+		warn("getaddrinfo(%s,%s)\n", node, service);
+
+	he = gethostbyname(node);
+	if (!he)
+		return -1;
+
+	ai = malloc(sizeof *ai + sizeof (struct sockaddr_in));
+	memset(ai, 0, sizeof *ai);
+	ai->ai_family = _L(AF_INET);
+	ai->ai_socktype = _L(AF_UNSPEC);
+	ai->ai_addrlen = sizeof (struct sockaddr_in);
+	si = (void*) (ai + 1);
+	ai->ai_addr = (void*) si;
+	si->sin_family = _L(AF_INET);
+	si->sin_port = 0;
+	memcpy(&si->sin_addr, he->h_addr_list[0], sizeof (struct in_addr));
+	ai->ai_canonname = he->h_name;
+
+	*res = ai;
+
+	return 0;
+}
+
+EXPORT void freeaddrinfo(struct addrinfo *ai)
+{
+	free(ai);
+}
+
+EXPORT const char *gai_strerror(int error)
+{
+	return "getaddrinfo not implemented";
 }
 
 EXPORT int getnameinfo(const struct sockaddr *sa, socklen_t salen,

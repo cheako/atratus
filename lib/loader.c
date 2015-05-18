@@ -75,7 +75,6 @@ static struct module_info modules[32];
 static struct module_info *main_module = &modules[0];
 static struct module_info *loader_module = &modules[1];
 static int module_count = 2;
-extern char **environ;
 static int ldverbose = 0;
 
 /*
@@ -123,7 +122,7 @@ static int ldstrcmp(const char *a, const char *b)
 	return 0;
 }
 
-/*static*/ int ldstrlen(const char *s)
+static int ldstrlen(const char *s)
 {
 	int n = 0;
 	while (s[n])
@@ -316,7 +315,7 @@ static unsigned int ld_get_auxv(Elf32_Aux *auxv, int value)
 	return 0;
 }
 
-unsigned long elf_hash(const char *name)
+static unsigned long ld_elf_hash(const char *name)
 {
 	unsigned long h = 0, g;
 	const uint8_t *p = (const uint8_t*) name;
@@ -331,7 +330,7 @@ unsigned long elf_hash(const char *name)
 	return h;
 }
 
-uint32_t dl_new_hash(const char *s)
+static uint32_t ld_new_hash(const char *s)
 {
 	uint32_t h = 5381;
 
@@ -344,12 +343,12 @@ uint32_t dl_new_hash(const char *s)
 	return h;
 }
 
-static const char *strtab_get(struct module_info *m, Elf32_Word ofs)
+static const char *ld_strtab_get(struct module_info *m, Elf32_Word ofs)
 {
 	return (const char*) (m->delta + m->dt.strtab + ofs);
 }
 
-Elf32_Sym *elf_hash_lookup(struct module_info *m,
+static Elf32_Sym *ld_hash_lookup(struct module_info *m,
 				const char *symbol_name)
 {
 	Elf32_Word hash;
@@ -364,7 +363,7 @@ Elf32_Sym *elf_hash_lookup(struct module_info *m,
 
 	dthash = (void*)(m->dt.hash + m->delta);
 
-	hash = elf_hash(symbol_name);
+	hash = ld_elf_hash(symbol_name);
 
 	index = dthash->buckets[hash % dthash->nbuckets];
 	chains = &dthash->buckets[dthash->nbuckets];
@@ -377,9 +376,9 @@ Elf32_Sym *elf_hash_lookup(struct module_info *m,
 		sym = (void*)(m->delta + m->dt.symtab);
 		sym += index;
 
-		name = strtab_get(m, sym->st_name);
+		name = ld_strtab_get(m, sym->st_name);
 #if 0
-		if (elf_hash(name) != hash)
+		if (ld_elf_hash(name) != hash)
 		{
 			fprintf(stderr, "bad hash in chain\n");
 			abort();
@@ -401,7 +400,7 @@ Elf32_Sym *elf_hash_lookup(struct module_info *m,
 }
 
 /* https://blogs.oracle.com/ali/entry/gnu_hash_elf_sections */
-Elf32_Sym *elf_gnu_hash_lookup(struct module_info *m,
+static Elf32_Sym *ld_gnu_hash_lookup(struct module_info *m,
 				const char *symbol_name)
 {
 	struct {
@@ -419,7 +418,7 @@ Elf32_Sym *elf_gnu_hash_lookup(struct module_info *m,
 	int last = 0;
 
 	gnuhash = (void*)(m->delta + m->dt.gnu_hash);
-	hash = dl_new_hash(symbol_name);
+	hash = ld_new_hash(symbol_name);
 
 	/* TODO: use bloom filter here */
 
@@ -441,7 +440,7 @@ Elf32_Sym *elf_gnu_hash_lookup(struct module_info *m,
 		{
 			sym = (void*)(m->delta + m->dt.symtab);
 			sym += index;
-			name = strtab_get(m, sym->st_name);
+			name = ld_strtab_get(m, sym->st_name);
 			if (!ldstrcmp(name, symbol_name))
 			{
 				r = sym;
@@ -460,15 +459,15 @@ Elf32_Sym *elf_gnu_hash_lookup(struct module_info *m,
 	return r;
 }
 
-Elf32_Word module_get_symbol_address(struct module_info *m,
+static Elf32_Word module_get_symbol_address(struct module_info *m,
 					const char *symbol_name)
 {
 	Elf32_Sym *r = 0;
 
 	if (m->dt.gnu_hash)
-		r = elf_gnu_hash_lookup(m, symbol_name);
+		r = ld_gnu_hash_lookup(m, symbol_name);
 	else if (m->dt.hash)
-		r = elf_hash_lookup(m, symbol_name);
+		r = ld_hash_lookup(m, symbol_name);
 
 	if (r && r->st_size)
 		return r->st_value;
@@ -507,7 +506,8 @@ static Elf32_Word ld_get_symbol_address(const char *sym)
 	return ld_get_symbol_address_exclude(sym, NULL);
 }
 
-void *__ld_dynamic_resolve(void *arg, unsigned int entry, void *callee)
+__attribute__((used))
+static void *ld_dynamic_resolve(void *arg, unsigned int entry, void *callee)
 {
 	struct module_info *m = arg;
 	Elf32_Word target;
@@ -545,7 +545,7 @@ void *__ld_dynamic_resolve(void *arg, unsigned int entry, void *callee)
 	if (!target)
 	{
 		/* FIXME: handle weak symbols */
-		die("no such symbol (%s)\n", symbol_name);
+		lddie("no such symbol (%s)\n", symbol_name);
 	}
 
 	r = (void*) target;
@@ -567,7 +567,7 @@ extern void __dynamic_resolve_trampoline(void);
 __asm__ (
 	"\n"
 	"__dynamic_resolve_trampoline:\n"
-	"\tcall __ld_dynamic_resolve\n"
+	"\tcall ld_dynamic_resolve\n"
 	"\tadd $8, %esp\n"
 	"\torl %eax, %eax\n"
 	"\tjz skip\n"
@@ -576,7 +576,7 @@ __asm__ (
 	"\tret\n"
 );
 
-void patch_got(struct module_info *m)
+static void ld_patch_got(struct module_info *m)
 {
 	int i;
 	unsigned int *got = (void*) m->delta + m->dt.pltgot;
@@ -599,7 +599,7 @@ void patch_got(struct module_info *m)
 	}
 }
 
-void elf_apply_reloc_glob_dat(struct module_info *m, int offset)
+static void ld_apply_reloc_glob_dat(struct module_info *m, int offset)
 {
 	Elf32_Rel *rel = (void*)(m->delta + m->dt.rel);
 	Elf32_Word syminfo;
@@ -641,7 +641,7 @@ void elf_apply_reloc_glob_dat(struct module_info *m, int offset)
 	*p = (uint32_t) value;
 }
 
-void ld_apply_reloc_copy(struct module_info *m, Elf32_Rel *rel)
+static void ld_apply_reloc_copy(struct module_info *m, Elf32_Rel *rel)
 {
 	Elf32_Word syminfo = ELF32_R_SYM(rel->r_info);
 	const char *symbol_name;
@@ -717,11 +717,10 @@ static void ld_apply_symbol_value(struct module_info *m, Elf32_Rel *rel)
 	st += syminfo;
 	symbol_name = (const char*) (m->delta + m->dt.strtab + st->st_name);
 
-	/* find the copy source */
-	value = ld_get_symbol_address_exclude(symbol_name, m);
+	value = ld_get_symbol_address(symbol_name);
 	if (!value)
 	{
-		ldprintf("symbol not found: %s\n", symbol_name);
+		lddie("symbol not found: %s\n", symbol_name);
 		return;
 	}
 
@@ -739,7 +738,7 @@ static void ld_apply_tls_dtpmod32(struct module_info *m, Elf32_Rel *rel)
 	ldverbose--;
 }
 
-int ld_apply_relocations(struct module_info *m)
+static int ld_apply_relocations(struct module_info *m)
 {
 	int i;
 
@@ -754,7 +753,7 @@ int ld_apply_relocations(struct module_info *m)
 		switch (symtype)
 		{
 		case R_386_GLOB_DAT:
-			elf_apply_reloc_glob_dat(m, i);
+			ld_apply_reloc_glob_dat(m, i);
 			break;
 		case R_386_COPY:
 			ld_apply_reloc_copy(m, &rel[i]);
@@ -820,7 +819,7 @@ static void ld_add_needed(const char *name)
 			return;
 
 	if (module_count > sizeof modules/sizeof modules[0])
-		die("Too many libraries needed\n");
+		lddie("Too many libraries needed\n");
 
 	n = module_count++;
 	modules[n].name = name;
@@ -828,7 +827,7 @@ static void ld_add_needed(const char *name)
 	ldprintf("need %s\n", modules[n].name);
 }
 
-void ld_read_dynamic_section(struct module_info *m, Elf32_Word dyn_offset)
+static void ld_read_dynamic_section(struct module_info *m, Elf32_Word dyn_offset)
 {
 	Elf32_Dyn *dyn = (void*)(m->delta + dyn_offset);
 	int i;
@@ -877,7 +876,7 @@ void ld_read_dynamic_section(struct module_info *m, Elf32_Word dyn_offset)
 	{
 		if (dyn[i].d_tag != DT_NEEDED)
 			continue;
-		ld_add_needed(strtab_get(m, dyn[i].d_un.d_val));
+		ld_add_needed(ld_strtab_get(m, dyn[i].d_un.d_val));
 	}
 }
 
@@ -900,8 +899,8 @@ static const Elf32_Phdr* ld_find_dynamic_phdr(Elf32_Phdr *phdr, unsigned int phn
 	return dynamic;
 }
 
-const int pagesize = 0x1000;
-const int pagemask = 0x0fff;
+static const int pagesize = 0x1000;
+static const int pagemask = 0x0fff;
 
 static unsigned int round_down_to_page(unsigned int addr)
 {
@@ -1002,14 +1001,13 @@ static int map_elf_object(struct module_info *m, Elf32_Ehdr *ehdr, int fd)
 		int mapflags = mmap_flags_from_elf(to_load[i].p_flags);
 		void *p;
 		unsigned int vaddr = round_down_to_page(to_load[i].p_vaddr);
-		unsigned int vaddr_offset = (to_load[i].p_vaddr & pagemask);
-		unsigned int filesz = round_up_to_page(vaddr_offset + to_load[i].p_filesz);
+		unsigned int sz = round_up_to_page(to_load[i].p_vaddr + to_load[i].p_memsz);
 
 		(void) mapflags;	/* FIXME: use these */
 
 		p = (void*)(base - min_vaddr + vaddr);
 
-		ldprintf("map at %p, offset %x sz %x\n", p, vaddr, filesz);
+		ldprintf("map at %p, offset %x sz %x\n", p, vaddr, sz);
 		/*
 		 * Map anonymous memory then read the data in
 		 * rather than mapping the file directly.
@@ -1019,7 +1017,7 @@ static int map_elf_object(struct module_info *m, Elf32_Ehdr *ehdr, int fd)
 		 *
 		 * nb. need MAP_FIXED to blow away our old mapping
 		 */
-		p = ldmmap(p, filesz, _L(PROT_READ)|_L(PROT_WRITE)|_L(PROT_EXEC),
+		p = ldmmap(p, sz, _L(PROT_READ)|_L(PROT_WRITE)|_L(PROT_EXEC),
 			 _L(MAP_FIXED)|_L(MAP_PRIVATE)|_L(MAP_ANONYMOUS), -1, 0);
 		if (p == _L(MAP_FAILED))
 		{
@@ -1095,7 +1093,7 @@ static int ld_load_module(struct module_info *m)
  *    0x10      FiberData/Version
  *    0x14      TIB Self pointer              Stack smashing protection value
  */
-void ld_setup_gs(void)
+static void ld_setup_gs(void)
 {
 	__asm__ __volatile__(
 		"\tmovw %%fs, %%ax\n"
@@ -1151,19 +1149,26 @@ void *ld_main(int argc, char **argv, char **env, Elf32_Aux *auxv)
 	{
 		if (i == 1)
 			continue;
-		patch_got(&modules[i]);
+		ld_patch_got(&modules[i]);
 	}
 
 	ld_apply_loader_relocations(loader_module);
 
-	for (i = 0; i < module_count; i++)
+	/*
+	 * apply relocation in reverse so that
+	 * R_386_COPY copies values with relocs applied (e.g. FILE *stdio)
+	 */
+	for (i = module_count - 1; i >= 0; i--)
 	{
 		if (i == 1)
 			continue;
 		ld_apply_relocations(&modules[i]);
 	}
 
-	environ = env;
+	/* TODO: libc to look up from auxv ? */
+	char ***penv = (char ***) ld_get_symbol_address("environ");
+	if (penv)
+		*penv = env;
 
 	ldprintf("done returning to %p\n", entry);
 

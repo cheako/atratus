@@ -43,8 +43,11 @@
 #include "tty.h"
 #include "vt100.h"
 #include "inet.h"
-
+#include "minmax.h"
 #include "debug.h"
+#include "ntstatus.h"
+#include "vm.h"
+#include "elf.h"
 
 struct _l_pollfd {
 	int fd;
@@ -68,43 +71,22 @@ static HANDLE loop_event;
 
 static WCHAR stub_exe_name[MAX_PATH];
 
-static const int pagesize = 0x1000;
-static const int pagemask = 0x0fff;
-
-/* non-standard stuff */
-#define MIN(A, B) (((A) < (B)) ? (A) : (B))
-#define MAX(A, B) (((A) > (B)) ? (A) : (B))
-
 #define DEFAULT_STACKSIZE 0x100000
 
-int nt_process_memcpy_from(void *local_addr, const void *client_addr, size_t size)
+static int vm_memcpy_from(void *local_addr, const void *client_addr, size_t size)
 {
-	NTSTATUS r;
-	ULONG bytesRead = 0;
-
-	r = NtReadVirtualMemory(current->process, client_addr,
-				 local_addr, size, &bytesRead);
-	if (r != STATUS_SUCCESS)
-		return -_L(EFAULT);
-	return 0;
+	return vm_memcpy_from_process(current, local_addr, client_addr, size);
 }
 
-int nt_process_memcpy_to(void *client_addr, const void *local_addr, size_t size)
+static int vm_memcpy_to(void *client_addr, const void *local_addr, size_t size)
 {
-	NTSTATUS r;
-	ULONG bytesWritten = 0;
-
-	r = NtWriteVirtualMemory(current->process, client_addr,
-				 local_addr, size, &bytesWritten);
-	if (r != STATUS_SUCCESS)
-		return -_L(EFAULT);
-	return 0;
+	return vm_memcpy_to_process(current, client_addr, local_addr, size);
 }
 
 struct process_ops nt_process_ops =
 {
-	.memcpy_from = &nt_process_memcpy_from,
-	.memcpy_to = &nt_process_memcpy_to,
+	.memcpy_from = &vm_memcpy_from,
+	.memcpy_to = &vm_memcpy_to,
 };
 
 struct process *context_from_client_id(CLIENT_ID *id)
@@ -122,56 +104,9 @@ struct process *context_from_client_id(CLIENT_ID *id)
 	return NULL;
 }
 
+BOOL WINAPI GetFileSizeEx(HANDLE handle, PLARGE_INTEGER Size);
 extern void KiUserApcDispatcher(void);
 extern void LdrInitializeThunk(void);
-
-static FILE *debug_stream;
-int verbose = 0;
-
-int dprintf(const char *fmt, ...) __attribute__((format(printf,1,2)));
-
-int dprintf(const char *fmt, ...)
-{
-	va_list va;
-	int n;
-	if (!verbose)
-		return 0;
-	va_start(va, fmt);
-	n = vfprintf(debug_stream, fmt, va);
-	va_end(va);
-	fflush(debug_stream);
-	return n;
-}
-
-const char *ntstatus_to_string(NTSTATUS r)
-{
-	switch (r)
-	{
-#define S(x) case x: return #x;
-	S(STATUS_UNSUCCESSFUL)
-	S(STATUS_NOT_IMPLEMENTED)
-	S(STATUS_INVALID_INFO_CLASS)
-	S(STATUS_INFO_LENGTH_MISMATCH)
-	S(STATUS_ACCESS_VIOLATION)
-	S(STATUS_INVALID_HANDLE)
-	S(STATUS_INVALID_CID)
-	S(STATUS_INVALID_PARAMETER)
-	S(STATUS_NO_SUCH_FILE)
-	S(STATUS_NO_MEMORY)
-	S(STATUS_CONFLICTING_ADDRESSES)
-	S(STATUS_UNABLE_TO_FREE_VM)
-	S(STATUS_INVALID_SYSTEM_SERVICE)
-	S(STATUS_ILLEGAL_INSTRUCTION)
-	S(STATUS_INVALID_FILE_FOR_SECTION)
-	S(STATUS_ACCESS_DENIED)
-	S(STATUS_BUFFER_TOO_SMALL)
-	S(STATUS_OBJECT_TYPE_MISMATCH)
-	S(STATUS_NOT_COMMITTED)
-#undef S
-	default:
-		return "unknown";
-	}
-}
 
 /* mingw32's ntdll doesn't have these functions */
 #define DECLARE(x) typeof(x) *p##x;
@@ -222,59 +157,12 @@ static BOOL dynamic_resolve(void)
 	return TRUE;
 }
 
-/* TODO: don't forward declare, move this to a separate file... */
-struct module_info
-{
-	void *base;
-	uint32_t min_vaddr;
-	uint32_t max_vaddr;
-	Elf32_Ehdr ehdr;
-	Elf32_Shdr *shdr;
-	void *entry_point;
-	int num_to_load;
-	Elf32_Phdr to_load[8];
-	char interpreter[0x40];	/* usually /lib/ld-linux.so.2 */
-};
-
-int load_module(struct module_info *m, const char *path);
-int map_elf_object(struct module_info *m, int fd);
 void* sys_mmap(void *addr, ULONG len, int prot,
 		int flags, int fd, off_t offset);
 int do_close(int fd);
-NTSTATUS GetClientId(HANDLE thread, CLIENT_ID *id);
 void dump_string_list(char **list);
 void unlink_process(struct process *process);
 void __stdcall SyscallHandler(PVOID param);
-
-static char printable(char x)
-{
-	if (x >= 0x20 && x < 0x7f)
-		return x;
-	return '.';
-}
-
-static void dump_line(void *p, unsigned int len)
-{
-	unsigned char *x = (unsigned char*) p;
-	unsigned int i;
-	char line[0x11];
-
-	line[0x10] = 0;
-	for (i = 0; i < 16; i++)
-	{
-		if (i < len)
-		{
-			line[i] = printable(x[i]);
-			printf("%02x ", x[i] );
-		}
-		else
-		{
-			line[i] = 0;
-			printf("   ", x[i] );
-		}
-	}
-	printf("   %s\n", line);
-}
 
 static void dump_user_mem(struct process *context,
 			void *p, unsigned int len)
@@ -302,7 +190,7 @@ static void dump_user_mem(struct process *context,
 			printf("<invalid>\n");
 			break;
 		}
-		dump_line(buffer, bytesRead);
+		debug_line_dump(buffer, bytesRead);
 		if (bytesRead != sz)
 			break;
 		len -= sz;
@@ -392,40 +280,6 @@ void dump_address_space(void)
 			info.AllocationBase, info.AllocationProtect,
 			state, protect, info.Type);
 	}
-}
-
-int strv_count(char **str)
-{
-	int n = 0;
-	while (str[n])
-		n++;
-	return n;
-}
-
-int strv_length(char **str)
-{
-	int n = 0, length = 0;
-	while (str[n])
-		length += strlen(str[n++]) + 1;
-	return length;
-}
-
-int auxv_count(Elf32Aux *aux)
-{
-	int n = 0;
-	while (aux[n].a_type)
-		n++;
-	return n;
-}
-
-static inline unsigned long round_down(unsigned long val, unsigned long rounding)
-{
-	return val & ~(rounding - 1);
-}
-
-static inline unsigned long round_up(unsigned long val, unsigned long rounding)
-{
-	return (val + rounding - 1) & ~(rounding - 1);
 }
 
 void* get_process_peb(HANDLE process)
@@ -599,190 +453,6 @@ static NTSTATUS patch_ldr_thunk(struct process *context)
 	return r;
 }
 
-NTSTATUS alloc_vdso(struct process *context, void **vdso)
-{
-	NTSTATUS r;
-	void *addr = NULL;
-	ULONG sz = 0x1000;
-	uint8_t code[] = {0xcd, 0x80, 0xc3};
-	ULONG old_prot;
-
-	/* allocate one page */
-	r = NtAllocateVirtualMemory(context->process, &addr, 0, &sz,
-				MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
-	if (r != STATUS_SUCCESS)
-		return r;
-	*vdso = addr;
-
-	/*
-	 * write int80 instruction to it
-	 * FIXME:
-	 *  - VDSO is in ELF format, so needs an ELF header
-	 *  - place high in memory
-	 */
-	r = NtWriteVirtualMemory(context->process, addr,
-				 code, sizeof code, &sz);
-
-	/* make it read-only */
-	sz = 0x1000;
-	r = NtProtectVirtualMemory(context->process, &addr, &sz,
-				PAGE_EXECUTE_READ, &old_prot);
-	if (r != STATUS_SUCCESS)
-		return r;
-
-	dprintf("VDSO constructed at %p\n", *vdso);
-
-	return 0;
-}
-
-/* stack:
-	argc
-	argv[0]
-	...
-	argv[argc]
-	env[0]
-	...
-	env[n]
-	NULL
-	av[0]
-	...
-	av[n]
-	NULL
-*/
-NTSTATUS setup_stack(struct process *context,
-		void *stack, size_t stack_size,
-		char **argv, char **env,
-		struct module_info *m,
-		struct module_info *interp)
-{
-	Elf32Aux aux[30];
-	int n = 0;
-	int i;
-	char *p;
-	void **init_stack;
-	int pointer_space;
-	int string_space;
-	int offset;
-	BYTE *addr;
-	ULONG sz;
-	NTSTATUS r;
-	void *vdso = NULL;
-	void *entry_point;
-
-	r = alloc_vdso(context, &vdso);
-	if (r != STATUS_SUCCESS)
-		return r;
-
-	entry_point = (void*) m->base - m->min_vaddr + m->ehdr.e_entry;
-
-	memset(&aux, 0, sizeof aux);
-	aux[n].a_type = AT_PHDR;
-	aux[n++].a_value = (int)&((BYTE*)m->base)[m->ehdr.e_phoff];
-	aux[n].a_type = AT_PHENT;
-	aux[n++].a_value = sizeof (Elf32_Phdr);
-	aux[n].a_type = AT_PHNUM;
-	aux[n++].a_value = m->ehdr.e_phnum;
-	aux[n].a_type = AT_BASE;	/* interpreter (libc) address */
-	aux[n++].a_value = (int) interp->base;
-	aux[n].a_type = AT_FLAGS;
-	aux[n++].a_value = 0;
-	aux[n].a_type = AT_PAGESZ;
-	aux[n++].a_value = pagesize;
-	aux[n].a_type = AT_ENTRY;
-	aux[n++].a_value = (int)m->entry_point;
-	aux[n].a_type = AT_UID;
-	aux[n++].a_value = context->uid;
-	aux[n].a_type = AT_EUID;
-	aux[n++].a_value = context->euid;
-	aux[n].a_type = AT_GID;
-	aux[n++].a_value = context->gid;
-	aux[n].a_type = AT_EGID;
-	aux[n++].a_value = context->egid;
-	aux[n].a_type = AT_SECURE;
-	aux[n++].a_value = 0;
-	aux[n].a_type = AT_SYSINFO;
-	aux[n++].a_value = (int) vdso;
-	assert(n <= sizeof aux/sizeof aux[0]);
-
-	dprintf("entry is %p\n", m->entry_point);
-
-	/* entry, &argc, argv[0..argc-1], NULL, env[0..], NULL, auxv[0..], NULL */
-	int argc = strv_count(argv);
-	pointer_space = (5 + argc
-			   + strv_count(env)
-			   + auxv_count(aux)*2);
-	pointer_space *= sizeof (void*);
-
-	/* env space rounded */
-	string_space = (strv_length(argv) + strv_length(env) + 3) & ~3;
-
-	dprintf("%08x bytes for strings\n", string_space);
-
-	/*
-	 * Construct stack in the heap then
-	 * write everything to the client in one go
-	 */
-	p = malloc(pointer_space + string_space);
-	if (!p)
-		return STATUS_NO_MEMORY;
-	n = 0;
-
-	/* base address on local heap */
-	init_stack = (void**) p;
-
-	/* base address in client address space */
-	addr = (BYTE*) stack + stack_size - (pointer_space + string_space);
-
-	/* offset from base address */
-	offset = pointer_space;
-
-	/* copy argc, argv arrays onto the allocated memory */
-	init_stack[n++] = (void*) argc;
-	for (i = 0; argv[i]; i++)
-	{
-		dprintf("adding arg %s at %p\n", argv[i], &addr[offset]);
-		init_stack[n++] = &addr[offset];
-		strcpy(&p[offset], argv[i]);
-		offset += strlen(argv[i]) + 1;
-	}
-	init_stack[n++] = NULL;
-
-	/* gcc optimizes out these assignments if volatile is not used */
-	for (i = 0; env[i]; i++)
-	{
-		dprintf("adding env %s at %p\n", env[i], &addr[offset]);
-		init_stack[n++] = &addr[offset];
-		strcpy(&p[offset], env[i]);
-		offset += strlen(env[i]) + 1;
-	}
-	init_stack[n++] = NULL;
-
-	/* set the auxilary vector */
-	for (i = 0; aux[i].a_type; i++)
-	{
-		init_stack[n++] = (void*) aux[i].a_type;
-		init_stack[n++] = (void*) aux[i].a_value;
-	}
-
-	init_stack[n++] = NULL;
-
-	sz = (pointer_space + string_space);
-	r = NtWriteVirtualMemory(context->process, addr,
-				 p, sz, &sz);
-
-	free(p);
-	if (r != STATUS_SUCCESS)
-	{
-		printf("NtWriteVirtualMemory failed (r=%08lx %s)\n",
-			r, ntstatus_to_string(r));
-		return r;
-	}
-
-	context->regs.Esp = (ULONG) addr;
-
-	return STATUS_SUCCESS;
-}
-
 struct process *alloc_process(void)
 {
 	struct process *context;
@@ -927,9 +597,10 @@ void purge_address_space(void)
 
 int do_exec(const char *filename, char **argv, char **envp)
 {
-	struct module_info exe = {0};
-	struct module_info interp = {0};
-	int exe_fd = -1, interp_fd = -1, r;
+	const char *interpreter = NULL;
+	struct elf_module *exe = NULL;
+	struct elf_module *interp = NULL;
+	int r;
 
 	dprintf("exec %s\n", filename);
 	dprintf("argv:\n");
@@ -938,26 +609,25 @@ int do_exec(const char *filename, char **argv, char **envp)
 	dump_string_list(envp);
 
 	/* load the elf object */
-	exe_fd = load_module(&exe, filename);
-	if (exe_fd < 0)
+	exe = elf_module_load(filename);
+	if (!exe)
 	{
-		dprintf("load_module(%s) failed (r=%d)\n",
-			filename, exe_fd);
-		r = exe_fd;
+		dprintf("elf_module_load(%s) failed\n", filename);
+		r = -1;
 		goto end;
 	}
 
 	/*
 	 * load interpreter (in case of dynamically linked object)
 	 */
-	if (exe.interpreter[0])
+	interpreter = elf_interpreter_get(exe);
+	if (interpreter)
 	{
-		interp_fd = load_module(&interp, exe.interpreter);
-		if (interp_fd < 0)
+		interp = elf_module_load(interpreter);
+		if (!interp)
 		{
-			dprintf("load_module(%s) failed (r=%d)\n",
-				exe.interpreter, interp_fd);
-			r = interp_fd;
+			dprintf("elf_module_load(%s) failed\n", interpreter);
+			r = -1;
 			goto end;
 		}
 	}
@@ -969,16 +639,16 @@ int do_exec(const char *filename, char **argv, char **envp)
 	 */
 	purge_address_space();
 
-	r = map_elf_object(&exe, exe_fd);
+	r = elf_object_map(current, exe);
 	if (r < 0)
 	{
 		dprintf("failed to map executable\n");
 		goto end;
 	}
 
-	if (interp_fd >= 0)
+	if (interp)
 	{
-		r = map_elf_object(&interp, interp_fd);
+		r = elf_object_map(current, interp);
 		if (r < 0)
 		{
 			dprintf("failed to map interpreter\n");
@@ -1013,29 +683,24 @@ int do_exec(const char *filename, char **argv, char **envp)
 	current->stack_info.StackLimit = (void*) p;
 
 	/* copy startup information to the stack */
-	r = setup_stack(current, p, sz, argv, envp, &exe, &interp);
-	if (r != STATUS_SUCCESS)
-	{
-		r = -_L(EPERM);
+	r = elf_stack_setup(current, p, sz, argv, envp, exe, interp);
+	if (r < 0)
 		goto end;
-	}
 
 	/*
 	 * libc makes assumptions about registers being zeroed
 	 * ebx should be delta from load address to link address
 	 */
-	if (interp_fd >= 0)
-		current->regs.Eip = (ULONG) interp.entry_point;
+	if (interp)
+		current->regs.Eip = elf_entry_point_get(interp);
 	else
-		current->regs.Eip = (ULONG) exe.entry_point;
+		current->regs.Eip = elf_entry_point_get(exe);
 
 	dprintf("Eip = %08lx\n", current->regs.Eip);
 	dprintf("Esp = %08lx\n", current->regs.Esp);
 end:
-	if (exe_fd)
-		do_close(exe_fd);
-	if (interp_fd)
-		do_close(interp_fd);
+	elf_object_free(exe);
+	elf_object_free(interp);
 	return r;
 }
 
@@ -1236,6 +901,19 @@ void copy_fd_set(struct process *to, struct process *from)
 	}
 }
 
+void close_fd_set(struct process *p)
+{
+	int i;
+
+	for (i = 0; i < MAX_FDS; i++)
+	{
+		filp *fp = p->handles[i].fp;
+		if (fp)
+			process_close_fd(p, i);
+		p->handles[i].fp = NULL;
+	}
+}
+
 int sys_fork(void)
 {
 	HANDLE parent = NULL;
@@ -1282,6 +960,17 @@ int sys_fork(void)
 		return -_L(EPERM);
 	}
 
+	/*
+	 * shared memory mappings are marked to be dropped (by ViewUnmap)
+	 * during a fork copy and remap them
+	 *
+	 * Note for the future (i.e. COW): The stack must be mapped.
+	 * Without doing this, the process becomes unkillable in WinXP,
+	 * probably because the kernel cannot push an exception CONTEXT
+	 * onto the user stack and gives up in a bad state...
+	 */
+	vm_mappings_copy(context, current);
+
 	/* duplicate the stack info */
 	context->stack_info = current->stack_info;
 
@@ -1319,6 +1008,10 @@ int sys_fork(void)
 			r, ntstatus_to_string(r));
 		goto out;
 	}
+
+	dprintf("fork: created thread %p:%p\n",
+		context->id.UniqueProcess,
+		context->id.UniqueThread);
 
 	/* return the new PID */
 	context->regs.Eax = 0;
@@ -1370,6 +1063,8 @@ int sys_exit(int exit_code)
 	current->exit_code = exit_code;
 	current->state = thread_terminated;
 
+	close_fd_set(current);
+
 	process_signal(current->parent, _L(SIGCHLD));
 
 	if (!current->parent)
@@ -1408,22 +1103,31 @@ int sys_pread64(int fd, void *addr, size_t length, loff_t ofs)
 
 	fp = fdi->fp;
 
+	if (!fp->ops->fn_read)
+		return -_L(EPERM);
+
 	return fp->ops->fn_read(fp, addr, length, &ofs,
 				 !(fdi->flags & FD_NONBLOCKING));
 }
 
 int sys_write(int fd, void *addr, size_t length)
 {
+	struct fdinfo *fdi;
+	filp *fp;
+
 	dprintf("write(%d,%p,%d)\n", fd, addr, length);
 
-	filp *fp = filp_from_fd(fd);
-	if (!fp)
+	fdi = fdinfo_from_fd(fd);
+	if (!fdi)
 		return -_L(EBADF);
+
+	fp = fdi->fp;
 
 	if (!fp->ops->fn_write)
 		return -_L(EPERM);
 
-	return fp->ops->fn_write(fp, addr, length, &fp->offset);
+	return fp->ops->fn_write(fp, addr, length, &fp->offset,
+				 !(fdi->flags & FD_NONBLOCKING));
 }
 
 void winfs_init(void);
@@ -1484,7 +1188,7 @@ static filp *open_filp(const char *file, int flags, int mode, int follow_links)
 	return fp;
 }
 
-static int do_open(const char *file, int flags, int mode)
+int do_open(const char *file, int flags, int mode)
 {
 	filp *fp;
 	int r;
@@ -1517,13 +1221,15 @@ int add_dirent(void *ptr, const char* entry, size_t name_len,
 		 int avail, unsigned long next_offset, char type)
 {
 	struct linux_dirent *de;
-	int len = (name_len + sizeof *de + 4) & ~3;
+	int len = (name_len + 2 + sizeof *de + 3) & ~3;
 	int r;
 	char *t;
 
 	de = alloca(len);
 	if (len > avail)
 		return -1;
+
+	memset(de, 0, len);
 
 	de->d_ino = 0;
 	de->d_off = next_offset;
@@ -1564,24 +1270,20 @@ int add_dirent64(void *ptr, const char* entry, size_t name_len,
 	struct linux_dirent64 *de;
 	int r;
 
-	/* add a trailing NUL and round up to multiple of 4 */
-	int len = (name_len + sizeof *de + 5) & ~3;
-	char *t;
-
+	/* add a trailing NUL and round up to multiple of 8 */
+	int len = (name_len + 1 + sizeof *de + 7) & ~7;
 	if (len > avail)
 		return -1;
 
 	de = alloca(len);
 
+	memset(de, 0, len);
+
 	de->d_ino = 0;
 	de->d_off = next_offset;
-	de->d_type = 0;
+	de->d_type = type;
 	de->d_reclen = len;
 	memcpy(de->d_name, entry, name_len);
-	de->d_name[name_len] = 0;
-	de->d_name[name_len+1] = type;
-	t = (char*) de;
-	t[len - 1] = type;
 
 	dprintf("added %s\n", de->d_name);
 
@@ -1608,12 +1310,15 @@ int sys_getdents64(int fd, struct linux_dirent *de, unsigned int count)
 	return fp->ops->fn_getdents(fp, de, count, &add_dirent64);
 }
 
-/* read client file handle into "kernel" memory */
-int kread(int fd, void *buf, size_t size, off_t off)
+static WINAPI void kread_complete(DWORD err, DWORD sz, LPOVERLAPPED ov)
 {
-	LARGE_INTEGER pos;
-	LARGE_INTEGER out;
-	DWORD bytesRead = 1;
+}
+
+/* read client file handle into "kernel" memory */
+int kread(int fd, void *buf, size_t size, loff_t ofs)
+{
+	OVERLAPPED ov;
+	DWORD bytesRead = 0;
 	BOOL r;
 	filp *fp;
 
@@ -1621,15 +1326,33 @@ int kread(int fd, void *buf, size_t size, off_t off)
 	if (!fp)
 		return -_L(EBADF);
 
-	pos.QuadPart = off;
+	memset(&ov, 0, sizeof ov);
+	ov.OffsetHigh = (ofs >> 32);
+	ov.Offset = (ofs & 0xffffffff);
 
-	r = SetFilePointerEx(fp->handle, pos, &out, FILE_BEGIN);
-	if (!r)
-		return -_L(EIO);
+	do {
+		r = ReadFileEx(fp->handle, buf, size, &ov, &kread_complete);
+		if (!r)
+		{
+			DWORD err = GetLastError();
+			if (err == ERROR_HANDLE_EOF)
+			{
+				LARGE_INTEGER fileSize;
+				if (!GetFileSizeEx(fp->handle, &fileSize))
+					return -_L(EIO);
+				size = (fileSize.QuadPart - ofs);
+				continue;
+			}
+			dprintf("read failed, %ld\n", err);
+			return -_L(EIO);
+		}
+	} while (0);
 
-	r = ReadFile(fp->handle, buf, size, &bytesRead, NULL);
-	if (!r)
+	if (!GetOverlappedResult(fp->handle, &ov, &bytesRead, TRUE))
+	{
+		dprintf("read failed, %ld\n", GetLastError());
 		return -_L(EIO);
+	}
 
 	return bytesRead;
 }
@@ -1885,7 +1608,7 @@ static int sys_rmdir(void *ptr)
 	return r;
 }
 
-int do_close(int fd)
+int process_close_fd(struct process *p, int fd)
 {
 	filp *fp;
 
@@ -1906,10 +1629,15 @@ int do_close(int fd)
 		memset(fp, 0xff, sizeof *fp);
 		free(fp);
 	}
-	current->handles[fd].fp = NULL;
-	current->handles[fd].flags = 0;
+	p->handles[fd].fp = NULL;
+	p->handles[fd].flags = 0;
 
 	return 0;
+}
+
+int do_close(int fd)
+{
+	return process_close_fd(current, fd);
 }
 
 int sys_close(int fd)
@@ -2161,201 +1889,9 @@ int sys_chdir(const void *ptr)
 	return r;
 }
 
-static int get_protection(int prot)
-{
-	DWORD Protection = PAGE_NOACCESS;
-	if (prot & _l_PROT_EXEC)
-		Protection = PAGE_EXECUTE_READWRITE;
-	else if (prot & _l_PROT_WRITE)
-		Protection = PAGE_READWRITE;
-	else if (prot & _l_PROT_READ)
-		Protection = PAGE_READONLY;
-	return Protection;
-}
-
-/*
- * Move state of non-overlapping pages from
- * free to committed
- */
-static PVOID allocate_pages(void *addr, size_t len, int prot)
-{
-	DWORD AllocationType = MEM_RESERVE | MEM_COMMIT;
-	DWORD Protection;
-	ULONG Size;
-	PVOID Address;
-	NTSTATUS r;
-
-	Protection = get_protection(prot);
-
-	Address = (void*)((int)addr & ~0xffff);
-	Size = len;
-	Size += ((int)addr - (int)Address);
-	Size = (Size + 0xffff) & ~0xffff;
-
-	dprintf("NtAllocateVirtualMemory(%p,%08lx,%08lx,%08lx)\n",
-		Address, Size, AllocationType, Protection);
-
-	r = NtAllocateVirtualMemory(current->process, &Address,
-				0, &Size, AllocationType, Protection);
-	if (r != STATUS_SUCCESS)
-	{
-		printf("NtAllocateVirtualMemory failed (%08lx) %s\n",
-			r, ntstatus_to_string(r));
-		return _l_MAP_FAILED;
-	}
-	dprintf("NtAllocateVirtualMemory -> Address=%p Size=%08lx\n",
-		Address, Size);
-
-	return Address;
-}
-
-/*
- * allocate_fragmented_pages()
- *
- * TODO: This should be atomic.
- * if we fail in the middle for any reason,
- *   any mappings created should be destroyed
- */
-static PVOID allocate_fragmented_pages(void *addr, size_t len, int prot)
-{
-	MEMORY_BASIC_INFORMATION info;
-	PVOID Address;
-	ULONG Size;
-	ULONG BlockSize;
-	PVOID Base = addr;
-	NTSTATUS r;
-	DWORD Protection = get_protection(prot);
-
-	dprintf("Allocating fragmented pages at %p len=%08x\n", addr, len);
-
-	while (len > 0)
-	{
-		/* find current state of memory */
-		Address = addr;
-		r = NtQueryVirtualMemory(current->process, Address,
-					MemoryBasicInformation,
-					&info, sizeof info, &Size);
-		if (r != STATUS_SUCCESS)
-		{
-			fprintf(stderr, "NtQueryVirtualMemory failed r=%08x %s\n",
-				r, ntstatus_to_string(r));
-			exit(1);
-		}
-
-		if (len < info.RegionSize)
-			BlockSize = len;
-		else
-			BlockSize = info.RegionSize;
-
-		/* fill in what's not allocated */
-		if (info.State == MEM_FREE)
-		{
-			void *p = allocate_pages(Address, BlockSize, prot);
-			if (p == _l_MAP_FAILED)
-				return p;
-		}
-		else
-		{
-			ULONG old_prot = 0;
-			void *p = addr;
-			if (addr != Address)
-				BlockSize -= (0x10000 - ((char*)addr - (char*)Address));
-			dprintf("Adjusting protection at %p %08lx\n",
-				 p, BlockSize);
-			r = NtProtectVirtualMemory(current->process, &p, &BlockSize,
-						Protection, &old_prot);
-			if (r != STATUS_SUCCESS)
-			{
-				dprintf("NtProtectVirtualMemory failed %08lx\n", r);
-				return _l_MAP_FAILED;
-			}
-		}
-
-		/* next */
-		len -= BlockSize;
-		addr = (char*) addr + BlockSize;
-	}
-
-	return Base;
-}
-
-/*
- * TODO
- *  - return error codes correctly
- *  - mmap vs. nt mapping size differences
- *  - handle state change differences
- *  - deal with MAP_FIXED correctly
- */
 void* sys_mmap(void *addr, ULONG len, int prot, int flags, int fd, off_t offset)
 {
-	NTSTATUS r;
-	PVOID Address;
-	MEMORY_BASIC_INFORMATION info;
-	ULONG Size = 0;
-
-	dprintf("mmap(%p,%08lx,%08x,%08x,%d,%08lx)\n",
-		addr, len, prot, flags, fd, offset);
-
-	if (fd != -1)
-	{
-		fprintf(stderr, "mmap'ing files not yet supported\n");
-		return (void*) -_L(EINVAL);
-	}
-
-	/* find current state of memory */
-	Address = (void*)((int)addr & ~0xffff);
-	r = NtQueryVirtualMemory(current->process, Address,
-				MemoryBasicInformation,
-				&info, sizeof info, &Size);
-	if (r != STATUS_SUCCESS)
-	{
-		fprintf(stderr, "NtQueryVirtualMemory failed r=%08x %s\n",
-			r, ntstatus_to_string(r));
-		exit(1);
-	}
-
-	if (!(flags & _l_MAP_ANONYMOUS))
-	{
-		fprintf(stderr, "File mapping not supported yet\n");
-		exit(1);
-	}
-
-	/*
-	 * Check if something is allocated at this address
-	 *
-	 * Can only change the protection within an allocated block.
-	 * Crossing allocation boundaries will cause a
-	 * STATUS_CONFLICTING_ADDRESS error.
-	 */
-	if (info.RegionSize < len ||
-	    info.State != MEM_FREE)
-	{
-		if (!(flags & _l_MAP_FIXED))
-		{
-			Address = allocate_pages(0, len, prot);
-		}
-		else
-		{
-			/* partial allocate required */
-			Address = allocate_fragmented_pages(addr, len, prot);
-		}
-	}
-	else
-	{
-		/* no conflicts, go */
-		Address = allocate_pages(addr, len, prot);
-	}
-
-	if (Address == _l_MAP_FAILED)
-		return Address;
-
-	/* handle case where no address was specificied */
-	if (!addr)
-		addr = Address;
-
-	dprintf("mmap -> %p\n", addr);
-
-	return addr;
+	return vm_process_map(current, addr, len, prot, flags, fd, offset);
 }
 
 int sys_gettimeofday(void *arg)
@@ -2735,14 +2271,13 @@ int sys_fstat64(int fd, struct stat64 *statbuf)
 int sys_set_thread_area(void *ptr)
 {
 	struct user_desc desc;
-	NTSTATUS r;
-	ULONG sz = 0;
+	int r;
 
 	dprintf("set_thread_area(%p)\n", ptr);
 
-	r = NtReadVirtualMemory(current->process, ptr, &desc, sizeof desc, &sz);
-	if (r != STATUS_SUCCESS)
-		return -_L(EFAULT);
+	r = current->ops->memcpy_from(&desc, ptr, sizeof desc);
+	if (r < 0)
+		return r;
 
 	/*
 	 * Check we can deal with this thread area
@@ -2782,10 +2317,9 @@ int sys_set_thread_area(void *ptr)
 	/*
 	 * copy it back to userland
 	 */
-	r = NtWriteVirtualMemory(current->process, ptr,
-				 &desc, sizeof desc.entry_number, &sz);
-	if (r != STATUS_SUCCESS)
-		return -1;
+	r = current->ops->memcpy_to(ptr, &desc, sizeof desc);
+	if (r < 0)
+		return r;
 
 	return 0;
 }
@@ -3722,237 +3256,6 @@ int do_syscall(int n, int a1, int a2, int a3, int a4, int a5, int a6)
 	return r;
 }
 
-unsigned int round_down_to_page(unsigned int addr)
-{
-	return addr &= ~pagemask;
-}
-
-unsigned int round_up_to_page(unsigned int addr)
-{
-	return (addr + pagemask) & ~pagemask;
-}
-
-int mmap_flags_from_elf(int flags)
-{
-	int mapflags = 0;
-
-	if (flags & PF_X)
-		mapflags |= _l_PROT_EXEC;
-	if (flags & PF_W)
-		mapflags |= _l_PROT_WRITE;
-	if (flags & PF_R)
-		mapflags |= _l_PROT_READ;
-	return mapflags;
-}
-
-void print_map_flags(int flags)
-{
-	dprintf("map -> %s %s %s\n",
-		flags & _l_PROT_READ ? "PROT_READ" : "",
-		flags & _l_PROT_WRITE ? "PROT_WRITE" : "",
-		flags & _l_PROT_EXEC ? "PROT_EXEC" : "");
-}
-
-int map_elf_object(struct module_info *m, int fd)
-{
-	int i;
-	int r;
-
-	dprintf("to load (%d)\n", m->num_to_load);
-	dprintf("%-8s %-8s %-8s %-8s\n", "vaddr", "memsz", "offset", "filesz");
-	for (i = 0; i < m->num_to_load; i++)
-	{
-		m->min_vaddr = MIN(round_down_to_page(m->to_load[i].p_vaddr), m->min_vaddr);
-		m->max_vaddr = MAX(round_up_to_page(m->to_load[i].p_vaddr + m->to_load[i].p_memsz), m->max_vaddr);
-
-		dprintf("%08x %08x %08x %08x\n",
-			m->to_load[i].p_vaddr, m->to_load[i].p_memsz,
-			m->to_load[i].p_offset, m->to_load[i].p_filesz);
-	}
-
-	dprintf("vaddr -> %08x-%08x\n", m->min_vaddr, m->max_vaddr);
-
-	/* reserve memory for image */
-	m->base = sys_mmap((void*)m->min_vaddr, m->max_vaddr - m->min_vaddr,
-			_l_PROT_NONE, _l_MAP_ANONYMOUS|_l_MAP_PRIVATE, -1, 0);
-	if (m->base == _l_MAP_FAILED)
-	{
-		dprintf("mmap failed\n");
-		goto error;
-	}
-	dprintf("base = %p\n", m->base);
-
-	for (i = 0; i < m->num_to_load; i++)
-	{
-		int mapflags = mmap_flags_from_elf(m->to_load[i].p_flags);
-		void *p;
-		unsigned int vaddr = round_down_to_page(m->to_load[i].p_vaddr);
-		unsigned int vaddr_offset = (m->to_load[i].p_vaddr & pagemask);
-		unsigned int memsz = round_up_to_page(vaddr_offset + m->to_load[i].p_memsz);
-		unsigned int max_addr;
-
-		print_map_flags(mapflags);
-
-		p = (void*)(m->base - m->min_vaddr + vaddr);
-
-		dprintf("map at %p, offset %08x sz %08x\n", p, vaddr, memsz);
-		/*
-		 * Map anonymous memory then read the data in
-		 * rather than mapping the file directly.
-		 *
-		 * The windows page granularity is different to that on Linux.
-		 * The pages may need to be modified to apply relocations.
-		 *
-		 * nb. need MAP_FIXED to blow away our old mapping
-		 */
-		p = sys_mmap(p, memsz, _l_PROT_READ | _l_PROT_WRITE | _l_PROT_EXEC,
-			 _l_MAP_FIXED|_l_MAP_PRIVATE|_l_MAP_ANONYMOUS, -1, 0);
-		if (p == _l_MAP_FAILED)
-		{
-			fprintf(stderr, "mmap failed (%d)\n", -(int)p);
-			goto error;
-		}
-
-		p = (void*)(m->base - m->min_vaddr + m->to_load[i].p_vaddr);
-		dprintf("pread %08x bytes from %08x to %p\n",
-			m->to_load[i].p_filesz, m->to_load[i].p_offset, p);
-		r = sys_pread64(fd, p, m->to_load[i].p_filesz, m->to_load[i].p_offset);
-		if (r != m->to_load[i].p_filesz)
-		{
-			fprintf(stderr, "read failed (%08x != %08x)\n",
-				m->to_load[i].p_filesz, r);
-			goto error;
-		}
-
-		/* remember highest address we mapped, use it for brk */
-		max_addr = m->to_load[i].p_vaddr + m->to_load[i].p_memsz;
-		max_addr = round_up(max_addr, pagesize);
-		if (current->brk < max_addr)
-			current->brk = max_addr;
-		dprintf("brk at %08x\n", current->brk);
-	}
-
-	m->entry_point = (void*) m->base - m->min_vaddr + m->ehdr.e_entry;
-
-	return 0;
-error:
-	return -1;
-}
-
-int load_module(struct module_info *m, const char *path)
-{
-	bool dynamic_seen = false;
-	int fd = -1;
-	int r;
-	int i;
-
-	m->base = _l_MAP_FAILED;
-	m->min_vaddr = 0xfffff000;
-	m->max_vaddr = 0;
-
-	fd = do_open(path, _l_O_RDONLY, 0);
-	if (fd < 0)
-	{
-		dprintf("open() failed\n");
-		goto error;
-	}
-
-	r = kread(fd, &m->ehdr, sizeof m->ehdr, 0);
-	if (r < 0)
-	{
-		dprintf("read() failed\n");
-		goto error;
-	}
-
-	if (memcmp(&m->ehdr, ELFMAG, SELFMAG))
-	{
-		dprintf("not an ELF file\n");
-		goto error;
-	}
-
-	if (m->ehdr.e_type != ET_EXEC &&
-		m->ehdr.e_type != ET_REL &&
-		m->ehdr.e_type != ET_DYN)
-	{
-		dprintf("not an ELF executable\n");
-		goto error;
-	}
-
-	if (m->ehdr.e_machine != EM_386)
-	{
-		dprintf("not an i386 ELF executable\n");
-		goto error;
-	}
-
-	dprintf("opened ELF file, entry=%08x\n", m->ehdr.e_entry);
-
-	dprintf("Program headers (%d)\n", m->ehdr.e_phnum);
-	dprintf("     %-15s %-8s %-8s %-8s %-8s %-8s %-8s\n",
-		"type", "offset", "vaddr", "filesz",
-		"memsz", "flags", "align");
-
-	for (i = 0; i < m->ehdr.e_phnum; i++)
-	{
-		Elf32_Phdr phdr;
-		r = kread(fd, &phdr, sizeof phdr,
-			 m->ehdr.e_phoff + i * sizeof phdr);
-		if (r < 0)
-			break;
-
-		dprintf("[%2d] %08x %08x %08x %08x %08x %08x\n", i,
-			phdr.p_offset,
-			phdr.p_vaddr, phdr.p_filesz, phdr.p_memsz,
-			phdr.p_flags, phdr.p_align);
-
-		/* load segments */
-		if (phdr.p_type == PT_LOAD)
-		{
-			if (m->num_to_load >= sizeof m->to_load/
-						sizeof m->to_load[0])
-			{
-				dprintf("too many PT_LOAD entries\n");
-				goto error;
-			}
-
-			memcpy(&m->to_load[m->num_to_load], &phdr, sizeof phdr);
-			m->num_to_load++;
-		}
-
-		if (phdr.p_type == PT_DYNAMIC)
-		{
-			if (dynamic_seen)
-			{
-				fprintf(stderr, "two PT_DYNAMIC sections\n");
-				goto error;
-			}
-			dynamic_seen = true;
-		}
-		if (phdr.p_type == PT_INTERP)
-		{
-			size_t sz = phdr.p_filesz;
-
-			if (sz > sizeof m->interpreter - 1)
-			{
-				dprintf("interpreter name too big\n");
-				goto error;
-			}
-			r = kread(fd, &m->interpreter, sz, phdr.p_offset);
-			if (r != sz)
-			{
-				dprintf("interpreter name read failed\n");
-				goto error;
-			}
-			m->interpreter[sz] = 0;
-		}
-	}
-
-	return fd;
-error:
-	close(fd);
-	return -1;
-}
-
-
 PULONG getwreg(int reg)
 {
 	switch (reg & 7)
@@ -4015,77 +3318,69 @@ void handle_mov_reg_to_seg_reg(uint8_t modrm)
 	}
 }
 
-NTSTATUS handle_mov_eax_to_gs_addr(void)
+int handle_mov_eax_to_gs_addr(void)
 {
 	unsigned int offset = 0;
-	NTSTATUS r;
-	ULONG sz = 0;
-	BYTE *tls;
+	int r;
+	unsigned char *tls;
+	char *eip = (char*) current->regs.Eip;
 
-	r = NtReadVirtualMemory(current->process,
-				(char*) current->regs.Eip + 2,
-				&offset, sizeof offset, &sz);
-	if (r != STATUS_SUCCESS)
+	r = current->ops->memcpy_from(&offset, eip + 2, sizeof offset);
+	if (r < 0)
 		return r;
 
-	tls = (BYTE*) current->vtls[current->vtls_selector].base_addr;
+	tls = (unsigned char*) current->vtls[current->vtls_selector].base_addr;
 	tls += offset;
-	r = NtWriteVirtualMemory(current->process, tls,
-				&current->regs.Eax, 4, &sz);
-	if (r != STATUS_SUCCESS)
+	r = current->ops->memcpy_to(tls, &current->regs.Eax, 4);
+	if (r < 0)
+		return r;
+
+	current->regs.Eip += 6;
+
+	return 0;
+}
+
+int handle_mov_gs_addr_to_eax(void)
+{
+	unsigned int offset = 0;
+	int r;
+	unsigned char *tls;
+	char *eip = (char*) current->regs.Eip;
+
+	r = current->ops->memcpy_from(&offset, eip + 2, sizeof offset);
+	if (r < 0)
+		return r;
+
+	tls = (unsigned char*) current->vtls[current->vtls_selector].base_addr;
+	tls += offset;
+	r = current->ops->memcpy_from(&current->regs.Eax, tls, 4);
+	if (r < 0)
 		return r;
 
 	current->regs.Eip += 6;
 	return r;
 }
 
-NTSTATUS handle_mov_gs_addr_to_eax(void)
+int handle_movl_to_gs_reg(void)
 {
-	unsigned int offset = 0;
-	NTSTATUS r;
-	ULONG sz = 0;
-	BYTE *tls;
-
-	r = NtReadVirtualMemory(current->process,
-				(char*) current->regs.Eip + 2,
-				&offset, sizeof offset, &sz);
-	if (r != STATUS_SUCCESS)
-		return r;
-
-	tls = (BYTE*) current->vtls[current->vtls_selector].base_addr;
-	tls += offset;
-	r = NtReadVirtualMemory(current->process, tls,
-				&current->regs.Eax, 4, &sz);
-	if (r != STATUS_SUCCESS)
-		return r;
-
-	current->regs.Eip += 6;
-	return r;
-}
-
-NTSTATUS handle_movl_to_gs_reg(void)
-{
-	NTSTATUS r;
-	ULONG sz = 0;
-	BYTE *tls;
+	int r;
+	unsigned char *tls;
 	struct {
 		int8_t offset;
 		uint32_t value;
 	} __attribute__((__packed__)) buf;
+	char *eip = (char*) current->regs.Eip;
 
-	r = NtReadVirtualMemory(current->process,
-				(char*) current->regs.Eip + 2,
-				&buf, sizeof buf, &sz);
-	if (r != STATUS_SUCCESS)
+	r = current->ops->memcpy_from(&buf, eip + 2, sizeof buf);
+	if (r < 0)
 		return r;
 
-	tls = (BYTE*) current->vtls[current->vtls_selector].base_addr;
+	tls = (unsigned char*) current->vtls[current->vtls_selector].base_addr;
 	tls += current->regs.Eax;
 	tls += buf.offset;
 
-	r = NtWriteVirtualMemory(current->process, tls,
-				&buf.value, sizeof buf.value, &sz);
-	if (r != STATUS_SUCCESS)
+	r = current->ops->memcpy_to(tls, &buf.value, sizeof buf.value);
+	if (r < 0)
 		return r;
 
 	current->regs.Eip += 7;
@@ -4094,34 +3389,31 @@ NTSTATUS handle_movl_to_gs_reg(void)
 
 NTSTATUS handle_imm32_to_gs_address(void)
 {
-	NTSTATUS r;
-	ULONG sz = 0;
-	BYTE *tls;
+	int r;
+	unsigned char *tls;
 	struct {
 		uint8_t modrm;
 		int8_t offset;
 		uint32_t value;
 	} __attribute__((__packed__)) buf;
 	uint32_t value;
+	char *eip = (char*) current->regs.Eip;
 
-	r = NtReadVirtualMemory(current->process,
-				(char*) current->regs.Eip + 2,
-				&buf, sizeof buf, &sz);
-	if (r != STATUS_SUCCESS)
+	r = current->ops->memcpy_from(&buf, eip + 2, sizeof buf);
+	if (r < 0)
 		return r;
 
 	if (buf.modrm != 0x3d)
 	{
 		fprintf(stderr, "unhandled instruction\n");
-		return STATUS_UNSUCCESSFUL;
+		return -1;
 	}
 
-	tls = (BYTE*) current->vtls[current->vtls_selector].base_addr;
+	tls = (unsigned char*) current->vtls[current->vtls_selector].base_addr;
 	tls += buf.offset;
 
-	r = NtReadVirtualMemory(current->process, tls,
-				&value, sizeof value, &sz);
-	if (r != STATUS_SUCCESS)
+	r = current->ops->memcpy_from(&value, tls, sizeof value);
+	if (r < 0)
 		return r;
 
 	/* set the flags */
@@ -4139,72 +3431,64 @@ NTSTATUS handle_imm32_to_gs_address(void)
 
 NTSTATUS handle_reg_indirect_to_read(void)
 {
-	NTSTATUS r;
-	ULONG sz = 0;
-	BYTE *tls;
+	int r;
+	unsigned char *tls;
 	struct {
 		uint8_t modrm;
 	} buf;
-	ULONG *preg;
+	unsigned long *preg;
+	char *eip = (char*) current->regs.Eip;
 
-	r = NtReadVirtualMemory(current->process,
-				(char*) current->regs.Eip + 2,
-				&buf, sizeof buf, &sz);
-	if (r != STATUS_SUCCESS)
+	r = current->ops->memcpy_from(&buf, eip + 2, sizeof buf);
+	if (r < 0)
 		return r;
 
 	// 65 8b 38			mov    %gs:(%eax),%edi
-	tls = (BYTE*) current->vtls[current->vtls_selector].base_addr;
+	tls = (unsigned char*) current->vtls[current->vtls_selector].base_addr;
 
 	preg = getwreg(buf.modrm >> 3);
 
 	tls += getrm_value(buf.modrm);
-	r = NtReadVirtualMemory(current->process, tls,
-				preg, sizeof *preg, &sz);
-	if (r != STATUS_SUCCESS)
+	r = current->ops->memcpy_from(preg, tls, sizeof *preg);
+	if (r < 0)
 		return r;
 
 	current->regs.Eip += 3;
 
-	return r;
+	return 0;
 }
 
 NTSTATUS handle_reg_indirect_to_write(void)
 {
-	NTSTATUS r;
-	ULONG sz = 0;
-	BYTE *tls;
+	int r;
+	unsigned char *tls;
 	struct {
 		uint8_t modrm;
 	} buf;
-	ULONG *preg;
+	unsigned long *preg;
+	char *eip = (char*) current->regs.Eip;
 
-	r = NtReadVirtualMemory(current->process,
-				(char*) current->regs.Eip + 2,
-				&buf, sizeof buf, &sz);
-	if (r != STATUS_SUCCESS)
+	r = current->ops->memcpy_from(&buf, eip + 2, sizeof buf);
+	if (r < 0)
 		return r;
 
-	tls = (BYTE*) current->vtls[current->vtls_selector].base_addr;
+	tls = (unsigned char*) current->vtls[current->vtls_selector].base_addr;
 
 	preg = getwreg(buf.modrm >> 3);
 
 	tls += getrm_value(buf.modrm);
-	r = NtWriteVirtualMemory(current->process, tls,
-				preg, sizeof *preg, &sz);
-	if (r != STATUS_SUCCESS)
+	r = current->ops->memcpy_from(tls, preg, sizeof *preg);
+	if (r < 0)
 		return r;
 
 	current->regs.Eip += 3;
 
-	return r;
+	return 0;
 }
 
 static int emulate_instruction(unsigned char *buffer, CONTEXT *regs)
 {
 	int r;
-
-	return 0;
 
 	// 8e e8			mov    %eax,%gs
 	if (buffer[0] == 0x8e)
@@ -4216,34 +3500,34 @@ static int emulate_instruction(unsigned char *buffer, CONTEXT *regs)
 	else if (buffer[0] == 0x65 && buffer[1] == 0xa3)
 	{
 		r = handle_mov_eax_to_gs_addr();
-		if (r != STATUS_SUCCESS)
+		if (r < 0)
 			return 0;
 	}
 	else if (buffer[0] == 0x65 && buffer[1] == 0xa1)
 	{
 		r = handle_mov_gs_addr_to_eax();
-		if (r != STATUS_SUCCESS)
+		if (r < 0)
 			return 0;
 	}
 	// 65 c7 00 80 c4 1b 08		movl   $0x81bc480,%gs:(%eax)
 	else if (buffer[0] == 0x65 && buffer[1] == 0xc7)
 	{
 		r = handle_movl_to_gs_reg();
-		if (r != STATUS_SUCCESS)
+		if (r < 0)
 			return 0;
 	}
 	// 65 83 3d 0c 00 00 00 00    cmpl   $0x0,%gs:0xc
 	else if (buffer[0] == 0x65 && buffer[1] == 0x83)
 	{
 		r = handle_imm32_to_gs_address();
-		if (r != STATUS_SUCCESS)
+		if (r < 0)
 			return 0;
 	}
 	// 65 89 0b			mov    %ecx,%gs:(%ebx)
 	else if (buffer[0] == 0x65 && buffer[1] == 0x89)
 	{
 		r = handle_reg_indirect_to_write();
-		if (r != STATUS_SUCCESS)
+		if (r < 0)
 			return 0;
 	}
 	// 65 8b 03			mov    %gs:(%ebx),%eax
@@ -4251,9 +3535,11 @@ static int emulate_instruction(unsigned char *buffer, CONTEXT *regs)
 	else if (buffer[0] == 0x65 && buffer[1] == 0x8b)
 	{
 		r = handle_reg_indirect_to_read();
-		if (r != STATUS_SUCCESS)
+		if (r < 0)
 			return 0;
 	}
+	else
+		return 0;
 
 	return 1;
 }
@@ -4306,14 +3592,15 @@ static NTSTATUS OnDebuggerException(DEBUGEE_EVENT *event,
 	{
 		CONTEXT *regs = &context->regs;
 		unsigned char buffer[2];
-		ULONG sz = 0;
 		NTSTATUS r;
 
-		r = NtReadVirtualMemory(context->process, (void*) context->regs.Eip,
-					buffer, sizeof buffer, &sz);
-		if (r != STATUS_SUCCESS)
+		if (0 > vm_memcpy_from_process(context, buffer,
+					(void*) context->regs.Eip, sizeof buffer))
 		{
-			fprintf(stderr, "failed to read instruction\n");
+			r = STATUS_ACCESS_VIOLATION;
+			fprintf(stderr, "%08x:%08x failed to read instruction\n",
+				event->ClientId.UniqueProcess,
+				event->ClientId.UniqueThread);
 			goto fail;
 		}
 		if (buffer[0] == 0xcd && buffer[1] == 0x80)
@@ -4340,7 +3627,6 @@ static NTSTATUS OnDebuggerException(DEBUGEE_EVENT *event,
 			fprintf(stderr, "failed to set registers back\n");
 			return STATUS_UNSUCCESSFUL;
 		}
-
 	}
 	else
 	{
@@ -4426,6 +3712,9 @@ static NTSTATUS ReadDebugPort(HANDLE debugObject)
 	timeout.QuadPart = 0;
 	r = pDbgUiWaitStateChange(&event, &timeout);
 	if (r == STATUS_TIMEOUT)
+		return STATUS_SUCCESS;
+
+	if (r == STATUS_USER_APC)
 		return STATUS_SUCCESS;
 
 	if (r != STATUS_SUCCESS)
@@ -4549,6 +3838,30 @@ DWORD GetProcessId(HANDLE process)
 	return info.UniqueProcessId;
 }
 
+static BOOL Is64Bit(void)
+{
+	BOOL (WINAPI *pfnIsWow64)(HANDLE, PBOOL);
+	PVOID k32;
+	BOOL wow64 = FALSE;
+	BOOL r;
+
+	k32 = GetModuleHandle("kernel32");
+	if (!k32)
+		return FALSE;
+
+	pfnIsWow64 = GetProcAddress(k32, "IsWow64Process");
+	if (!pfnIsWow64)
+		return FALSE;
+
+	r = pfnIsWow64(GetCurrentProcess(), &wow64);
+	if (!r)
+		return FALSE;
+
+	dprintf("wow64 = %d\n", wow64);
+
+	return wow64;
+}
+
 void get_stub_name(void)
 {
 	static const WCHAR stub[] = L"linux.exe";
@@ -4612,6 +3925,8 @@ static void process_unlink_from_sibling_list(struct process *process)
 
 void process_free(struct process *process)
 {
+	vm_mappings_free(process);
+
 	process_migrate_children_to_parent(process);
 	process_unlink_from_sibling_list(process);
 
@@ -4849,6 +4164,15 @@ int main(int argc, char **argv)
 	DWORD console_mode = 0;
 	BOOL backtrace_on_ctrl_c = 0;
 
+	if (Is64Bit())
+	{
+		fprintf(stderr, "Atratus doesn't work on 64-bit windows as yet\n");
+		Sleep(5);
+		return 0;
+	}
+
+	vm_init();
+
 	context->cwd = strdup("/");
 	context->uid = 1000;
 	context->gid = 1000;
@@ -4890,25 +4214,20 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	debug_stream = stderr;
+	debug_init();
 	while (n < argc)
 	{
 		if (!strcmp(argv[n], "-d"))
 		{
-			verbose = 1;
+			debug_set_verbose(1);
 			n++;
 			continue;
 		}
 
 		if (!strcmp(argv[n], "-D") && (n + 1) < argc)
 		{
-			verbose = 1;
-			debug_stream = fopen(argv[n+1], "a");
-			if (!debug_stream)
-			{
-				fprintf(stderr, "failed to open %s\n", argv[n+1]);
-				exit(1);
-			}
+			debug_set_verbose(1);
+			debug_set_file(argv[n+1]);
 			n += 2;
 			continue;
 		}

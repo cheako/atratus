@@ -117,7 +117,7 @@ static int WSAToErrno(const char *func)
 		dprintf("WSAENOTCONN\n");
 		return -_L(ENOTCONN);
 	default:
-		dprintf("Unknown WSAError %d\n", WsaError);
+		dprintf("Unknown WSAError %ld\n", WsaError);
 		return -1;
 	}
 }
@@ -134,7 +134,7 @@ static int inet_error_from_overlapped(struct socket_filp *sfp)
 				&bytesTransferred, FALSE, &flags);
 	if (r)
 	{
-		dprintf("operation succeeded, %d bytes transferred\n",
+		dprintf("operation succeeded, %ld bytes transferred\n",
 			bytesTransferred);
 		return bytesTransferred;
 	}
@@ -147,7 +147,7 @@ static int inet_error_from_overlapped(struct socket_filp *sfp)
 	case ERROR_CONNECTION_REFUSED:
 		return -_L(ECONNREFUSED);
 	default:
-		dprintf("unknown socket error %d\n", err);
+		dprintf("unknown socket error %ld\n", err);
 		return -_L(EACCES);
 	}
 }
@@ -233,7 +233,7 @@ static int inet_read(filp *fp, void *buf, size_t size, loff_t *off, int block)
 	return bytesCopied;
 }
 
-static int inet_write(filp *fp, const void *buf, size_t size, loff_t *off)
+static int inet_write(filp *fp, const void *buf, size_t size, loff_t *off, int block)
 {
 	struct socket_filp *sfp = (struct socket_filp*) fp;
 	uint8_t buffer[0x1000];
@@ -436,7 +436,7 @@ static int inet_connect(struct socket_filp *sfp,
 
 	sfp->state = ss_connecting;
 
-	dprintf("socket %d connecting to %d.%d.%d.%d:%d\n", s,
+	dprintf("socket %d connecting to %ld.%ld.%ld.%ld:%d\n", s,
 		(sin.sin_addr.s_addr >> 0) & 0xff,
 		(sin.sin_addr.s_addr >> 8) & 0xff,
 		(sin.sin_addr.s_addr >> 16) & 0xff,
@@ -504,7 +504,7 @@ static int inet_bind(struct socket_filp *sfp, void *addr, size_t addrlen)
 		return -_L(EAFNOSUPPORT);
 	}
 
-	dprintf("socket %d binding to %d.%d.%d.%d:%d\n", s,
+	dprintf("socket %d binding to %ld.%ld.%ld.%ld:%d\n", s,
 		(sin.sin_addr.s_addr >> 0) & 0xff,
 		(sin.sin_addr.s_addr >> 8) & 0xff,
 		(sin.sin_addr.s_addr >> 16) & 0xff,
@@ -547,7 +547,7 @@ static int inet_copy_accept_addr(struct socket_filp *sfp,
 	unsigned int sa;
 	int r;
 
-	dprintf("recvlen = %d\n", recv_len);
+	dprintf("recvlen = %ld\n", recv_len);
 
 	pGetAcceptExSockaddrs(sfp->buffer, recv_len,
 				ACCEPTEX_ADDRSIZE,

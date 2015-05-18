@@ -22,6 +22,7 @@
 #define _l_ERANGE 34
 #define _l_ENAMETOOLONG 36
 #define _l_ENOSYS 38
+#define _l_ELOOP 40
 #define _l_ENOTSOCK 88
 #define _l_EAFNOSUPPORT 97
 #define _l_ETIMEDOUT 110

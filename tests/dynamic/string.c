@@ -134,7 +134,8 @@ int test_strcpy(void)
 
 int test_strtok(void)
 {
-	char input[] = "testing?:1:2:3";
+	char input[] = "testing?:1:2:3::4";
+	char input2[] = "xxayyzzcyyzzyyxxyyzz";
 
 	OK(input == strtok(input, ":"));
 	OK(input[8] == 0);
@@ -143,8 +144,14 @@ int test_strtok(void)
 	OK(&input[11] == strtok(NULL, ":"));
 	OK(input[12] == 0);
 	OK(&input[13] == strtok(NULL, ":"));
+	OK(input[14] == 0);
+	OK(&input[16] == strtok(NULL, ":"));
 	OK(NULL == strtok(NULL, ":"));
 	OK(NULL == strtok(NULL, ":"));
+
+	OK(&input2[2] == strtok(input2, "xyz"));
+	OK(&input2[7] == strtok(NULL, "xyz"));
+	OK(NULL == strtok(NULL, "xyz"));
 
 	return 1;
 }

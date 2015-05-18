@@ -173,6 +173,30 @@ int test_getopt7(void)
 	return 1;
 }
 
+int test_getopt8(void)
+{
+	int r;
+	char *a1 = "ls";
+	char *a2 = "-laR";
+	char *t8[] = { a1, a2, NULL };
+	int ac = 2;
+
+	optind = 1;
+	r = getopt(ac, t8, "alR");
+	OK(r == 'l');
+
+	r = getopt(ac, t8, "alR");
+	OK(r == 'a');
+
+	r = getopt(ac, t8, "alR");
+	OK(r == 'R');
+
+	r = getopt(ac, t8, "alR");
+	OK(r == -1);
+
+	return 1;
+}
+
 int unit_main(void)
 {
 	/* test initial values */
@@ -208,12 +232,14 @@ int unit_main(void)
 
 	OK(test_getopt7() == 1);
 
-	return 0;
+	OK(test_getopt8() == 1);
+
+	return 1;
 }
 
 int main(int argc, char **argv)
 {
-	if (unit_main())
+	if (!unit_main())
 		return 1;
 	printf("OK\n");
 	return 0;

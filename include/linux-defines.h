@@ -20,10 +20,10 @@
 #define _l_PROT_EXEC  4
 #define _l_PROT_NONE  0
 
-#define _l_O_RDONLY 0
-#define _l_O_WRONLY 1
-#define _l_O_RDWR 2
-#define _l_O_CREAT 0x100
+#define _l_O_RDONLY (0x00)
+#define _l_O_WRONLY (0x01)
+#define _l_O_RDWR   (0x02)
+#define _l_O_CREAT  (0x40)
 
 #define _l_O_NONBLOCK (0x800)
 
@@ -58,6 +58,7 @@
 #define _l_PF_INET 2
 #define _l_PF_INET6 10
 
+#define _l_AF_UNSPEC 0
 #define _l_AF_INET _l_PF_INET
 #define _l_AF_INET6 _l_PF_INET6
 
@@ -258,7 +259,7 @@ struct linux_dirent {
 	unsigned long  d_off;
 	unsigned short d_reclen;
 	char           d_name[];
-};
+} PACKED;
 
 struct linux_dirent64 {
 	unsigned long long d_ino;
@@ -266,7 +267,7 @@ struct linux_dirent64 {
 	unsigned short d_reclen;
 	unsigned char d_type;
 	char d_name[];
-};
+} PACKED;
 
 #define SECSPERDAY 86400
 #define SECS_1601_TO_1970 ((369 * 365 + 89) * (ULONGLONG)SECSPERDAY)

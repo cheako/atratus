@@ -32,25 +32,29 @@ LDFLAGS += -shared -Wl,-Bsymbolic -Wl,-Bsymbolic-functions
 LDFLAGS += -Wl,--no-undefined -nostartfiles -nodefaultlibs
 LDFLAGS += -fpic -g
 
-all: ld-linux.so.2 libc.so.6 libm.so.6 libdl.so.2 librt.so.1 libpthread.so.0
+TARGETS = ld-linux.so.2 libc.so.6 libm.so.6 libdl.so.2 librt.so.1 libpthread.so.0 libutil.so.1
+all: $(TARGETS)
 
 LIBC_OBJECTS = \
-	main.c
+	c.o \
+	main.o
 
 LIBM_OBJECTS = \
-	main.c
+	main.o
 
 LIBDL_OBJECTS = \
-	main.c
+	main.o
 
 LIBRT_OBJECTS = \
-	main.c
+	main.o
 
 LIBPTHREAD_OBJECTS = \
 	main.c
 
+LIBUTIL_OBJECTS = \
+	main.c
+
 LDSO_OBJECTS = \
-	c.o \
 	loader.o \
 	stub.o
 
@@ -74,5 +78,8 @@ librt.so.1: $(LIBRT_OBJECTS)
 libpthread.so.0: $(LIBPTHREAD_OBJECTS)
 	$(CC) -o $@ $(LDFLAGS) -e _start $^
 
+libutil.so.1: $(LIBUTIL_OBJECTS)
+	$(CC) -o $@ $(LDFLAGS) -e _start $^
+
 clean:
-	rm -f $(TARGET) *.o .*.o.d
+	rm -f $(TARGETS) *.o .*.o.d

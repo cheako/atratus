@@ -32,7 +32,7 @@ LIMITATIONS?
   which have been a stubling block of previous Linux-binary-on-Windows
   projects can work.
 
-* programs statically linked with glibc will not work
+* programs statically linked with glibc will (currently) not work
 
 
 DIRTY TECHNICAL DETAILS?
@@ -50,6 +50,13 @@ DIRTY TECHNICAL DETAILS?
 
 * the "kernel" is using co-operative multi-tasking (i.e. yield())
   to keep things simple and reliable for the moment.
+
+* memory is allocated in the kernel in a shared section, and that
+  section is also mapped into the client process's address space.
+  Windows allocates in chunks of 64k, but Linux allocates in chunks
+  of 4k, however this Windows allows page protection to be changed
+  in granularity of the page size (4k).  Using page protections,
+  allocates under 64k emulated in the client.
 
 
 BUILD INSTRUCTIONS

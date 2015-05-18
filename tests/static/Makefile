@@ -17,7 +17,8 @@
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
 #
 
-all: 
+all:
+
 CFLAGS = -Wall -fno-stack-protector
 CC = gcc
 
@@ -27,6 +28,7 @@ TARGETS = \
 	cat \
 	date \
 	dir \
+	dir64 \
 	echo \
 	exec \
 	exit \
