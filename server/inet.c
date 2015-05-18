@@ -59,6 +59,9 @@ typedef BOOL (WINAPI * LPFN_CONNECTEX)(SOCKET, const struct sockaddr*, int, PVOI
 typedef BOOL (WINAPI * LPFN_ACCEPTEX)(SOCKET, SOCKET, PVOID, DWORD, DWORD, DWORD, LPDWORD, LPOVERLAPPED);
 typedef VOID (WINAPI * LPFN_GETACCEPTEXSOCKADDRS)(PVOID, DWORD, DWORD, DWORD, struct sockaddr **, LPINT, struct sockaddr **, LPINT);
 
+#ifndef SO_UPDATE_CONNECT_CONTEXT
+#define SO_UPDATE_CONNECT_CONTEXT     0x7010
+#endif
 
 enum socket_state
 {
@@ -84,9 +87,11 @@ struct socket_filp
 	enum socket_state state;
 	uint8_t buffer[ACCEPTEX_ADDRSIZE * 2];
 	SOCKET incoming;
+	int async_events;
 };
 
 static HANDLE inet_event;
+static HWND inet_hwnd;
 static LPFN_CONNECTEX pConnectEx;
 static LPFN_ACCEPTEX pAcceptEx;
 static LPFN_GETACCEPTEXSOCKADDRS pGetAcceptExSockaddrs;
@@ -106,8 +111,10 @@ static int WSAToErrno(const char *func)
 	case WSAEINVAL:
 		return -_L(EINVAL);
 	case WSAENOTSOCK:
+		dprintf("WSAENOTSOCK\n");
 		return -_L(ENOTSOCK);
 	case WSAENOTCONN:
+		dprintf("WSAENOTCONN\n");
 		return -_L(ENOTCONN);
 	default:
 		dprintf("Unknown WSAError %d\n", WsaError);
@@ -117,13 +124,24 @@ static int WSAToErrno(const char *func)
 
 static int inet_error_from_overlapped(struct socket_filp *sfp)
 {
-	DWORD err;
+	SOCKET s = (SOCKET) sfp->fp.handle;
+	DWORD bytesTransferred = 0;
+	DWORD err, flags = 0;
+	BOOL r;
 
-	err = RtlNtStatusToDosError(sfp->overlapped.Internal);
+	dprintf("getting result for %d\n", s);
+	r = WSAGetOverlappedResult(s, &sfp->overlapped,
+				&bytesTransferred, FALSE, &flags);
+	if (r)
+	{
+		dprintf("operation succeeded, %d bytes transferred\n",
+			bytesTransferred);
+		return bytesTransferred;
+	}
+
+	err = GetLastError();
 	switch (err)
 	{
-	case 0:
-		return sfp->overlapped.InternalHigh;
 	case ERROR_TIMEOUT:
 		return -_L(ETIMEDOUT);
 	case ERROR_CONNECTION_REFUSED:
@@ -158,45 +176,58 @@ static int inet_read(filp *fp, void *buf, size_t size, loff_t *off, int block)
 
 	while (size)
 	{
+		SOCKET s = (SOCKET) sfp->fp.handle;
+		WSABUF wsabuf;
 		DWORD sz;
-		BOOL ret;
+		int r;
+		DWORD flags;
 
 		if (size > sizeof buffer)
 			sz = sizeof buffer;
 		else
 			sz = size;
 
+		sfp->async_events &= ~FD_READ;
+
+		wsabuf.buf = (void*) buffer;
+		wsabuf.len = sz;
 		bytesRead = 0;
-		ret = ReadFile(sfp->fp.handle, buffer, sz, &bytesRead, &sfp->overlapped);
-		if (!ret)
+		flags = 0;
+		r = WSARecv(s, &wsabuf, 1, &bytesRead, &flags, &sfp->overlapped, NULL);
+		if (r == SOCKET_ERROR)
 		{
 			int r;
 
-			if (GetLastError() != ERROR_IO_PENDING)
+			if (WSAGetLastError() != ERROR_IO_PENDING)
 			{
 				dprintf("WriteFile %p failed %ld\n",
 					sfp->fp.handle, GetLastError());
-				return -_L(EIO);
+				return WSAToErrno("inet_read");
 			}
 
 			r = inet_socket_wait_complete(sfp);
 			if (r < 0)
+			{
+				dprintf("inet_read(): wait failed (%d)\n", r);
 				return r;
+			}
 
 			bytesRead = r;
 		}
 
-		ret = WriteProcessMemory(current->process, buf,
-					 buffer, bytesRead, &sz);
-		if (!ret)
+		r = current->ops->memcpy_to(buf, buffer, bytesRead);
+		if (r < 0)
 		{
 			if (bytesCopied)
 				break;
-			return -_L(EFAULT);
+			return r;
 		}
 		bytesCopied += bytesRead;
 		buf = (char*) buf + bytesRead;
 		size -= bytesRead;
+
+		if (bytesRead != sizeof buffer)
+			break;
 	}
 
 	return bytesCopied;
@@ -293,13 +324,34 @@ static int inet_set_reuseaddr(struct socket_filp *sfp, const void *optval, size_
 	if (optlen != sizeof val)
 		return -_L(EINVAL);
 
+	r = current->ops->memcpy_from(&val, optval, sizeof val);
+	if (r < 0)
+		return r;
+
 	dprintf("reuseaddr(%d) -> %d\n", s, val);
+
+	r = setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
+			(char*) &val, sizeof val);
+
+	return (r == 0) ? 0 : -_L(EINVAL);
+}
+
+static int inet_set_keepalive(struct socket_filp *sfp, const void *optval, size_t optlen)
+{
+	SOCKET s = (SOCKET) sfp->fp.handle;
+	int val = 0;
+	int r;
+
+	if (optlen != sizeof val)
+		return -_L(EINVAL);
 
 	r = current->ops->memcpy_from(&val, optval, sizeof val);
 	if (r < 0)
 		return r;
 
-	r = setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
+	dprintf("keepalive(%d) -> %d\n", s, val);
+
+	r = setsockopt(s, SOL_SOCKET, SO_KEEPALIVE,
 			(char*) &val, sizeof val);
 
 	return (r == 0) ? 0 : -_L(EINVAL);
@@ -321,6 +373,8 @@ static int inet_setsockopt(struct socket_filp *sfp, int level, int optname,
 	{
 	case _L(SO_REUSEADDR):
 		return inet_set_reuseaddr(sfp, optval, optlen);
+	case _L(SO_KEEPALIVE):
+		return inet_set_keepalive(sfp, optval, optlen);
 	default:
 		dprintf("unknown socket option %d\n", optname);
 	}
@@ -406,7 +460,19 @@ static int inet_connect(struct socket_filp *sfp,
 		r = 0;
 
 	if (r == 0)
+	{
+		r = setsockopt(s, SOL_SOCKET,
+				SO_UPDATE_CONNECT_CONTEXT,
+				(const char*) &s, sizeof s);
+		if (r != 0)
+		{
+			dprintf("SO_UPDATE_CONNECT_CONTEXT failed (%d)\n",
+				WSAGetLastError());
+		}
+
 		sfp->state = ss_connected;
+		sfp->async_events |= FD_WRITE;
+	}
 	else
 		sfp->state = ss_disconnected;
 
@@ -506,7 +572,7 @@ static int inet_copy_accept_addr(struct socket_filp *sfp,
 	sa = in_local->sin_addr.s_addr;
 	port = in_local->sin_port;
 	dprintf("accept %d\n", s);
-	dprintf("local: %d.%d.%d.%d:%d\n", s,
+	dprintf("local: %d.%d.%d.%d:%d\n",
 		(sa >> 0) & 0xff, (sa >> 8) & 0xff,
 		(sa >> 16) & 0xff, (sa >> 24) & 0xff, ntohs(port));
 
@@ -598,12 +664,24 @@ accepted:
 		closesocket(sfp->incoming);
 		return -_L(EFAULT);
 	}
+	else
+	{
+		r = setsockopt(sfp->incoming, SOL_SOCKET,
+				SO_UPDATE_ACCEPT_CONTEXT,
+				(const char*) &s, sizeof s);
+		if (r != 0)
+		{
+			dprintf("SO_UPDATE_ACCEPT_CONTEXT failed (%d)\n",
+				WSAGetLastError());
+		}
+	}
 
 	new_sfp = inet_alloc_socket(sfp->incoming);
 	if (!new_sfp)
 		return -_L(ENOMEM);
 
 	new_sfp->state = ss_connected;
+	new_sfp->async_events |= FD_WRITE;
 
 	return inet_alloc_fd(new_sfp);
 }
@@ -748,41 +826,26 @@ static void inet_poll_del(filp *f, struct wait_entry *we)
 static int inet_poll(filp *f)
 {
 	struct socket_filp *sfp = (struct socket_filp*) f;
-	SOCKET s = (SOCKET) sfp->fp.handle;
-	fd_set rfds, wfds, efds;
-	struct timeval tv;
 	int events = 0;
-	int r;
 
-	if (sfp->state == ss_accepting)
+	if (sfp->state == ss_accepting ||
+		sfp->state == ss_connecting)
 	{
 		if (HasOverlappedIoCompleted(&sfp->overlapped))
 			events |= _L(POLLIN);
 		return events;
 	}
 
-	tv.tv_sec = 0;
-	tv.tv_usec = 0;
-
-	FD_ZERO(&rfds);
-	FD_ZERO(&wfds);
-	FD_ZERO(&efds);
-
-	FD_SET(s, &rfds);
-	FD_SET(s, &wfds);
-	FD_SET(s, &efds);
-
-	r = select(0, &rfds, &wfds, &efds, &tv);
-
-	if (r > 0)
-	{
-		if (FD_ISSET(s, &rfds))
-			events |= _l_POLLIN;
-		if (FD_ISSET(s, &wfds))
-			events |= _l_POLLOUT;
-		if (FD_ISSET(s, &efds))
-			events |= _l_POLLHUP | _l_POLLERR;
-	}
+	if (sfp->async_events & FD_ACCEPT)
+		events |= _l_POLLIN;
+	if (sfp->async_events & FD_CONNECT)
+		events |= _l_POLLIN;
+	if (sfp->async_events & FD_READ)
+		events |= _l_POLLIN;
+	if (sfp->async_events & FD_WRITE)
+		events |= _l_POLLOUT;
+	if (sfp->async_events & FD_CLOSE)
+		events |= _l_POLLIN;
 
 	return events;
 }
@@ -853,6 +916,9 @@ static struct socket_filp *inet_alloc_socket(SOCKET s)
 	sfp->next = inet_first_socket;
 	inet_first_socket = sfp;
 
+	WSAAsyncSelect(s, inet_hwnd, WM_USER,
+		FD_READ | FD_WRITE | FD_ACCEPT | FD_CONNECT | FD_CLOSE);
+
 	return sfp;
 }
 
@@ -874,6 +940,24 @@ static int inet_alloc_fd(struct socket_filp *sfp)
 	current->handles[fd].flags = 0;
 
 	return fd;
+}
+
+void inet4_process_events(void)
+{
+	struct socket_filp *sfp;
+
+	ResetEvent(inet_event);
+
+	for (sfp = inet_first_socket; sfp; sfp = sfp->next)
+	{
+		if (sfp->thread &&
+			HasOverlappedIoCompleted(&sfp->overlapped))
+		{
+			SOCKET s = (SOCKET) sfp->fp.handle;
+			dprintf("socket %d ready\n", s);
+			ready_list_add(sfp->thread);
+		}
+	}
 }
 
 /*
@@ -929,6 +1013,78 @@ static void inet4_resolve_functions(void)
 	close(s);
 }
 
+static void inet_on_async_select(WPARAM wParam, LPARAM lParam)
+{
+	struct socket_filp *sfp;
+
+	dprintf("async_select %d %08lx\n", wParam, lParam);
+
+	for (sfp = inet_first_socket; sfp; sfp = sfp->next)
+	{
+		SOCKET s = (SOCKET) sfp->fp.handle;
+		if (s == wParam)
+		{
+			struct wait_entry *we;
+
+			sfp->async_events = lParam;
+
+			if (sfp->thread)
+				ready_list_add(sfp->thread);
+
+			for (we = sfp->wl.head; we; we = we->next)
+				ready_list_add(we->p);
+
+			return;
+		}
+	}
+
+	dprintf("socket %d not found\n", wParam);
+}
+
+/*
+ * It would be preferable to be able to do overlapped I/O
+ * to find out whether a socket is ready for reading or writing...
+ */
+static LRESULT CALLBACK
+inet_wndproc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+	switch (uMsg)
+	{
+	case WM_CREATE:
+		return 0;
+	case WM_USER:
+		inet_on_async_select(wParam, lParam);
+		return 0;
+	}
+	return DefWindowProc(hwnd, uMsg, wParam, lParam);
+}
+
+static void inet4_create_message_window(void)
+{
+	WNDCLASS wndcls;
+
+	memset(&wndcls, 0, sizeof wndcls);
+	wndcls.lpszClassName = "ATRATUS_INET_MESSAGE_CLASS";
+	wndcls.lpfnWndProc = &inet_wndproc;
+
+	if (!RegisterClass(&wndcls))
+	{
+		dprintf("failed to register window class\n");
+		exit(1);
+	}
+
+	inet_hwnd = CreateWindow(wndcls.lpszClassName,
+			"ATRATUS_INET_MESSAGE_WINDOW",
+			0, 0, 0, 1, 1, NULL, NULL, NULL, NULL);
+	if (!inet_hwnd)
+	{
+		dprintf("failed to create window\n");
+		exit(1);
+	}
+
+	dprintf("inet_hwnd = %p\n", inet_hwnd);
+}
+
 HANDLE inet4_init(void)
 {
 	WSADATA wsaData;
@@ -941,26 +1097,12 @@ HANDLE inet4_init(void)
 
 	inet4_resolve_functions();
 
+	inet4_create_message_window();
+
 	/*
 	 * use single event flag for all overlapped operations
 	 */
-	inet_event = CreateEvent(NULL, 0, 0, NULL);
+	inet_event = CreateEvent(NULL, TRUE, 0, NULL);
 
 	return inet_event;
-}
-
-void inet4_process_events(void)
-{
-	struct socket_filp *sfp;
-
-	for (sfp = inet_first_socket; sfp; sfp = sfp->next)
-	{
-		if (sfp->thread &&
-			HasOverlappedIoCompleted(&sfp->overlapped))
-		{
-			SOCKET s = (SOCKET) sfp->fp.handle;
-			dprintf("socket %d ready\n", s);
-			ready_list_add(sfp->thread);
-		}
-	}
 }

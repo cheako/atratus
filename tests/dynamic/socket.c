@@ -35,17 +35,23 @@
 int test_socket(void)
 {
 	struct sockaddr_in sin;
-	int s, ss, c, r;
+	int s, ss, c, r, opt;
 	struct sockaddr_in sa;
 	struct sockaddr_in name;
 	socklen_t sl;
 	struct pollfd pfd[2];
+	char buffer[16];
 
 	s = socket(AF_INET, SOCK_STREAM, 0);
 	OK(s > 0);
 
 	c = socket(AF_INET, SOCK_STREAM, 0);
 	OK(c > 0);
+
+	opt = 1;
+	r = setsockopt(s, SOL_SOCKET, SO_REUSEADDR,
+			&opt, sizeof opt);
+	OK(r == 0);
 
 	sin.sin_family = AF_INET;
 	sin.sin_addr.s_addr = inet_addr("127.0.0.1");
@@ -90,12 +96,32 @@ int test_socket(void)
 	OK(sl == sizeof sa);
 	OK(sin.sin_addr.s_addr == sa.sin_addr.s_addr);
 
-	OK(0 == shutdown(ss, SHUT_WR));
-	OK(0 == shutdown(c, SHUT_WR));
+	/* write one byte, read one byte */
+	OK(1 == write(ss, "x", 1));
+	buffer[0] = ' ';
+	OK(1 == read(c, buffer, 1));
+	OK(buffer[0] == 'x');
 
+	/* write one, read many */
+	OK(1 == write(ss, "y", 1));
+	buffer[0] = ' ';
+	OK(1 == read(c, buffer, sizeof buffer));
+	OK(buffer[0] == 'y');
+
+	OK(0 == shutdown(ss, SHUT_WR));
 	OK(0 == close(ss));
-	OK(0 == close(s));
+
+	pfd[0].fd = c;
+	pfd[0].events = POLLIN | POLLHUP;
+	pfd[0].revents = 0;
+	r = poll(pfd, 1, 0);
+	OK(r == 1);
+	OK(pfd[0].revents == POLLIN);
+
+	OK(0 == shutdown(c, SHUT_WR));
 	OK(0 == close(c));
+
+	OK(0 == close(s));
 
 	return 1;
 }

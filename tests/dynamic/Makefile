@@ -17,7 +17,6 @@
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
 #
 
-all: 
 CFLAGS = -Wall -fno-stack-protector
 CFLAGS = -Wall -O2
 CC = gcc
@@ -34,6 +33,8 @@ TARGETS = \
 	hw \
 	inet \
 	jmpbuf \
+	ln \
+	ls \
 	malloc \
 	pipe \
 	qsort \

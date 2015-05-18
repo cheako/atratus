@@ -9,6 +9,8 @@ getopt_long
 hw
 inet
 jmpbuf
+ln
+ls
 malloc
 pipe
 qsort

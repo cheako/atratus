@@ -1,5 +1,12 @@
 Announcement & Release notes
 
+Mon Feb 11 23:12:24 EST 2013
+0.6 - February release
+
+ - symbolic link support
+ - mkdir/rmdir/chdir/getcwd support
+ - telnet can connect to a server
+
 Fri Jan 18 17:47:58 EST 2013
 0.5 - January release
 

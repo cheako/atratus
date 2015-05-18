@@ -27,7 +27,7 @@ CFLAGS += -Wp,-MD,.$@.d -Wp,-MT,$@
 MINGWCC = i586-mingw32msvc-gcc
 NATIVEEXEFLAGS = -lntdll -nostartfiles -nodefaultlibs -Wl,--subsystem=native -e __entry
 
-all: atratus.exe linux.exe
+all: atratus.exe cygsymlink.exe linux.exe
 
 %.pe.o: %.c
 	$(MINGWCC) -DNT $(CFLAGS) -c -o $@ $<
@@ -45,8 +45,12 @@ ATRATUS_SRCS = \
 STUB_SRCS = \
 	linux.c
 
+CYGSYMLINK_SRCS = \
+	cygsymlink.c
+
 ATRATUS_OBJECTS = $(ATRATUS_SRCS:.c=.pe.o)
 STUB_OBJECTS = $(STUB_SRCS:.c=.pe.o)
+CYGSYMLINK_OBJECTS = $(CYGSYMLINK_SRCS:.c=.pe.o)
 
 OBJECTS = $(ATRATUS_OBJECTS) $(STUB_OBJECTS)
 
@@ -59,5 +63,8 @@ atratus.exe: $(ATRATUS_OBJECTS)
 linux.exe: $(STUB_OBJECTS)
 	$(MINGWCC) -static -o $@ $^ $(NATIVEEXEFLAGS)
 
+cygsymlink.exe: $(CYGSYMLINK_OBJECTS)
+	$(MINGWCC) -static -o $@ $^ -lntdll -lkernel32
+
 clean:
-	rm -f atratus.exe linux.exe *.pe.o .*.pe.o.d
+	rm -f atratus.exe cygsymlink.exe linux.exe *.pe.o .*.pe.o.d

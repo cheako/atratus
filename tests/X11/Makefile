@@ -1,5 +1,4 @@
-#
-# Atratus top level Makefile
+# dynamically linked tests
 #
 # Copyright (C) 2012 Mike McCormack
 #
@@ -18,16 +17,18 @@
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
 #
 
-all: 
-	cd lib && make
-	cd server && make
-	cd tests/static && make
-	cd tests/dynamic && make
-	cd tests/X11 && make
+CFLAGS = -Wall -fno-stack-protector
+CFLAGS = -Wall -O2
+CC = gcc
+
+TARGETS = \
+	display
+
+all: $(TARGETS)
+
+# dynamicly linked with libc
+%: %.c
+	$(CC) $(CFLAGS) -o $@ $< -lX11
 
 clean:
-	cd lib && make $@
-	cd server && make $@
-	cd tests/static && make $@
-	cd tests/dynamic && make $@
-	cd tests/X11 && make $@
+	rm -f $(TARGETS) *.o

@@ -27,6 +27,9 @@
 
 #include "linux-defines.h"
 
+#define L_ERROR_PTR(x) ((void*) -_L(x))
+#define L_PTR_ERROR(x) ((((unsigned int)x) > 0xffffff80U) ? (int) x : 0)
+
 typedef int64_t loff_t;
 
 typedef struct _filp filp;
@@ -51,6 +54,13 @@ struct filp_ops {
 	int (*fn_truncate)(filp *f, uint64_t length);
 	int (*fn_seek)(filp *f, int whence, uint64_t pos, uint64_t *newpos);
 	int (*fn_sockcall)(int call, filp *fp, unsigned long *args, int block);
+	int (*fn_readlink)(filp *fp, char **buf);
+	int (*fn_unlink)(filp *fp);
+	int (*fn_utimes)(filp *fp, struct timeval *times);
+	int (*fn_symlink)(filp *dir, const char *name, const char *newpath);
+	int (*fn_getname)(filp *fp, char **name);
+	int (*fn_mkdir)(filp *fp, const char *name, int mode);
+	int (*fn_rmdir)(filp *fp);
 };
 
 struct _filp {
@@ -61,6 +71,12 @@ struct _filp {
 	loff_t offset;
 	int refcount;
 };
+
+static inline void filp_close(filp *fp)
+{
+	if (fp->ops->fn_close)
+		fp->ops->fn_close(fp);
+}
 
 struct _poll_list {
 	poll_list *next;
@@ -74,10 +90,8 @@ struct fs
 {
 	char *root;
 	struct fs *next;
-	int (*open)(struct fs *fs, const char *subpath, int flags, int mode);
-	int (*stat64)(struct fs *fs, const char *path,
-			 struct stat64 *statbuf, bool follow_links);
-	int (*utimes)(struct fs *fs, const char *path, struct timeval *times);
+	filp *(*open)(struct fs *fs, const char *subpath, int flags,
+			int mode, int follow_links);
 };
 
 extern int alloc_fd(void);

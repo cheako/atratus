@@ -732,6 +732,12 @@ static void ld_apply_symbol_value(struct module_info *m, Elf32_Rel *rel)
 	(*dest) += value;
 }
 
+static void ld_apply_tls_dtpmod32(struct module_info *m, Elf32_Rel *rel)
+{
+	ldverbose++;
+	ldprintf("warning: R_386_TLS_DTPMOD32 reloc unapplied\n");
+	ldverbose--;
+}
 
 int ld_apply_relocations(struct module_info *m)
 {
@@ -760,6 +766,9 @@ int ld_apply_relocations(struct module_info *m)
 			break;
 		case R_386_32: /* Add symbol value. */
 			ld_apply_symbol_value(m, &rel[i]);
+			break;
+		case R_386_TLS_DTPMOD32:
+			ld_apply_tls_dtpmod32(m, &rel[i]);
 			break;
 		default:
 			/* FIXME */

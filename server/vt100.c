@@ -38,7 +38,7 @@
 
 struct _vt100_filp
 {
-	con_filp con;
+	tty_filp con;
 	int state;
 	int num[MAX_VT100_PARAMS];
 	int num_count;
@@ -1035,7 +1035,7 @@ static vt100_control_fn vt100_control_list[0x20] =
 	NULL,
 };
 
-static int vt100_write(con_filp *con, unsigned char ch)
+static int vt100_write(tty_filp *con, unsigned char ch)
 {
 	vt100_filp *vt = (void*) con;
 	int r = 0;
@@ -1140,7 +1140,7 @@ static DWORD WINAPI vt100_input_thread(LPVOID param)
 	return 0;
 }
 
-static void vt100_get_winsize(con_filp *con, struct winsize *ws)
+static void vt100_get_winsize(tty_filp *con, struct winsize *ws)
 {
 	CONSOLE_SCREEN_BUFFER_INFO info;
 	vt100_filp *vt= (void*) con;
@@ -1155,13 +1155,13 @@ static void vt100_get_winsize(con_filp *con, struct winsize *ws)
 	dprintf("winsize -> %d,%d\n", ws->ws_col, ws->ws_row);
 }
 
-static void vt100_lock(con_filp *con)
+static void vt100_lock(tty_filp *con)
 {
 	vt100_filp *vt= (void*) con;
 	EnterCriticalSection(&vt->cs);
 }
 
-static void vt100_unlock(con_filp *con)
+static void vt100_unlock(tty_filp *con)
 {
 	vt100_filp *vt= (void*) con;
 	LeaveCriticalSection(&vt->cs);
@@ -1177,7 +1177,7 @@ struct con_ops vt100_ops = {
 static filp* alloc_vt100_console(HANDLE handle)
 {
 	vt100_filp *vt;
-	con_filp *con;
+	tty_filp *con;
 	DWORD id;
 
 	vt = malloc(sizeof *vt);

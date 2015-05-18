@@ -767,6 +767,15 @@ typedef struct _FILE_END_OF_FILE_INFORMATION {
     LARGE_INTEGER EndOfFile;
 } FILE_END_OF_FILE_INFORMATION, *PFILE_END_OF_FILE_INFORMATION;
 
+typedef struct _FILE_DISPOSITION_INFORMATION {
+	BOOLEAN             DeleteFile;
+} FILE_DISPOSITION_INFORMATION, *PFILE_DISPOSITION_INFORMATION;
+
+typedef struct _FILE_NAME_INFORMATION {
+	ULONG               FileNameLength;
+	WCHAR               FileName[1];
+} FILE_NAME_INFORMATION, *PFILE_NAME_INFORMATION;
+
 #define FILE_SUPERSEDED     0
 #define FILE_OPENED         1
 #define FILE_CREATED        2
@@ -834,7 +843,9 @@ typedef struct _FILE_PIPE_WAIT_FOR_BUFFER {
 
 #define FILE_DEVICE_NAMED_PIPE            0x00000011
 
-#define FILE_ANY_ACCESS                   0x00000000
+#define FILE_ANY_ACCESS 0
+#define FILE_READ_ACCESS 1
+#define FILE_WRITE_ACCESS 2
 
 #define METHOD_BUFFERED                   0
 

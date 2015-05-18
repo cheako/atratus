@@ -1,7 +1,8 @@
 
-    atratus
+    Atratus        (http://atratus.org)
 
-Run Linux binaries on Windows!
+    Run Linux binaries on Windows!
+
 
 WHAT IS IT?
 
@@ -9,34 +10,23 @@ Atratus is a binary compatibility layer that can run Linux binaries
 on Windows.  Atratus will load an ELF format executable created with
 gcc under Linux run it.
 
-QUICK SETUP
 
-* apt-get install gcc-mingw32 build-essential
+WHAT WORKS?
 
-* run "make" in the top level directory
+* To use the binary package:
 
-* map z:\ as ~/atratus in a VirtualBox running Windows XP
-   - On VirtualBox "Devices" menu, choose "Shared folder...",
-     click on the "+" icon, and add the atratus directory.
-   - In Windows XP's explorer, open "My Computer", choose
-     "Map Network drive", and map the atratus folder to Z:
+    1) extract it to your Desktop
+    2) open the atratus-v0.X-bin directory
+    3) double click on one of the batch files (e.g. vitetris.bat)
 
-* open a windows command prompt, and type "Z:" to select
-  Z drive. Then type "server\atratus.exe" as follows:
+* Some busybox programs, robotfindskitten, vitetris, some BSD games
 
-   Z:\>server\atratus.exe
-   usage: server\atratus prog ...
-
-   Z:\>server\atratus.exe tests\static\hw
-   hello world
-
-   Z:>
 
 LIMITATIONS?
 
-* This code has been tested with Windows XP an Intel x86 processor.
-  It may not work correctly on Windows 7 or Windows 8, and will
-  definitely not work on Windows 2000 in its current state.
+* This code has been tested with 32bit Windows XP and Windows 7.
+  It may not work correctly on Windows 8, and does not work on
+  Windows 2000 or any 64bit Windows in its current state.
 
 * This version is a proof of concept to show that fork() and exec(),
   which have been a stubling block of previous Linux-binary-on-Windows
@@ -44,21 +34,8 @@ LIMITATIONS?
 
 * programs statically linked with glibc will not work
 
-WHAT WORKS?
-
-* A bunch of test programs in tests/ should work.
-  Feedback is welcome!
 
 DIRTY TECHNICAL DETAILS?
-
-* glibc can not be made to work due to its use of negative offsets 
-  with the %gs segment register, however TLS as described by ELF
-  appears to be possible, as it uses %gs:[0].  %gs will be set
-  to %fs selector, and %gs:[0] can be setup to point to valid memory.
-
-  Specifically, the set_thread_selector() system call cannot be
-  made to work correctly without a device driver as there appears
-  to be no way to allocate a thread selector from Windows userland
 
 * fork() is implemented using NtCreateProcess() which is an NT system
   call not exposed to Win32 userland
@@ -67,9 +44,90 @@ DIRTY TECHNICAL DETAILS?
   although they could be caught by an exception handler "in process"
   to improve efficiency.
 
+* TLS is not yet fully handled, but will work using a combination of
+  instruction emulation and by reusing Windows' TLS selector
+  (i.e. setting %gs = %fs)
+
 * the "kernel" is using co-operative multi-tasking (i.e. yield())
   to keep things simple and reliable for the moment.
 
-WHO?
 
-Mike McCormack
+BUILD INSTRUCTIONS
+
+This software should build on Ubuntu 12.04 LTS (x86)
+
+* apt-get install gcc-mingw32 build-essential libx11-dev
+* run "make" in the top level directory
+
+
+DEBUGGING
+
+* the -D flag creates a debug log that logs the system calls handled
+  by the server process. e.g
+
+   C:\Documents and Settings\Mike\Desktop\atratus-v0.6-alpha>bin\atratus.exe -D ls.log bin/ls -la
+
+* when any signal is caught, debugging information is dumped.
+  The contents are:
+
+   - the instruction that caused the fault
+   - the registers at the time of the fault
+   - the exception
+   - the top 256 bytes of the stack
+   - the allocated address ranges
+   - a simple backtrace (walking ESP and EBP), assuming -fframe-pointers
+
+    An example is show below
+
+    not a syscall: 0f b6
+    EAX:5fffff2c EBX:00fff956 ECX:00fff956 EDX:000006a6
+    ESI:5fffff28 EDI:fffffffc EBP:5ffff890 ESP:5ffff880
+    EIP:00017b74 EFLAGS: 00010217
+    CS:001b DS:0023 ES:0023 SS:0023 GS:0038 FS:0038
+    Exception:
+    Code:    c0000005
+    Flags:   00000000
+    Address: 00017b74
+    Params:  00000002
+    [0] -> 00000000
+    [1] -> 60fff87e
+    stack @5FFFF880
+    5FFFF880  fb ff ff 00 fb ff ff ff 24 ff ff 5f bb ff ff 5f    ........$.._..._
+    ...
+    5FFFF970  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00    ................
+    Address space details:
+    Address range     Base     Protect  State    Protect  Type
+    00010000-00026000 00010000 00000001   commit      rwx 00020000     <--- ld-linux.so.2
+    00026000-00030000 00010000 00000001   commit      --- 00020000
+    00030000-00031000 00030000 00000004   commit      r-x 00020000
+    00040000-00042000 00040000 00000001   commit      rwx 00020000
+    00042000-00050000 00040000 00000001   commit      --- 00020000
+    00050000-00052000 00050000 00000001   commit      rwx 00020000
+    00052000-00060000 00050000 00000001   commit      --- 00020000
+    00400000-00401000 00400000 00000080   commit      r-- 01000000     <--- stub linux.exe
+    00401000-00402000 00400000 00000080   commit      r-x 01000000
+    00402000-00403000 00400000 00000080   commit 00000008 01000000
+    08040000-08048000 08040000 00000001   commit      --- 00020000     <--- ELF image
+    08048000-08135000 08040000 00000001   commit      rwx 00020000
+    08135000-08140000 08040000 00000001   commit      --- 00020000
+    5ff00000-60000000 5ff00000 00000040   commit      rwx 00020000     <--- stack
+    7c900000-7c901000 7c900000 00000080   commit      r-- 01000000     <--- ntdll.dll
+    7c901000-7c97e000 7c900000 00000080   commit      r-x 01000000
+    7c97e000-7c983000 7c900000 00000080   commit 00000008 01000000
+    7c983000-7c9b2000 7c900000 00000080   commit      r-- 01000000
+    7ffb0000-7ffd4000 7ffb0000 00000002   commit      r-- 00040000     <--- Windows PEB, TEB, etc
+    7ffd8000-7ffd9000 7ffd8000 00000004   commit      rw- 00020000
+    7ffdf000-7ffe0000 7ffdf000 00000004   commit      rw- 00020000
+    7ffe0000-7ffe1000 7ffe0000 00000002   commit      r-- 00020000
+    7ffe1000-7fff0000 7ffe0000 00000002  reserve      --- 00020000
+        Esp      Ebp       Eip
+     0: 5ffff880 5ffff890  5ffff8bc
+     1: 5ffff890 00000002  <invalid frame>
+
+
+CONTRIBUTIONS & FEEDBACK?
+
+Feedback and patches are welcome.  There is a mailing list at:
+
+atratus-devel@atratus.org
+

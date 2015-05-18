@@ -32,96 +32,96 @@
 #include "linux-defines.h"
 #include "debug.h"
 
-static void con_poll_add(filp *f, struct wait_entry *we);
-static void con_poll_del(filp *f, struct wait_entry *we);
+static void tty_poll_add(filp *f, struct wait_entry *we);
+static void tty_poll_del(filp *f, struct wait_entry *we);
 
-static int con_is_canonical(con_filp *con)
+static int tty_is_canonical(tty_filp *tty)
 {
-	return con->tios.c_lflag & ICANON;
+	return tty->tios.c_lflag & ICANON;
 }
 
 /*
  * Process input characters into an input string
  * return number of characters ready to read
  */
-static int con_process_input(con_filp *con)
+static int tty_process_input(tty_filp *tty)
 {
 	int i, pos, end;
 
-	if (!con_is_canonical(con))
-		return con->ready_count;
+	if (!tty_is_canonical(tty))
+		return tty->ready_count;
 
 	/* remove VERASE characters, find line feed */
 	pos = 0;
 	end = -1;
-	for (i = 0; i < con->ready_count; i++)
+	for (i = 0; i < tty->ready_count; i++)
 	{
-		char ch = con->ready_data[i];
+		char ch = tty->ready_data[i];
 
 		/* once we find a line feed character, just copy */
-		if (end < 0 && !con->eof)
+		if (end < 0 && !tty->eof)
 		{
-			if (pos && ch == con->tios.c_cc[VERASE])
+			if (pos && ch == tty->tios.c_cc[VERASE])
 			{
 				pos--;
 				continue;
 			}
 
-			if ((con->tios.c_iflag & INLCR) && ch == '\n')
+			if ((tty->tios.c_iflag & INLCR) && ch == '\n')
 				ch = '\r';
-			else if ((con->tios.c_iflag & ICRNL) && ch == '\r')
+			else if ((tty->tios.c_iflag & ICRNL) && ch == '\r')
 				ch = '\n';
 
-			if ((con->tios.c_iflag & IUCLC) && ch >= 'A' && ch <= 'Z')
+			if ((tty->tios.c_iflag & IUCLC) && ch >= 'A' && ch <= 'Z')
 				ch += ('a' - 'A');
 
 			if (ch == '\n')
 			{
 				end = pos;
-				con->ready_data[pos] = ch;
+				tty->ready_data[pos] = ch;
 			}
-			else if (ch == con->tios.c_cc[VEOF])
+			else if (ch == tty->tios.c_cc[VEOF])
 			{
 				end = pos - 1;
-				con->eof = 1;
+				tty->eof = 1;
 			}
 		}
 
 		if (pos != i)
-			con->ready_data[pos] = ch;
+			tty->ready_data[pos] = ch;
 		pos++;
 	}
 
-	con->ready_count -= (i - pos);
+	tty->ready_count -= (i - pos);
 
 	return end + 1;
 }
 
-static int con_read(filp *f, void *buf, size_t size, loff_t *ofs, int block)
+static int tty_read(filp *f, void *buf, size_t size, loff_t *ofs, int block)
 {
-	con_filp *con = (con_filp*) f;
+	tty_filp *tty = (tty_filp*) f;
 	int ret = 0;
 	struct wait_entry we;
 	int done = 0;
 
 	we.p = current;
-	con_poll_add(&con->fp, &we);
+	tty_poll_add(&tty->fp, &we);
 
-	while (ret < size && !con->eof && !done)
+	while (ret < size && !tty->eof && !done)
 	{
 		BOOL wait = 0;
 		size_t len;
 
-		con->ops->fn_lock(con);
-		assert(con->ready_count >= 0);
-		len = con_process_input(con);
+		tty->ops->fn_lock(tty);
+		assert(tty->ready_count >= 0);
+		len = tty_process_input(tty);
 		if (len)
 		{
 			if (len > size)
 				len = size;
 
 			int r;
-			r = current->ops->memcpy_to(buf, con->ready_data, len);
+			r = current->ops->memcpy_to(buf, tty->ready_data, len);
 			if (r < 0)
 			{
 				if (ret > 0)
@@ -132,15 +132,15 @@ static int con_read(filp *f, void *buf, size_t size, loff_t *ofs, int block)
 			ret += len;
 
 			/* move everything to the front */
-			con->ready_count -= len;
-			memmove(con->ready_data, con->ready_data+len, con->ready_count);
+			tty->ready_count -= len;
+			memmove(tty->ready_data, tty->ready_data+len, tty->ready_count);
 			done = 1;
 		}
 		else
 		{
 			wait = 1;
 		}
-		con->ops->fn_unlock(con);
+		tty->ops->fn_unlock(tty);
 
 		if (wait && !block)
 			break;
@@ -153,73 +153,73 @@ static int con_read(filp *f, void *buf, size_t size, loff_t *ofs, int block)
 		}
 	}
 
-	con_poll_del(&con->fp, &we);
+	tty_poll_del(&tty->fp, &we);
 
-	dprintf("con_read r = %d/%d\n", ret, size);
+	dprintf("tty_read r = %d/%d\n", ret, size);
 
 	return ret;
 }
 
-void tty_input_add_char(con_filp *con, char ch)
+void tty_input_add_char(tty_filp *tty, char ch)
 {
 	struct wait_entry *we;
 
-	con->ops->fn_lock(con);
+	tty->ops->fn_lock(tty);
 
 	/* add data to buffer */
-	if (con->ready_count < sizeof con->ready_data)
-		con->ready_data[con->ready_count++] = ch;
+	if (tty->ready_count < sizeof tty->ready_data)
+		tty->ready_data[tty->ready_count++] = ch;
 
 	/* TODO: send only to the controlling terminal */
-	for (we = con->wl.head; we; we = we->next)
+	for (we = tty->wl.head; we; we = we->next)
 		ready_list_add(we->p);
 
-	con->ops->fn_unlock(con);
+	tty->ops->fn_unlock(tty);
 }
 
-void tty_input_add_string(con_filp *con, const char *string)
+void tty_input_add_string(tty_filp *tty, const char *string)
 {
 	struct wait_entry *we;
 	int len = strlen(string);
 
-	con->ops->fn_lock(con);
-	if ((con->ready_count + len) <= sizeof con->ready_data)
+	tty->ops->fn_lock(tty);
+	if ((tty->ready_count + len) <= sizeof tty->ready_data)
 	{
-		memcpy(&con->ready_data[con->ready_count], string, len);
-		con->ready_count += len;
+		memcpy(&tty->ready_data[tty->ready_count], string, len);
+		tty->ready_count += len;
 	}
 
-	for (we = con->wl.head; we; we = we->next)
+	for (we = tty->wl.head; we; we = we->next)
 		ready_list_add(we->p);
 
-	con->ops->fn_unlock(con);
+	tty->ops->fn_unlock(tty);
 }
 
 /* write to the terminal, observing termios settings */
-static int con_write_output(con_filp *con, unsigned char ch)
+static int tty_write_output(tty_filp *tty, unsigned char ch)
 {
 	switch (ch)
 	{
 	case 0x0d:
-		if (con->tios.c_oflag & ONLRET)
+		if (tty->tios.c_oflag & ONLRET)
 			return 0;
-		if (con->tios.c_oflag & OCRNL)
+		if (tty->tios.c_oflag & OCRNL)
 			ch = 0x0d;
 		break;
 	case 0x0a:
-		if (con->tios.c_oflag & ONLCR)
-			con->ops->fn_write(con, 0x0d);
-		return con->ops->fn_write(con, 0x0a);
+		if (tty->tios.c_oflag & ONLCR)
+			tty->ops->fn_write(tty, 0x0d);
+		return tty->ops->fn_write(tty, 0x0a);
 	}
 
 	/* map lower case to upper case */
-	if (con->tios.c_oflag & OLCUC)
+	if (tty->tios.c_oflag & OLCUC)
 	{
 		if (ch >= 'a' && ch <= 'z')
 			ch = ch - 'a' + 'A';
 	}
 
-	return con->ops->fn_write(con, ch);
+	return tty->ops->fn_write(tty, ch);
 }
 
 static void tty_debug_dump_buffer(const unsigned char *buffer, size_t sz)
@@ -246,9 +246,9 @@ static void tty_debug_dump_buffer(const unsigned char *buffer, size_t sz)
 	dprintf("tty out -> '%.*s'\n", n, out);
 }
 
-static int con_write(filp *f, const void *buf, size_t size, loff_t *off)
+static int tty_write(filp *f, const void *buf, size_t size, loff_t *off)
 {
-	con_filp *con = (con_filp*) f;
+	tty_filp *tty = (tty_filp*) f;
 	DWORD written = 0;
 	unsigned char *p = NULL;
 	unsigned char buffer[0x1000];
@@ -277,7 +277,7 @@ static int con_write(filp *f, const void *buf, size_t size, loff_t *off)
 		}
 		if (buf_remaining == 0)
 			break;
-		r = con_write_output(con, *p);
+		r = tty_write_output(tty, *p);
 		if (r < 0)
 			break;
 		written++;
@@ -290,46 +290,46 @@ static int con_write(filp *f, const void *buf, size_t size, loff_t *off)
 	return written;
 }
 
-static int con_set_termios(con_filp *con, void *p)
+static int tty_set_termios(tty_filp *tty, void *p)
 {
 	int r;
 	/*
 	 * There's two or three different termios structures.
 	 * TODO: use the kernel structure, not the libc one
 	 */
-	STATIC_ASSERT(sizeof con->tios == 60);
+	STATIC_ASSERT(sizeof tty->tios == 60);
 
-	r = current->ops->memcpy_from(&con->tios, p, sizeof con->tios);
+	r = current->ops->memcpy_from(&tty->tios, p, sizeof tty->tios);
 	if (r < 0)
 		return r;
 	dprintf("tios: %s %s %s %s %s\n",
-		 (con->tios.c_oflag & ONLRET) ? "ONLRET" : "~ONLRET",
-		 (con->tios.c_oflag & OCRNL) ? "OCRNL" : "~OCRNL",
-		 (con->tios.c_oflag & ONLCR) ? "ONLCR" : "~ONLCR",
-		 (con->tios.c_oflag & OLCUC) ? "OLCUC" : "~OLCUC",
-		 (con->tios.c_oflag & OPOST) ? "OPOST" : "~POST"
+		 (tty->tios.c_oflag & ONLRET) ? "ONLRET" : "~ONLRET",
+		 (tty->tios.c_oflag & OCRNL) ? "OCRNL" : "~OCRNL",
+		 (tty->tios.c_oflag & ONLCR) ? "ONLCR" : "~ONLCR",
+		 (tty->tios.c_oflag & OLCUC) ? "OLCUC" : "~OLCUC",
+		 (tty->tios.c_oflag & OPOST) ? "OPOST" : "~POST"
 	);
 
 	return 0;
 }
 
-static int con_get_termios(con_filp *con, void *p)
+static int tty_get_termios(tty_filp *tty, void *p)
 {
 	dprintf("get termios(%p)\n", p);
-	return current->ops->memcpy_to(p, &con->tios, sizeof con->tios);
+	return current->ops->memcpy_to(p, &tty->tios, sizeof tty->tios);
 }
 
-static int con_get_winsize(con_filp *con, void *ptr)
+static int tty_get_winsize(tty_filp *tty, void *ptr)
 {
 	struct winsize ws;
 
-	con->ops->fn_get_winsize(con, &ws);
+	tty->ops->fn_get_winsize(tty, &ws);
 	return current->ops->memcpy_to(ptr, &ws, sizeof ws);
 }
 
-static int con_ioctl(filp *f, int cmd, unsigned long arg)
+static int tty_ioctl(filp *f, int cmd, unsigned long arg)
 {
-	con_filp *con = (con_filp*) f;
+	tty_filp *tty = (tty_filp*) f;
 	int *pgrp;
 	int r = 0;
 
@@ -343,11 +343,11 @@ static int con_ioctl(filp *f, int cmd, unsigned long arg)
 		f->pgid = arg;
 		break;
 	case TIOCS:
-		return con_set_termios(con, (void*)arg);
+		return tty_set_termios(tty, (void*)arg);
 	case TIOCG:
-		return con_get_termios(con, (void*)arg);
+		return tty_get_termios(tty, (void*)arg);
 	case TIOCGWINSZ:
-		return con_get_winsize(con, (void*)arg);
+		return tty_get_winsize(tty, (void*)arg);
 	default:
 		dprintf("unknown tty ioctl(%08x, %08x)\n", cmd, arg);
 		r = -_L(EINVAL);
@@ -356,53 +356,53 @@ static int con_ioctl(filp *f, int cmd, unsigned long arg)
 	return r;
 }
 
-static int con_poll(filp *f)
+static int tty_poll(filp *f)
 {
 	int events = 0;
-	con_filp *con = (con_filp*) f;
-	con->ops->fn_lock(con);
-	if (0 != con_process_input(con))
+	tty_filp *tty = (tty_filp*) f;
+	tty->ops->fn_lock(tty);
+	if (0 != tty_process_input(tty))
 		events |= _l_POLLIN;
 	events |= _l_POLLOUT;
-	con->ops->fn_unlock(con);
+	tty->ops->fn_unlock(tty);
 	return events;
 }
 
-static void con_poll_add(filp *f, struct wait_entry *we)
+static void tty_poll_add(filp *f, struct wait_entry *we)
 {
-	con_filp *con = (con_filp*) f;
+	tty_filp *tty = (tty_filp*) f;
 
-	con->ops->fn_lock(con);
-	wait_entry_append(&con->wl, we);
-	con->ops->fn_unlock(con);
+	tty->ops->fn_lock(tty);
+	wait_entry_append(&tty->wl, we);
+	tty->ops->fn_unlock(tty);
 }
 
-static void con_poll_del(filp *f, struct wait_entry *we)
+static void tty_poll_del(filp *f, struct wait_entry *we)
 {
-	con_filp *con = (con_filp*) f;
+	tty_filp *tty = (tty_filp*) f;
 
-	con->ops->fn_lock(con);
-	wait_entry_remove(&con->wl, we);
-	con->ops->fn_unlock(con);
+	tty->ops->fn_lock(tty);
+	wait_entry_remove(&tty->wl, we);
+	tty->ops->fn_unlock(tty);
 }
 
-static const struct filp_ops con_file_ops = {
-	.fn_read = &con_read,
-	.fn_write = &con_write,
-	.fn_ioctl = &con_ioctl,
-	.fn_poll = &con_poll,
-	.fn_poll_add = &con_poll_add,
-	.fn_poll_del = &con_poll_del,
+static const struct filp_ops tty_file_ops = {
+	.fn_read = &tty_read,
+	.fn_write = &tty_write,
+	.fn_ioctl = &tty_ioctl,
+	.fn_poll = &tty_poll,
+	.fn_poll_add = &tty_poll_add,
+	.fn_poll_del = &tty_poll_del,
 };
 
-void tty_init(con_filp *con)
+void tty_init(tty_filp *tty)
 {
-	init_fp(&con->fp, &con_file_ops);
+	init_fp(&tty->fp, &tty_file_ops);
 
-	con->tios.c_lflag = ICANON | ECHO;
-	con->tios.c_cc[VERASE] = 8;
-	con->tios.c_cc[VEOF] = 4;
-	con->tios.c_oflag = ONLCR | OPOST;
-	con->eof = 0;
-	con->ready_count = 0;
+	tty->tios.c_lflag = ICANON | ECHO;
+	tty->tios.c_cc[VERASE] = 8;
+	tty->tios.c_cc[VEOF] = 4;
+	tty->tios.c_oflag = ONLCR | OPOST;
+	tty->eof = 0;
+	tty->ready_count = 0;
 }

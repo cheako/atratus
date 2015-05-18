@@ -123,6 +123,7 @@ struct process *context_from_client_id(CLIENT_ID *id)
 }
 
 extern void KiUserApcDispatcher(void);
+extern void LdrInitializeThunk(void);
 
 static FILE *debug_stream;
 int verbose = 0;
@@ -174,6 +175,7 @@ const char *ntstatus_to_string(NTSTATUS r)
 
 /* mingw32's ntdll doesn't have these functions */
 #define DECLARE(x) typeof(x) *p##x;
+DECLARE(NtContinue)
 DECLARE(NtCreateWaitablePort)
 DECLARE(DbgUiGetThreadDebugObject)
 DECLARE(DbgUiConnectToDbg);
@@ -182,6 +184,7 @@ DECLARE(DbgUiContinue)
 DECLARE(DbgUiIssueRemoteBreakin)
 DECLARE(NtUnmapViewOfSection)
 DECLARE(KiUserApcDispatcher)
+DECLARE(LdrInitializeThunk)
 #undef DECLARE
 
 static BOOL dynamic_resolve(void)
@@ -198,6 +201,7 @@ static BOOL dynamic_resolve(void)
 			return FALSE; \
 		}
 
+		RESOLVE(NtContinue)
 		RESOLVE(NtCreateWaitablePort)
 		RESOLVE(DbgUiGetThreadDebugObject)
 		RESOLVE(DbgUiConnectToDbg)
@@ -206,6 +210,7 @@ static BOOL dynamic_resolve(void)
 		RESOLVE(DbgUiIssueRemoteBreakin)
 		RESOLVE(NtUnmapViewOfSection)
 		RESOLVE(KiUserApcDispatcher)
+		RESOLVE(LdrInitializeThunk)
 #undef RESOLVE
 	}
 	else
@@ -477,36 +482,17 @@ void dump_regs(struct process *context)
 		context->regs.SegSs, context->regs.SegGs, context->regs.SegFs);
 }
 
-/*
- * The purpose of patching NTDLL is to:
- *  - avoid pollution of the address space with NTDLL's requirements
- *  - avoid useless NTDLL setup (don't want to use NT services)
- *  - make the startup a little cleaner
- *
- * KiUserApcDispatcher looks like this:
- * bytes: e9 07 9f 73 8b ff d0 6a 01 57 e8 ...
- * .text:7C90E450 lea     edi, [esp+arg_C]
- * .text:7C90E454 pop     eax
- * .text:7C90E455 call    eax  <--- overwrite here
- * .text:7C90E457 push    1
- * .text:7C90E459 push    edi
- * .text:7C90E45A call    ZwContinue
- */
-static NTSTATUS patch_apc_callback(struct process *context)
+static NTSTATUS patch_process(HANDLE process, void *where,
+				const void *inst, size_t inst_sz)
 {
-	HANDLE process = context->process;
-	uint8_t nops[2] = { 0x90, 0x90 };
 	ULONG sz = 0;
 	NTSTATUS r;
 	ULONG old_prot = 0;
 	void *addr;
-	void *p = (void*) ((char*)pKiUserApcDispatcher) + 5;
-
-	/* TODO: read assembly and make sure we're clobbering the right code */
 
 	/* make ntdll writeable */
-	sz = sizeof nops;
-	addr = p;
+	sz = inst_sz;
+	addr = where;
 	r = NtProtectVirtualMemory(process, &addr, &sz,
 				PAGE_READWRITE, &old_prot);
 	if (r != STATUS_SUCCESS)
@@ -516,16 +502,22 @@ static NTSTATUS patch_apc_callback(struct process *context)
 	}
 
 	/* patch */
-	r = NtWriteVirtualMemory(process, p, nops, sizeof nops, &sz);
+	r = NtWriteVirtualMemory(process, where, inst, inst_sz, &sz);
 	if (r != STATUS_SUCCESS)
 	{
 		printf("failed to write memory\n");
 		return r;
 	}
 
+	if (sz != inst_sz)
+	{
+		printf("short write!\n");
+		return STATUS_UNSUCCESSFUL;
+	}
+
 	/* restore original protection */
-	sz = 1;
-	addr = p;
+	sz = inst_sz;
+	addr = where;
 	r = NtProtectVirtualMemory(process, &addr, &sz,
 				old_prot, &old_prot);
 	if (r != STATUS_SUCCESS)
@@ -534,7 +526,75 @@ static NTSTATUS patch_apc_callback(struct process *context)
 		return r;
 	}
 
+	return r;
+}
+
+/*
+ * The purpose of patching NTDLL is to:
+ *  - avoid pollution of the address space with NTDLL's requirements
+ *  - avoid useless NTDLL setup (don't want to use NT services)
+ *  - make the startup a little cleaner
+ *
+ * The patched KiUserApcDispatcher is intended to ignore the
+ * APC that initializes NTDLL entirely.
+ *
+ * 0:   8d 7c 24 10             lea    0x10(%esp),%edi
+ * 4:   6a 01                   push   $0x1
+ * 6:   57                      push   %edi
+ * 7:   e8 xx xx xx xx          call   NtContinue
+ */
+static NTSTATUS patch_apc_callback(struct process *context)
+{
+	NTSTATUS r;
+	struct {
+		uint8_t ops1[8];
+		uint32_t offset;
+	} __attribute__((__packed__)) inst = {
+		{ 0x8d, 0x7c, 0x24, 0x10, 0x6a, 0x01, 0x57, 0xe8 }
+	};
+
+	inst.offset = (int) pNtContinue - (int) pKiUserApcDispatcher - sizeof inst;
+
+	STATIC_ASSERT(sizeof inst == 12);
+
+	r = patch_process(context->process, pKiUserApcDispatcher,
+			&inst, sizeof inst);
+	if (r != STATUS_SUCCESS)
+		return r;
+
 	dprintf("Patched KiUserApcDispatcher @%p\n", pKiUserApcDispatcher);
+
+	return r;
+}
+
+/*
+   0:   89 ff                   mov    %edi,%edi
+   2:   55                      push   %ebp
+   3:   89 e5                   mov    %esp,%ebp
+   5:   6a 01                   push   $0x1
+   7:   ff 75 08                pushl  0x8(%ebp)
+   a:   e8 fc ff ff ff          call   0xb
+ */
+static NTSTATUS patch_ldr_thunk(struct process *context)
+{
+	NTSTATUS r;
+	struct {
+		uint8_t ops1[11];
+		uint32_t offset;
+	} __attribute__((__packed__)) inst = {{
+		0x89, 0xff, 0x55, 0x89, 0xe5, 0x6a, 0x01, 0xff, 0x75, 0x08, 0xe8
+	}};
+
+	inst.offset = (int) pNtContinue - (int) pLdrInitializeThunk - sizeof inst;
+
+	STATIC_ASSERT(sizeof inst == 15);
+
+	r = patch_process(context->process, pLdrInitializeThunk,
+			&inst, sizeof inst);
+	if (r != STATUS_SUCCESS)
+		return r;
+
+	dprintf("Patched LdrInitializeThunk @%p\n", pLdrInitializeThunk);
 
 	return r;
 }
@@ -758,6 +818,7 @@ NTSTATUS create_nt_process(struct process *context,
 	if (file == INVALID_HANDLE_VALUE)
 	{
 		r = STATUS_UNSUCCESSFUL;
+		fprintf(stderr, "stub (%S) not found\n", stub_exe_name);
 		fprintf(stderr, "CreateFile() failed (r=%d)\n", GetLastError());
 		goto end;
 	}
@@ -799,11 +860,18 @@ NTSTATUS create_nt_process(struct process *context,
 		return r;
 
 	/*
-	 * Patch KiUserApcDispatch to not enter ntdll
+	 * Patch KiUserApcDispatcher to not enter ntdll
 	 * We don't want or need the stuff that ntdll does
 	 * Jump directly to the program entry point
 	 */
 	r = patch_apc_callback(context);
+	if (r != STATUS_SUCCESS)
+		goto end;
+
+	/*
+	 * Same as above, but for Windows 7
+	 */
+	r = patch_ldr_thunk(context);
 	if (r != STATUS_SUCCESS)
 		goto end;
 
@@ -1390,12 +1458,12 @@ static char *get_path(const char *file)
 	return path;
 }
 
-static int do_open(const char *file, int flags, int mode)
+static filp *open_filp(const char *file, int flags, int mode, int follow_links)
 {
 	struct fs *fs;
-	char *path;
-	int r;
 	size_t len;
+	char *path;
+	filp *fp;
 
 	path = get_path(file);
 
@@ -1407,24 +1475,42 @@ static int do_open(const char *file, int flags, int mode)
 	}
 
 	if (fs)
-	{
-		/* FIXME: get the filp, not fd from fs->open() */
-		r = fs->open(fs, &path[len], flags, mode);
-		if (r >= 0)
-		{
-			if (flags & _L(O_NONBLOCK))
-			{
-				dprintf("open(O_NONBLOCK)\n");
-				current->handles[r].flags |= FD_NONBLOCKING;
-			}
-		}
-	}
+		fp = fs->open(fs, &path[len], flags, mode, follow_links);
 	else
-		r = _L(ENOENT);
+		fp = L_ERROR_PTR(ENOENT);
 
 	free(path);
 
-	return r;
+	return fp;
+}
+
+static int do_open(const char *file, int flags, int mode)
+{
+	filp *fp;
+	int r;
+	int fd;
+
+	fp = open_filp(file, flags, mode, 1);
+	r = L_PTR_ERROR(fp);
+	if (r < 0)
+		return r;
+
+	fd = alloc_fd();
+	if (fd < 0)
+	{
+		filp_close(fp);
+		return -_L(ENOMEM);
+	}
+
+	dprintf("fd %d fp %p handle %p\n", fd, fp, fp->handle);
+
+	current->handles[fd].fp = fp;
+	current->handles[fd].flags = 0;
+
+	if (flags & _L(O_NONBLOCK))
+		current->handles[fd].flags |= FD_NONBLOCKING;
+
+	return fd;
 }
 
 int add_dirent(void *ptr, const char* entry, size_t name_len,
@@ -1664,6 +1750,141 @@ int sys_open(const char *ptr, int flags, int mode)
 	return r;
 }
 
+static int do_unlink(const char *filename)
+{
+	filp *fp;
+	int r;
+
+	dprintf("unlink(%s)\n", filename);
+
+	fp = open_filp(filename, O_RDWR, 0, 0);
+	r = L_PTR_ERROR(fp);
+	if (r < 0)
+		return r;
+
+	if (fp->ops->fn_unlink)
+		r = fp->ops->fn_unlink(fp);
+	else
+		r = -_L(EACCES);
+
+	filp_close(fp);
+
+	return r;
+}
+
+static int sys_unlink(const char *ptr)
+{
+	int r;
+	char *filename = NULL;
+
+	r = read_string(ptr, &filename);
+	if (r < 0)
+	{
+		printf("unlink(%p=<invalid>)\n", ptr);
+		return r;
+	}
+
+	r = do_unlink(filename);
+	free(filename);
+	return r;
+}
+
+static int do_mkdir(const char *parent, const char *dir, int mode)
+{
+	filp *fp;
+	int r;
+
+	dprintf("mkdir(%s,%s,%08x)\n", parent, dir, mode);
+
+	if (!parent)
+		parent = current->cwd;
+
+	fp = open_filp(parent, O_RDWR, 0, 1);
+	r = L_PTR_ERROR(fp);
+	if (r < 0)
+		return r;
+
+	if (fp->ops->fn_mkdir)
+		r = fp->ops->fn_mkdir(fp, dir, mode);
+	else
+		r = -_L(EPERM);
+
+	filp_close(fp);
+
+	return r;
+}
+
+static int sys_mkdir(void *ptr, int mode)
+{
+	int r;
+	char *dirname = NULL, *parent, *child, *p;
+
+	r = read_string(ptr, &dirname);
+	if (r < 0)
+	{
+		dprintf("mkdir(%p=<invalid>)\n", ptr);
+		return r;
+	}
+
+	/* split into filename and directory */
+	p = strrchr(dirname, '/');
+	if (p)
+	{
+		*p = '\0';
+		p++;
+		parent = dirname;
+		child = p;
+	}
+	else
+	{
+		parent = NULL;
+		child = dirname;
+	}
+
+	r = do_mkdir(parent, child, mode);
+	free(dirname);
+	return r;
+}
+
+static int do_rmdir(const char *dirname)
+{
+	filp *fp;
+	int r;
+
+	dprintf("rmdir(%s)\n", dirname);
+
+	fp = open_filp(dirname, O_RDWR, 0, 1);
+	r = L_PTR_ERROR(fp);
+	if (r < 0)
+		return r;
+
+	if (fp->ops->fn_rmdir)
+		r = fp->ops->fn_rmdir(fp);
+	else
+		r = -_L(EPERM);
+
+	filp_close(fp);
+
+	return r;
+}
+
+static int sys_rmdir(void *ptr)
+{
+	char *dirname = NULL;
+	int r;
+
+	r = read_string(ptr, &dirname);
+	if (r < 0)
+	{
+		dprintf("rmdir(%p=<invalid>)\n", ptr);
+		return r;
+	}
+
+	r = do_rmdir(dirname);
+	free(dirname);
+	return r;
+}
+
 int do_close(int fd)
 {
 	filp *fp;
@@ -1681,8 +1902,7 @@ int do_close(int fd)
 	fp->refcount--;
 	if (fp->refcount == 0)
 	{
-		if (fp->ops->fn_close)
-			fp->ops->fn_close(fp);
+		filp_close(fp);
 		memset(fp, 0xff, sizeof *fp);
 		free(fp);
 	}
@@ -1889,11 +2109,37 @@ int sys_getcwd(char *buf, unsigned long size)
 	return len;
 }
 
-int do_chdir(const char *dir)
+static int do_chdir(const char *dir)
 {
-	if (strcmp(dir, "/"))
-		return -_L(ENOENT);
-	return 0;
+	filp *fp;
+	int r;
+
+	dprintf("chdir(%s)\n", dir);
+
+	fp = open_filp(dir, O_RDONLY, 0, 1);
+	r = L_PTR_ERROR(fp);
+	if (r < 0)
+		return r;
+
+	/* TODO: store the directory, not its name */
+	if (fp->ops->fn_getname)
+	{
+		char *name = NULL;
+
+		r = fp->ops->fn_getname(fp, &name);
+		if (r == 0)
+		{
+			free(current->cwd);
+			current->cwd = name;
+			dprintf("cwd set to %s\n", name);
+		}
+	}
+	else
+		r = -_L(ENOENT);
+
+	filp_close(fp);
+
+	return r;
 }
 
 int sys_chdir(const void *ptr)
@@ -1907,7 +2153,6 @@ int sys_chdir(const void *ptr)
 		printf("chdir(%p=<invalid>)\n", ptr);
 		return r;
 	}
-	dprintf("chdir(%s)\n", dirname);
 
 	r = do_chdir(dirname);
 
@@ -2271,28 +2516,19 @@ int sys_getegid(void)
 
 static int do_stat64(const char *file, struct stat64 *statbuf, BOOL follow_links)
 {
-	struct fs *fs;
-	char *path;
+	filp *fp;
 	int r;
-	size_t len;
 
 	dprintf("stat64(\"%s\",%p)\n", file, statbuf);
 
-	path = get_path(file);
+	fp = open_filp(file, O_RDONLY, 0, follow_links);
+	r = L_PTR_ERROR(fp);
+	if (r < 0)
+		return r;
 
-	for (fs = fs_first; fs; fs = fs->next)
-	{
-		len = strlen(fs->root);
-		if (!strncmp(fs->root, path, len))
-			break;
-	}
+	r = fp->ops->fn_stat(fp, statbuf);
 
-	if (fs)
-		r = fs->stat64(fs, &path[len], statbuf, follow_links);
-	else
-		r = _L(ENOENT);
-
-	free(path);
+	filp_close(fp);
 
 	return r;
 }
@@ -2657,13 +2893,32 @@ int sys_fcntl(int fd, int cmd, long arg)
 	return r;
 }
 
+static int do_utimes(const char *filename, struct timeval *ptrtimes)
+{
+	filp *fp;
+	int r;
+
+	dprintf("utimes(%s,%p)\n", filename, ptrtimes);
+
+	fp = open_filp(filename, O_RDWR, 0, 0);
+	r = L_PTR_ERROR(fp);
+	if (r < 0)
+		return r;
+
+	if (fp->ops->fn_utimes)
+		r = fp->ops->fn_utimes(fp, ptrtimes);
+	else
+		r = -_L(EPERM);
+
+	filp_close(fp);
+
+	return r;
+}
+
 int sys_utimes(const char *ptr, struct timeval *ptrtimes)
 {
 	char *filename = NULL;
 	struct timeval times[2];
-	struct fs *fs;
-	size_t len = 0;
-	char *path;
 	int r;
 
 	if (ptrtimes)
@@ -2681,28 +2936,7 @@ int sys_utimes(const char *ptr, struct timeval *ptrtimes)
 		return r;
 	}
 
-	dprintf("utimes(%s,%p)\n", filename, ptrtimes);
-
-	path = get_path(filename);
-
-	for (fs = fs_first; fs; fs = fs->next)
-	{
-		len = strlen(fs->root);
-		if (!strncmp(fs->root, path, len))
-			break;
-	}
-
-	if (fs)
-	{
-		if (fs->utimes)
-			r = fs->utimes(fs, &path[len], ptrtimes);
-		else
-			r = -_L(EPERM);
-	}
-	else
-		r = -_L(ENOENT);
-
-	free(path);
+	r = do_utimes(filename, times);
 	free(filename);
 
 	return r;
@@ -2799,9 +3033,10 @@ int sys_dup2(int oldfd, int newfd)
 	if (newfd < 0 || newfd > MAX_FDS)
 		return -_L(EBADF);
 
+	fp->refcount++;
+
 	do_close(newfd);
 
-	fp->refcount++;
 	current->handles[newfd].fp = fp;
 	current->handles[newfd].flags = 0;
 
@@ -2875,11 +3110,13 @@ static int poll_check(filp **fps, struct _l_pollfd *fds, int nfds)
 	{
 		if (fps[i])
 		{
+			int ev;
 			if (!fps[i]->ops->fn_poll)
 				continue;
 
-			fds[i].revents = fps[i]->ops->fn_poll(fps[i]);
-			if (fds[i].revents & fds[i].events)
+			ev = fps[i]->ops->fn_poll(fps[i]);
+			fds[i].revents = (ev & fds[i].events);
+			if (fds[i].revents)
 				ready++;
 		}
 		else
@@ -3118,6 +3355,131 @@ int sys_select(void *select_args)
 	return do_select(a.nfds, a.rfds, a.wfds, a.efds, a.tv);
 }
 
+static int do_symlink(const char *dir, const char *file,
+			const char *newpath)
+{
+	filp *fp;
+	int r;
+
+	dprintf("do_symlink(%s,%s,%s)\n", dir, file, newpath);
+
+	if (!dir)
+		dir = current->cwd;
+
+	fp = open_filp(dir, O_RDWR, 0, 1);
+	r = L_PTR_ERROR(fp);
+	if (r < 0)
+		return -_L(ENOENT);
+
+	if (fp->ops->fn_symlink)
+		r = fp->ops->fn_symlink(fp, file, newpath);
+	else
+		r = -_L(EPERM);
+
+	filp_close(fp);
+
+	return r;
+}
+
+static int sys_symlink(const void *oldptr, const void *newptr)
+{
+	char *oldpath = NULL, *newpath = NULL, *p, *dir, *link;
+	int r;
+
+	r = read_string(oldptr, &oldpath);
+	if (r < 0)
+	{
+		dprintf("symlink(%p=<invalid>,%p)\n", oldptr, newptr);
+		return r;
+	}
+
+	r = read_string(newptr, &newpath);
+	if (r < 0)
+	{
+		dprintf("symlink(%s,%p=<invalid>)\n", oldpath, newptr);
+		free(oldpath);
+		return r;
+	}
+
+	/* split into filename and directory */
+	p = strrchr(oldpath, '/');
+	if (p)
+	{
+		*p = '\0';
+		p++;
+		dir = oldpath;
+		link = p;
+	}
+	else
+	{
+		dir = NULL;
+		link = oldpath;
+	}
+
+	r = do_symlink(dir, link, newpath);
+
+	free(oldpath);
+	free(newpath);
+
+	return r;
+}
+
+static int do_readlink(const char *path, void *bufptr, size_t bufsize)
+{
+	char *buf = NULL;
+	int r;
+	filp *fp;
+
+	dprintf("readlink(%s,%p,%zd)\n", path, bufptr, bufsize);
+
+	fp = open_filp(path, O_RDONLY, 0, 0);
+	r = L_PTR_ERROR(fp);
+	if (r < 0)
+		return r;
+
+	if (fp->ops->fn_readlink)
+	{
+		r = fp->ops->fn_readlink(fp, &buf);
+		if (r >= 0)
+		{
+			size_t len = strlen(buf);
+			if (len > bufsize)
+				len = bufsize;
+
+			r = current->ops->memcpy_to(bufptr, buf, len);
+			if (r == 0)
+				r = len;
+
+			free(buf);
+		}
+	}
+	else
+		r = -_L(EINVAL);
+
+	filp_close(fp);
+
+	return r;
+}
+
+int sys_readlink(void *pathptr, void *bufptr, size_t bufsize)
+{
+	char *path;
+	int r;
+
+	r = read_string(pathptr, &path);
+	if (r < 0)
+	{
+		dprintf("readlink(%p=<invalid>,%p,%zd)\n",
+			pathptr, bufptr, bufsize);
+	}
+
+	r = do_readlink(path, bufptr, bufsize);
+
+	free(path);
+
+	return r;
+}
+
 int sys_newuname(struct _l_new_utsname *ptr)
 {
 	struct _l_new_utsname un;
@@ -3165,6 +3527,9 @@ int do_syscall(int n, int a1, int a2, int a3, int a4, int a5, int a6)
 	case 7:
 		r = sys_waitpid(a1, ptr(a2), a3);
 		break;
+	case 10:
+		r = sys_unlink(ptr(a1));
+		break;
 	case 11:
 		r = sys_exec(ptr(a1), ptr(a2), ptr(a3));
 		break;
@@ -3191,6 +3556,12 @@ int do_syscall(int n, int a1, int a2, int a3, int a4, int a5, int a6)
 		break;
 	case 37:
 		r = sys_kill(a1, a2);
+		break;
+	case 39:
+		r = sys_mkdir(ptr(a1), a2);
+		break;
+	case 40:
+		r = sys_rmdir(ptr(a1));
 		break;
 	case 41:
 		r = sys_dup(a1);
@@ -3244,6 +3615,12 @@ int do_syscall(int n, int a1, int a2, int a3, int a4, int a5, int a6)
 		break;
 	case 82:
 		r = sys_select(ptr(a1));
+		break;
+	case 83:
+		r = sys_symlink(ptr(a1), ptr(a2));
+		break;
+	case 85:
+		r = sys_readlink(ptr(a1), ptr(a2), a3);
 		break;
 	case 91:
 		r = sys_munmap(ptr(a1), a2);
@@ -4290,6 +4667,9 @@ static void process_ready_list(void)
 
 void ready_list_add(struct process *p)
 {
+	if (!p)
+		return;
+
 	EnterCriticalSection(&ready_list_lock);
 
 	/* first_ready is alway non-null if in ready list */
@@ -4482,6 +4862,7 @@ int main(int argc, char **argv)
 	/* the initial environment */
 	char *env[] =
 	{
+		"DISPLAY=:0",
 		"TERM=vt100",
 		"PS1=$ ",
 		"PATH=/usr/local/bin:/usr/bin:/bin",
@@ -4590,12 +4971,18 @@ int main(int argc, char **argv)
 		fprintf(stderr, "output not a console...\n");
 
 	current->tty = get_vt100_console(console_handle);
+
 	context->handles[0].fp = current->tty;
 	context->handles[0].flags = 0;
+	current->tty->refcount++;
+
 	context->handles[1].fp = current->tty;
 	context->handles[1].flags = 0;
+	current->tty->refcount++;
+
 	context->handles[2].fp = current->tty;
 	context->handles[2].flags = 0;
+	current->tty->refcount++;
 
 	/* move exec into fiber */
 	r = do_exec(argv[n], argv + n, env);
@@ -4676,6 +5063,17 @@ int main(int argc, char **argv)
 		else if (r == WAIT_TIMEOUT)
 		{
 			timeout_handle();
+		}
+
+		/* pump the message loop until there's no more messages */
+		while (1)
+		{
+			MSG msg;
+
+			if (!PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+				break;
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
 		}
 
 		/* wake fibers that are ready, in context of main loop */

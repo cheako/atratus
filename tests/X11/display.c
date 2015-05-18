@@ -1,7 +1,7 @@
 /*
- * device file emulation
+ * Verify connecting to a display works
  *
- * Copyright (C) 2012 - 2013 Mike McCormack
+ * Copyright (C)  2013 Mike McCormack
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -19,46 +19,19 @@
  *
  */
 
-#include <windows.h>
+#include <X11/Xlib.h>
 #include <stdio.h>
-#include "ntapi.h"
-#include "filp.h"
-#include "linux-errno.h"
-#include "linux-defines.h"
-#include "debug.h"
-#include "process.h"
-#include "tty.h"
-#include "null.h"
 
-static filp* dev_open(struct fs *fs, const char *file, int flags,
-			int mode, int follow_links)
+int main(int argc, char **argv)
 {
-	filp *fp = NULL;
+	Display *display;
+	display = XOpenDisplay(NULL);
 
-	dprintf("opening %s\n", file);
+	if (display)
+	{
+		puts("OK");
+		XCloseDisplay(display);
+	}
 
-	while (file[0] == '/')
-		file++;
-
-	if (!strcmp(file, "tty"))
-		fp = current->tty;
-
-	if (!strcmp(file, "null"))
-		fp = null_fp_get();
-
-	if (!fp)
-		return L_ERROR_PTR(ENOENT);
-
-	return fp;
-}
-
-static struct fs devfs =
-{
-	.root = "/dev/",
-	.open = &dev_open,
-};
-
-void devfs_init(void)
-{
-	fs_add(&devfs);
+	return 0;
 }

@@ -132,6 +132,23 @@ int test_strcpy(void)
 	return 1;
 }
 
+int test_strtok(void)
+{
+	char input[] = "testing?:1:2:3";
+
+	OK(input == strtok(input, ":"));
+	OK(input[8] == 0);
+	OK(&input[9] == strtok(NULL, ":"));
+	OK(input[10] == 0);
+	OK(&input[11] == strtok(NULL, ":"));
+	OK(input[12] == 0);
+	OK(&input[13] == strtok(NULL, ":"));
+	OK(NULL == strtok(NULL, ":"));
+	OK(NULL == strtok(NULL, ":"));
+
+	return 1;
+}
+
 int test_strncpy(void)
 {
 	char dest[10];
@@ -359,6 +376,9 @@ int main(int argc, char **argv)
 		return 1;
 
 	if (!test_strstr())
+		return 1;
+
+	if (!test_strtok())
 		return 1;
 
 	puts("OK");

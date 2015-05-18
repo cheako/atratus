@@ -109,6 +109,12 @@
 #define _l_SHUT_WR 1
 #define _l_SHUT_RDWR 2
 
+#define _l_EAI_BADFLAGS (-1)
+#define _l_EAI_NONAME (-2)
+#define _l_EAI_AGAIN (-3)
+#define _l_EAI_FAIL (-4)
+#define _l_EAI_FAMILY (-6)
+
 #define TIOCGPGRP  0x540F
 #define TIOCSPGRP  0x5410
 #define TIOCGWINSZ 0x5413

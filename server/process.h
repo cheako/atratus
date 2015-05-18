@@ -145,6 +145,7 @@ static inline void wait_entry_remove(struct wait_list *list,
 	else
 		entry->prev->next = entry->next;
 
+	entry->p = NULL;
 	entry->prev = NULL;
 	entry->next = NULL;
 }

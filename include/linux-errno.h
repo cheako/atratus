@@ -18,7 +18,9 @@
 #define _l_ENOTDIR 20
 #define _l_EINVAL 22
 #define _l_EMFILE 24
+#define _l_ENOSPC 28
 #define _l_ERANGE 34
+#define _l_ENAMETOOLONG 36
 #define _l_ENOSYS 38
 #define _l_ENOTSOCK 88
 #define _l_EAFNOSUPPORT 97

@@ -186,6 +186,13 @@ EXPORT int fork(void)
 	return set_errno(r);
 }
 
+EXPORT int unlink(const char *path)
+{
+	int r;
+	SYSCALL1(10, path);
+	return set_errno(r);
+}
+
 EXPORT int execve(const char *filename,
 	char **argv,
 	char **env)
@@ -206,6 +213,34 @@ EXPORT int kill(pid_t pid, int signal)
 {
 	int r;
 	SYSCALL2(37, pid, signal);
+	return set_errno(r);
+}
+
+EXPORT int mkdir(const char *path, int mode)
+{
+	int r;
+	SYSCALL2(39, path, mode);
+	return set_errno(r);
+}
+
+EXPORT int rmdir(const char *path)
+{
+	int r;
+	SYSCALL1(40, path);
+	return set_errno(r);
+}
+
+EXPORT int symlink(const char *oldpath, const char *newpath)
+{
+	int r;
+	SYSCALL2(83, oldpath, newpath);
+	return set_errno(r);
+}
+
+EXPORT int readlink(const char *path, char *buf, size_t bufsiz)
+{
+	int r;
+	SYSCALL3(85, path, buf, bufsiz);
 	return set_errno(r);
 }
 
@@ -792,6 +827,15 @@ EXPORT unsigned short ** __ctype_b_loc(void)
 	return &pa;
 }
 
+EXPORT size_t __ctype_get_mb_cur_max(void)
+{
+	/*
+	 * maximum length of a character
+	 * for UTF-8 it's 6
+	 */
+	return 6;
+}
+
 EXPORT int toupper(int ch)
 {
 	int32_t **a = __ctype_toupper_loc();
@@ -802,6 +846,11 @@ EXPORT int tolower(int ch)
 {
 	int32_t **a = __ctype_tolower_loc();
 	return (*a)[ch];
+}
+
+EXPORT void __overflow(int a, int b)
+{
+	die("overflow %08x %08x\n", a, b);
 }
 
 static unsigned int random_value;
@@ -1042,10 +1091,30 @@ EXPORT int fputs(const char *str, FILE *stream)
 	return fputs_unlocked(str, stream);
 }
 
+EXPORT FILE *fdopen(int fd, const char *mode)
+{
+	FILE *f;
+
+	f = malloc(sizeof *f + STDIO_READ_BUFFER_SZ);
+	if (!f)
+	{
+		dprintf("malloc failed\n");
+		close(fd);
+		return NULL;
+	}
+
+	f->fd = fd;
+	f->flags = 0;
+	f->read_buffer = (char*) &f[1];
+	f->read_avail = 0;
+	f->read_start = 0;
+
+	return f;
+}
+
 EXPORT FILE *fopen(const char *path, const char *mode)
 {
 	int fd;
-	FILE *f;
 
 	if (mode[0] == 'r' && mode[1] != '+')
 	{
@@ -1065,21 +1134,7 @@ EXPORT FILE *fopen(const char *path, const char *mode)
 		return NULL;
 	}
 
-	f = malloc(sizeof *f + STDIO_READ_BUFFER_SZ);
-	if (!f)
-	{
-		dprintf("malloc failed\n");
-		close(fd);
-		return NULL;
-	}
-
-	f->fd = fd;
-	f->flags = 0;
-	f->read_buffer = (char*) &f[1];
-	f->read_avail = 0;
-	f->read_start = 0;
-
-	return f;
+	return fdopen(fd, mode);
 }
 
 EXPORT FILE *fopen64(const char *path, const char *mode)
@@ -1106,7 +1161,8 @@ EXPORT int fseek(FILE *stream, long offset, int whence)
 	return 0;
 }
 
-EXPORT size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *f)
+EXPORT size_t fwrite_unlocked(const void *ptr, size_t size,
+				size_t nmemb, FILE *f)
 {
 	int r;
 
@@ -1120,6 +1176,11 @@ EXPORT size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *f)
 		return 0;
 
 	return nmemb;
+}
+
+EXPORT size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *f)
+{
+	return fwrite_unlocked(ptr, size, nmemb, f);
 }
 
 EXPORT size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
@@ -2178,6 +2239,17 @@ EXPORT int __fprintf_chk(FILE *stream, int flags, const char *fmt, ...)
 	return r;
 }
 
+EXPORT int fprintf(FILE *stream, const char *fmt, ...)
+{
+	va_list va;
+	int r;
+
+	va_start(va, fmt);
+	r = __vfprintf_chk(stream, 0, fmt, va);
+	va_end(va);
+	return r;
+}
+
 static int vasprintf_chk_pfo(struct printf_output *pfo, const char *str, size_t len)
 {
 	if (pfo->out_size == 0)
@@ -3027,6 +3099,35 @@ EXPORT char *strpbrk(const char *s, const char *accept)
 			return (char*) &s[i];
 
 	return NULL;
+}
+
+EXPORT char *strtok_r(char *str, const char *delim, char **saveptr)
+{
+	char *p;
+
+	if (!str)
+		str = *saveptr;
+
+	if (str[0] == 0)
+		return NULL;
+
+	p = strpbrk(str, delim);
+	if (p)
+	{
+		p[0] = 0;
+		*saveptr = &p[1];
+	}
+	else
+		*saveptr = str + strlen(str);
+
+	return str;
+}
+
+EXPORT char *strtok(char *str, const char *delim)
+{
+	static char *saveptr;
+
+	return strtok_r(str, delim, &saveptr);
 }
 
 typedef int regoff_t;
@@ -3885,6 +3986,14 @@ EXPORT int getaddrinfo(const char *node, const char *service,
 	return -1;
 }
 
+EXPORT int getnameinfo(const struct sockaddr *sa, socklen_t salen,
+		char *host, size_t hostlen,
+		char *serv, size_t servlen, int flags)
+{
+	warn("getnameinfo() not implemented\n");
+	return _L(EAI_FAIL);
+}
+
 /* jmpbuf is 156 bytes in size */
 struct jmp_buf;
 
@@ -4013,6 +4122,12 @@ EXPORT int signal(int num, void *handler)
 {
 	dprintf("signal(%d,%p)\n", num, handler);
 	return SIG_DFL;
+}
+
+EXPORT int sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
+{
+	dprintf("sigprocmask(%d,%p,%p)\n", how, set, oldset);
+	return 0;
 }
 
 typedef void *sigjmp_buf;
